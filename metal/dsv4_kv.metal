@@ -63,46 +63,20 @@ static inline float dsv4_e4m3fn_value(int i) {
         : (1.0f + float(mant) * 0.125f) * dsv4_e4m3fn_exp_scale[exp];
 }
 
-static inline float dsv4_e4m3fn_dequant(float x) {
+static inline float astra_binary_round(float x, uint shift, float minimum_normal,
+                                        float units_per_one, float unit, float ceiling) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax = min(abs(x), 448.0f);
-
-    int lo = 0;
-    int hi = 126;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) >> 1;
-        if (dsv4_e4m3fn_value(mid) <= ax) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    int best = lo;
-    if (best < 126) {
-        const float best_diff = abs(ax - dsv4_e4m3fn_value(best));
-        const float next_diff = abs(ax - dsv4_e4m3fn_value(best + 1));
-        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
-            best = best + 1;
-        }
-    }
-
-    return sign * dsv4_e4m3fn_value(best);
+    const float ax = min(abs(x), ceiling);
+    if (ax < minimum_normal) return sign * (rint(ax * units_per_one) * unit);
+    uint b = as_type<uint>(ax);
+    b += ((1u << (shift - 1u)) - 1u) + ((b >> shift) & 1u);
+    return sign * as_type<float>(b & ~((1u << shift) - 1u));
 }
-
+static inline float dsv4_e4m3fn_dequant(float x) {
+    return astra_binary_round(x, 20u, 0.015625f, 512.0f, 0.001953125f, 448.0f);
+}
 static inline float dsv4_e2m1fn_dequant(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax = min(abs(x), 6.0f);
-    int best = 0;
-    float best_diff = abs(ax - dsv4_e2m1fn_values[0]);
-    for (int i = 1; i < 8; i++) {
-        const float diff = abs(ax - dsv4_e2m1fn_values[i]);
-        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
-            best = i;
-            best_diff = diff;
-        }
-    }
-    return sign * dsv4_e2m1fn_values[best];
+    return astra_binary_round(x, 22u, 1.0f, 2.0f, 0.5f, 6.0f);
 }
 
 // Quantizes the non-RoPE part of a KV row through E4M3FN and writes the

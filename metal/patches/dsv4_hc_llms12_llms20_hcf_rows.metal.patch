@@ -1,0 +1,528 @@
+--- a/dsv4_hc_llms12_llms20_hcf_rows.metal
++++ b/dsv4_hc_llms12_llms20_hcf_rows.metal
+@@ -1889,3 +1889,525 @@
+     device const float4 * w4n = (device const float4 *) nw;
+     for (int i = tid; i < ne4; i += ntg) ((device float4 *) no)[i] = llms_bf16r4((row4[i]*sc)*w4n[i]);
+ }
++
++
++kernel void kernel_llms_hc_pre_fused_rows(
++        constant llms_hcf_args & args [[buffer(0)]],
++        device const float * x_r   [[buffer(1)]],
++        device const half  * fn    [[buffer(2)]],
++        device const float * scale [[buffer(3)]],
++        device const float * base  [[buffer(4)]],
++        device const float * pre_r [[buffer(5)]],
++        device const float * nw    [[buffer(6)]],
++        device       float * split_r [[buffer(7)]],
++        device       float * xo_r  [[buffer(8)]],
++        device       float * no_r  [[buffer(9)]],
++        device atomic_uint * scr   [[buffer(10)]],
++        device       float * mixo_r [[buffer(11)]],
++        constant uint & pre_stride [[buffer(12)]],
++        threadgroup float * shm [[threadgroup(0)]],
++        uint tg_r [[threadgroup_position_in_grid]],
++        ushort tid [[thread_position_in_threadgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort ntg [[threads_per_threadgroup]]) {
++    /* llms HCF_ROWS: row = tg / 25; every buffer offset by its row (exact mode only: the split kernel runs after) */
++    const uint row = tg_r / 25u, tg = tg_r % 25u;
++    device const float * x = x_r + (ulong)row * (ulong)(args.n_hc * args.n_embd);
++    device const float * pre = pre_r + (ulong)row * (ulong)pre_stride;
++    device float * split = split_r + (ulong)row * 24ul;
++    device float * xo = xo_r + (ulong)row * (ulong)args.n_embd;
++    device float * no = no_r + (ulong)row * (ulong)args.n_embd;
++    device float * mixo = mixo_r + (ulong)row * 24ul;
++   /* 1024 (exact) or 256 (HC_FUSE1=3) */
++    const int n = args.n_hc * args.n_embd, n4 = n / 4, ne4 = args.n_embd / 4;
++    device const float4 * x4 = (device const float4 *) x;
++    threadgroup float * red = shm + args.n_embd;
++    threadgroup float * red2 = red + 32;
++    threadgroup uint * flag = (threadgroup uint *) (red2 + 32);
++    if (tg < 24u) {
++        if (sgitg == 0) red[tiisg] = 0.0f;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* virtual thread tid + ntg*v of the 1024-thread norm kernel: its partial, its simdgroup's sum */
++            float sumf = 0.0f;
++            for (int i = tid + (int)ntg * v; i < n4; i += 1024) sumf += dot(x4[i], x4[i]);
++            sumf = simd_sum(sumf);
++            if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = sumf;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        float sumf;
++        sumf = red[tiisg];
++        sumf = simd_sum(sumf);
++        const float mean = sumf/n;
++        const float sc = 1.0f/sqrt(mean + args.rms_eps);
++        if (sgitg == 0) red2[tiisg] = 0.0f;
++        float sr = 0.0f;
++        if (sgitg < 8) {
++            const short ix = tiisg/2, il = tiisg%2;
++            const int nb = n/32;
++            device const half4 * w4 = (device const half4 *) (fn + (ulong)tg * (ulong)n);
++            for (int ib = sgitg*16 + ix; ib < nb; ib += 8*16) {
++                const int b4 = (ib*32 + il*16)/4;
++                float4 yl4[4];
++                for (short i = 0; i < 4; ++i) yl4[i] = as_type<float4>(as_type<uint4>(x4[b4 + i]*sc));   /* materialize x*scale as the norm kernel stores it (no reassociation into the dot) */
++                float sumq = 0.f;
++                FOR_UNROLL (short i = 0; i < 4; ++i) sumq += dot(float4(w4[b4 + i]), float4(yl4[i]));
++                sr += sumq;
++            }
++            sr = simd_sum(sr);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg < 8 && tiisg == 0) red2[sgitg] = sr;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg == 0) {
++            const float tot = simd_sum(red2[tiisg]);
++            if (tiisg == 0) { if (args.canary >= 2) { mixo[tg] = tot; } else atomic_store_explicit(&scr[tg], as_type<uint>(tot), memory_order_relaxed); }
++        }
++        if (args.canary >= 2) return;   /* exact mode: the split kernel runs after this dispatch on the written mix */
++        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++        if (tid == 0) { const uint old = atomic_fetch_add_explicit(&scr[24], 1u, memory_order_relaxed); flag[0] = old == 23u ? 1u : 0u; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (flag[0] == 0u || tid != 0) return;
++        atomic_store_explicit(&scr[24], 0u, memory_order_relaxed);
++        float m[24];
++        for (int j = 0; j < 24; ++j) { m[j] = as_type<float>(atomic_load_explicit(&scr[j], memory_order_relaxed)); mixo[j] = m[j]; }
++        device const float * mix = mixo;   /* read back as the split kernel reads its input: the same code generation */
++        const float epsv = args.hc_eps, pre_scale = scale[0], post_scale = scale[1], comb_scale = scale[2];
++        const float4 pre_z = *((device const float4 *) mix) * pre_scale + *((device const float4 *) base);
++        *((device float4 *) split) = ds4_hc_sigmoid(pre_z) + epsv;
++        const float4 post_z = *((device const float4 *) (mix + 4)) * post_scale + *((device const float4 *) (base + 4));
++        *((device float4 *) (split + 4)) = ds4_hc_twice_sigmoid(post_z);
++        float4 r0 = *((device const float4 *) (mix + 8)) * comb_scale + *((device const float4 *) (base + 8));
++        float4 r1 = *((device const float4 *) (mix + 12)) * comb_scale + *((device const float4 *) (base + 12));
++        float4 r2 = *((device const float4 *) (mix + 16)) * comb_scale + *((device const float4 *) (base + 16));
++        float4 r3 = *((device const float4 *) (mix + 20)) * comb_scale + *((device const float4 *) (base + 20));
++        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
++        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
++        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
++        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
++        r0 = exp(r0 - m0); r1 = exp(r1 - m1); r2 = exp(r2 - m2); r3 = exp(r3 - m3);
++        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
++        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
++        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
++        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
++        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++        r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;
++        for (int iter = 1; iter < args.iters; ++iter) {
++            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
++            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
++            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
++            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
++            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++            r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;
++        }
++        *((device float4 *) (split + 8)) = r0;
++        *((device float4 *) (split + 12)) = r1;
++        *((device float4 *) (split + 16)) = r2;
++        *((device float4 *) (split + 20)) = r3;
++        return;
++    }
++    threadgroup float4 * row4 = (threadgroup float4 *) shm;
++    for (int d4 = tid; d4 < ne4; d4 += ntg) {
++        float4 acc = float4(0.0f);
++        for (int h = 0; h < args.n_hc; ++h) {
++            const float4 xv = x4[h * ne4 + d4];
++            const float wv = pre[h];
++            acc += xv * wv;
++        }
++        const float4 r = (args.canary & 1) ? acc : llms_bf16r4(acc);   /* bit 0: the canary; bit 1: exact mode */
++        ((device float4 *) xo)[d4] = r; row4[d4] = r;
++    }
++    if (sgitg == 0) red[tiisg] = 0.0f;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* the 1024-thread norm kernel's partials, emulated */
++        float s1 = 0.0f;
++        for (int i = tid + (int)ntg * v; i < ne4; i += 1024) s1 += dot(row4[i], row4[i]);
++        s1 = simd_sum(s1);
++        if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = s1;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    float s;
++    s = red[tiisg];
++    s = simd_sum(s);
++    const float mean = s/args.n_embd;
++    const float sc = 1.0f/sqrt(mean + args.rms_eps);
++    device const float4 * w4n = (device const float4 *) nw;
++    for (int i = tid; i < ne4; i += ntg) ((device float4 *) no)[i] = llms_bf16r4((row4[i]*sc)*w4n[i]);
++}
++
++kernel void kernel_llms_hc_pre_fused_rows_xs(
++        constant llms_hcf_args & args [[buffer(0)]],
++        device const float * x_r   [[buffer(1)]],
++        device const half  * fn    [[buffer(2)]],
++        device const float * scale [[buffer(3)]],
++        device const float * base  [[buffer(4)]],
++        device const float * pre_r [[buffer(5)]],
++        device const float * nw    [[buffer(6)]],
++        device       float * split_r [[buffer(7)]],
++        device       float * xo_r  [[buffer(8)]],
++        device       float * no_r  [[buffer(9)]],
++        device atomic_uint * scr   [[buffer(10)]],
++        device       float * mixo_r [[buffer(11)]],
++        constant uint & pre_stride [[buffer(12)]],
++        threadgroup float * shm [[threadgroup(0)]],
++        uint tg_r [[threadgroup_position_in_grid]],
++        ushort tid [[thread_position_in_threadgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort ntg [[threads_per_threadgroup]]) {
++    /* llms HCF_ROWS: row = tg / 25; every buffer offset by its row (exact mode only: the split kernel runs after) */
++    const uint row = tg_r, tg = 24u;   /* llms HC_MIXDUAL v2: the x / norm threadgroup + the stream's flat-norm scale */
++    device const float * x = x_r + (ulong)row * (ulong)(args.n_hc * args.n_embd);
++    device const float * pre = pre_r + (ulong)row * (ulong)pre_stride;
++    device float * split = split_r + (ulong)row * 24ul;
++    device float * xo = xo_r + (ulong)row * (ulong)args.n_embd;
++    device float * no = no_r + (ulong)row * (ulong)args.n_embd;
++    device float * mixo = mixo_r + (ulong)row * 24ul;
++   /* 1024 (exact) or 256 (HC_FUSE1=3) */
++    const int n = args.n_hc * args.n_embd, n4 = n / 4, ne4 = args.n_embd / 4;
++    device const float4 * x4 = (device const float4 *) x;
++    threadgroup float * red = shm + args.n_embd;
++    threadgroup float * red2 = red + 32;
++    threadgroup uint * flag = (threadgroup uint *) (red2 + 32);
++    if (tg < 24u) {
++        if (sgitg == 0) red[tiisg] = 0.0f;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* virtual thread tid + ntg*v of the 1024-thread norm kernel: its partial, its simdgroup's sum */
++            float sumf = 0.0f;
++            for (int i = tid + (int)ntg * v; i < n4; i += 1024) sumf += dot(x4[i], x4[i]);
++            sumf = simd_sum(sumf);
++            if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = sumf;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        float sumf;
++        sumf = red[tiisg];
++        sumf = simd_sum(sumf);
++        const float mean = sumf/n;
++        const float sc = 1.0f/sqrt(mean + args.rms_eps);
++        if (sgitg == 0) red2[tiisg] = 0.0f;
++        float sr = 0.0f;
++        if (sgitg < 8) {
++            const short ix = tiisg/2, il = tiisg%2;
++            const int nb = n/32;
++            device const half4 * w4 = (device const half4 *) (fn + (ulong)tg * (ulong)n);
++            for (int ib = sgitg*16 + ix; ib < nb; ib += 8*16) {
++                const int b4 = (ib*32 + il*16)/4;
++                float4 yl4[4];
++                for (short i = 0; i < 4; ++i) yl4[i] = as_type<float4>(as_type<uint4>(x4[b4 + i]*sc));   /* materialize x*scale as the norm kernel stores it (no reassociation into the dot) */
++                float sumq = 0.f;
++                FOR_UNROLL (short i = 0; i < 4; ++i) sumq += dot(float4(w4[b4 + i]), float4(yl4[i]));
++                sr += sumq;
++            }
++            sr = simd_sum(sr);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg < 8 && tiisg == 0) red2[sgitg] = sr;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg == 0) {
++            const float tot = simd_sum(red2[tiisg]);
++            if (tiisg == 0) { if (args.canary >= 2) { mixo[tg] = tot; } else atomic_store_explicit(&scr[tg], as_type<uint>(tot), memory_order_relaxed); }
++        }
++        if (args.canary >= 2) return;   /* exact mode: the split kernel runs after this dispatch on the written mix */
++        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++        if (tid == 0) { const uint old = atomic_fetch_add_explicit(&scr[24], 1u, memory_order_relaxed); flag[0] = old == 23u ? 1u : 0u; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (flag[0] == 0u || tid != 0) return;
++        atomic_store_explicit(&scr[24], 0u, memory_order_relaxed);
++        float m[24];
++        for (int j = 0; j < 24; ++j) { m[j] = as_type<float>(atomic_load_explicit(&scr[j], memory_order_relaxed)); mixo[j] = m[j]; }
++        device const float * mix = mixo;   /* read back as the split kernel reads its input: the same code generation */
++        const float epsv = args.hc_eps, pre_scale = scale[0], post_scale = scale[1], comb_scale = scale[2];
++        const float4 pre_z = *((device const float4 *) mix) * pre_scale + *((device const float4 *) base);
++        *((device float4 *) split) = ds4_hc_sigmoid(pre_z) + epsv;
++        const float4 post_z = *((device const float4 *) (mix + 4)) * post_scale + *((device const float4 *) (base + 4));
++        *((device float4 *) (split + 4)) = ds4_hc_twice_sigmoid(post_z);
++        float4 r0 = *((device const float4 *) (mix + 8)) * comb_scale + *((device const float4 *) (base + 8));
++        float4 r1 = *((device const float4 *) (mix + 12)) * comb_scale + *((device const float4 *) (base + 12));
++        float4 r2 = *((device const float4 *) (mix + 16)) * comb_scale + *((device const float4 *) (base + 16));
++        float4 r3 = *((device const float4 *) (mix + 20)) * comb_scale + *((device const float4 *) (base + 20));
++        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
++        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
++        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
++        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
++        r0 = exp(r0 - m0); r1 = exp(r1 - m1); r2 = exp(r2 - m2); r3 = exp(r3 - m3);
++        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
++        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
++        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
++        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
++        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++        r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;
++        for (int iter = 1; iter < args.iters; ++iter) {
++            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
++            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
++            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
++            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
++            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++            r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;
++        }
++        *((device float4 *) (split + 8)) = r0;
++        *((device float4 *) (split + 12)) = r1;
++        *((device float4 *) (split + 16)) = r2;
++        *((device float4 *) (split + 20)) = r3;
++        return;
++    }
++    {   /* llms HC_MIXDUAL v2: the mixer threadgroups' flat-norm scale, once, by their own code, parked in mix[row][0] */
++        if (sgitg == 0) red[tiisg] = 0.0f;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* virtual thread tid + ntg*v of the 1024-thread norm kernel: its partial, its simdgroup's sum */
++            float sumf = 0.0f;
++            for (int i = tid + (int)ntg * v; i < n4; i += 1024) sumf += dot(x4[i], x4[i]);
++            sumf = simd_sum(sumf);
++            if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = sumf;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        float sumf;
++        sumf = red[tiisg];
++        sumf = simd_sum(sumf);
++        const float mean = sumf/n;
++        const float sc = 1.0f/sqrt(mean + args.rms_eps);
++        if (tid == 0) mixo[0] = sc;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    threadgroup float4 * row4 = (threadgroup float4 *) shm;
++    for (int d4 = tid; d4 < ne4; d4 += ntg) {
++        float4 acc = float4(0.0f);
++        for (int h = 0; h < args.n_hc; ++h) {
++            const float4 xv = x4[h * ne4 + d4];
++            const float wv = pre[h];
++            acc += xv * wv;
++        }
++        const float4 r = (args.canary & 1) ? acc : llms_bf16r4(acc);   /* bit 0: the canary; bit 1: exact mode */
++        ((device float4 *) xo)[d4] = r; row4[d4] = r;
++    }
++    if (sgitg == 0) red[tiisg] = 0.0f;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* the 1024-thread norm kernel's partials, emulated */
++        float s1 = 0.0f;
++        for (int i = tid + (int)ntg * v; i < ne4; i += 1024) s1 += dot(row4[i], row4[i]);
++        s1 = simd_sum(s1);
++        if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = s1;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    float s;
++    s = red[tiisg];
++    s = simd_sum(s);
++    const float mean = s/args.n_embd;
++    const float sc = 1.0f/sqrt(mean + args.rms_eps);
++    device const float4 * w4n = (device const float4 *) nw;
++    for (int i = tid; i < ne4; i += ntg) ((device float4 *) no)[i] = llms_bf16r4((row4[i]*sc)*w4n[i]);
++}
++kernel void kernel_llms_hc_pre_fused_rows_mix(
++        constant llms_hcf_args & args [[buffer(0)]],
++        device const float * x_r   [[buffer(1)]],
++        device const half  * fn    [[buffer(2)]],
++        device const float * scale [[buffer(3)]],
++        device const float * base  [[buffer(4)]],
++        device const float * pre_r [[buffer(5)]],
++        device const float * nw    [[buffer(6)]],
++        device       float * split_r [[buffer(7)]],
++        device       float * xo_r  [[buffer(8)]],
++        device       float * no_r  [[buffer(9)]],
++        device atomic_uint * scr   [[buffer(10)]],
++        device       float * mixo_r [[buffer(11)]],
++        constant uint & pre_stride [[buffer(12)]],
++        threadgroup float * shm [[threadgroup(0)]],
++        uint tg_r [[threadgroup_position_in_grid]],
++        ushort tid [[thread_position_in_threadgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort ntg [[threads_per_threadgroup]]) {
++    /* llms HCF_ROWS: row = tg / 25; every buffer offset by its row (exact mode only: the split kernel runs after) */
++    const uint row = tg_r / 24u, tg = tg_r % 24u;   /* llms HC_MIXDUAL: the 24 mixer threadgroups only */
++    device const float * x = x_r + (ulong)row * (ulong)(args.n_hc * args.n_embd);
++    device const float * pre = pre_r + (ulong)row * (ulong)pre_stride;
++    device float * split = split_r + (ulong)row * 24ul;
++    device float * xo = xo_r + (ulong)row * (ulong)args.n_embd;
++    device float * no = no_r + (ulong)row * (ulong)args.n_embd;
++    device float * mixo = mixo_r + (ulong)row * 24ul;
++   /* 1024 (exact) or 256 (HC_FUSE1=3) */
++    const int n = args.n_hc * args.n_embd, n4 = n / 4, ne4 = args.n_embd / 4;
++    device const float4 * x4 = (device const float4 *) x;
++    threadgroup float * red = shm + args.n_embd;
++    threadgroup float * red2 = red + 32;
++    threadgroup uint * flag = (threadgroup uint *) (red2 + 32);
++    if (tg < 24u) {
++        if (sgitg == 0) red[tiisg] = 0.0f;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* virtual thread tid + ntg*v of the 1024-thread norm kernel: its partial, its simdgroup's sum */
++            float sumf = 0.0f;
++            for (int i = tid + (int)ntg * v; i < n4; i += 1024) sumf += dot(x4[i], x4[i]);
++            sumf = simd_sum(sumf);
++            if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = sumf;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        float sumf;
++        sumf = red[tiisg];
++        sumf = simd_sum(sumf);
++        const float mean = sumf/n;
++        const float sc = 1.0f/sqrt(mean + args.rms_eps);
++        if (sgitg == 0) red2[tiisg] = 0.0f;
++        float sr = 0.0f;
++        if (sgitg < 8) {
++            const short ix = tiisg/2, il = tiisg%2;
++            const int nb = n/32;
++            device const half4 * w4 = (device const half4 *) (fn + (ulong)tg * (ulong)n);
++            for (int ib = sgitg*16 + ix; ib < nb; ib += 8*16) {
++                const int b4 = (ib*32 + il*16)/4;
++                float4 yl4[4];
++                for (short i = 0; i < 4; ++i) yl4[i] = as_type<float4>(as_type<uint4>(x4[b4 + i]*sc));   /* materialize x*scale as the norm kernel stores it (no reassociation into the dot) */
++                float sumq = 0.f;
++                FOR_UNROLL (short i = 0; i < 4; ++i) sumq += dot(float4(w4[b4 + i]), float4(yl4[i]));
++                sr += sumq;
++            }
++            sr = simd_sum(sr);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg < 8 && tiisg == 0) red2[sgitg] = sr;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg == 0) {
++            const float tot = simd_sum(red2[tiisg]);
++            if (tiisg == 0) { if (args.canary >= 2) { mixo[tg] = tot; } else atomic_store_explicit(&scr[tg], as_type<uint>(tot), memory_order_relaxed); }
++        }
++        if (args.canary >= 2) return;   /* exact mode: the split kernel runs after this dispatch on the written mix */
++        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++        if (tid == 0) { const uint old = atomic_fetch_add_explicit(&scr[24], 1u, memory_order_relaxed); flag[0] = old == 23u ? 1u : 0u; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (flag[0] == 0u || tid != 0) return;
++        atomic_store_explicit(&scr[24], 0u, memory_order_relaxed);
++        float m[24];
++        for (int j = 0; j < 24; ++j) { m[j] = as_type<float>(atomic_load_explicit(&scr[j], memory_order_relaxed)); mixo[j] = m[j]; }
++        device const float * mix = mixo;   /* read back as the split kernel reads its input: the same code generation */
++        const float epsv = args.hc_eps, pre_scale = scale[0], post_scale = scale[1], comb_scale = scale[2];
++        const float4 pre_z = *((device const float4 *) mix) * pre_scale + *((device const float4 *) base);
++        *((device float4 *) split) = ds4_hc_sigmoid(pre_z) + epsv;
++        const float4 post_z = *((device const float4 *) (mix + 4)) * post_scale + *((device const float4 *) (base + 4));
++        *((device float4 *) (split + 4)) = ds4_hc_twice_sigmoid(post_z);
++        float4 r0 = *((device const float4 *) (mix + 8)) * comb_scale + *((device const float4 *) (base + 8));
++        float4 r1 = *((device const float4 *) (mix + 12)) * comb_scale + *((device const float4 *) (base + 12));
++        float4 r2 = *((device const float4 *) (mix + 16)) * comb_scale + *((device const float4 *) (base + 16));
++        float4 r3 = *((device const float4 *) (mix + 20)) * comb_scale + *((device const float4 *) (base + 20));
++        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
++        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
++        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
++        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
++        r0 = exp(r0 - m0); r1 = exp(r1 - m1); r2 = exp(r2 - m2); r3 = exp(r3 - m3);
++        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
++        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
++        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
++        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
++        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++        r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;
++        for (int iter = 1; iter < args.iters; ++iter) {
++            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
++            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
++            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
++            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
++            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++            r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;
++        }
++        *((device float4 *) (split + 8)) = r0;
++        *((device float4 *) (split + 12)) = r1;
++        *((device float4 *) (split + 16)) = r2;
++        *((device float4 *) (split + 20)) = r3;
++        return;
++    }
++    threadgroup float4 * row4 = (threadgroup float4 *) shm;
++    for (int d4 = tid; d4 < ne4; d4 += ntg) {
++        float4 acc = float4(0.0f);
++        for (int h = 0; h < args.n_hc; ++h) {
++            const float4 xv = x4[h * ne4 + d4];
++            const float wv = pre[h];
++            acc += xv * wv;
++        }
++        const float4 r = (args.canary & 1) ? acc : llms_bf16r4(acc);   /* bit 0: the canary; bit 1: exact mode */
++        ((device float4 *) xo)[d4] = r; row4[d4] = r;
++    }
++    if (sgitg == 0) red[tiisg] = 0.0f;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* the 1024-thread norm kernel's partials, emulated */
++        float s1 = 0.0f;
++        for (int i = tid + (int)ntg * v; i < ne4; i += 1024) s1 += dot(row4[i], row4[i]);
++        s1 = simd_sum(s1);
++        if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = s1;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    float s;
++    s = red[tiisg];
++    s = simd_sum(s);
++    const float mean = s/args.n_embd;
++    const float sc = 1.0f/sqrt(mean + args.rms_eps);
++    device const float4 * w4n = (device const float4 *) nw;
++    for (int i = tid; i < ne4; i += ntg) ((device float4 *) no)[i] = llms_bf16r4((row4[i]*sc)*w4n[i]);
++}
++
++kernel void kernel_llms_hcq_fused2(constant llms_hcf_args & args [[buffer(0)]], device const float * y_r [[buffer(1)]], device const float * h_r [[buffer(2)]],
++        device const float * cur_r [[buffer(3)]], device const float * pre_r [[buffer(4)]], device atomic_uint * scr [[buffer(5)]],
++        device float * hout_r [[buffer(6)]], device float * xo_r [[buffer(7)]], device float * scx_r [[buffer(8)]], device float * mixo_r [[buffer(9)]],
++        constant uint & pre_stride [[buffer(10)]], threadgroup float * shm [[threadgroup(0)]], uint tg_r [[threadgroup_position_in_grid]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]], ushort tiisg [[thread_index_in_simdgroup]]) {
++    const uint row = tg_r / 8u, t = tg_r % 8u;
++    const int ne4 = args.n_embd / 4, n = args.n_hc * args.n_embd, n4 = n / 4;
++    const int k = 4 * (int)t + (int)sgitg;            /* the virtual simdgroup */
++    const int vt = 32 * k + (int)tiisg;               /* the virtual thread of the 1,024-thread structures */
++    device const float4 * y4 = (device const float4 *) (y_r + (ulong)row * (ulong)args.n_embd);
++    device const float4 * h4 = (device const float4 *) (h_r + (ulong)row * (ulong)n);
++    device const float * cur = cur_r + (ulong)row * 24ul;
++    device const float * post = cur + 4; device const float * comb = cur + 8;
++    device const float * pre = pre_r + (ulong)row * (ulong)pre_stride;
++    device float4 * hout4 = (device float4 *) (hout_r + (ulong)row * (ulong)n);
++    device float4 * xo4 = (device float4 *) (xo_r + (ulong)row * (ulong)args.n_embd);
++    device atomic_uint * sr = scr + 128u * row;         /* [0, 32) x-norm partials, [32, 64) flat partials, 127 the count */
++    threadgroup uint * flag = (threadgroup uint *) shm;
++    float s1 = 0.0f;
++    for (int d4 = vt; d4 < ne4; d4 += 1024) {
++        const float4 block_v = y4[d4];
++        const float4 r0 = h4[0 * ne4 + d4], r1 = h4[1 * ne4 + d4], r2 = h4[2 * ne4 + d4], r3 = h4[3 * ne4 + d4];
++        float4 hp[4];
++        for (int dst_hc = 0; dst_hc < 4; ++dst_hc) {
++            float4 acc = block_v * post[dst_hc];
++            acc += comb[dst_hc + 0] * r0;
++            acc += comb[dst_hc + 4] * r1;
++            acc += comb[dst_hc + 8] * r2;
++            acc += comb[dst_hc + 12] * r3;
++            hp[dst_hc] = llms_bf16r4(acc); hout4[dst_hc * ne4 + d4] = hp[dst_hc];
++        }
++        float4 acc = float4(0.0f);
++        for (int h = 0; h < args.n_hc; ++h) { const float4 xv = hp[h]; const float wv = pre[h]; acc += xv * wv; }
++        const float4 r = (args.canary & 1) ? acc : llms_bf16r4(acc);
++        xo4[d4] = r; s1 += dot(r, r);
++    }
++    s1 = simd_sum(s1);
++    float sf = 0.0f;
++    for (int i = vt; i < n4; i += 1024) {   /* stream index i = h ne4 + d4: the element recomputed by the expand's expression */
++        const int hh = i / ne4, d4 = i - hh * ne4;
++        const float4 block_v = y4[d4];
++        const float4 r0 = h4[0 * ne4 + d4], r1 = h4[1 * ne4 + d4], r2 = h4[2 * ne4 + d4], r3 = h4[3 * ne4 + d4];
++        float4 acc = block_v * post[hh];
++        acc += comb[hh + 0] * r0;
++        acc += comb[hh + 4] * r1;
++        acc += comb[hh + 8] * r2;
++        acc += comb[hh + 12] * r3;
++        const float4 hv = llms_bf16r4(acc);
++        sf += dot(hv, hv);
++    }
++    sf = simd_sum(sf);
++    if (tiisg == 0) { atomic_store_explicit(&sr[k], as_type<uint>(s1), memory_order_relaxed); atomic_store_explicit(&sr[32 + k], as_type<uint>(sf), memory_order_relaxed); }
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (sgitg == 0 && tiisg == 0) { const uint old = atomic_fetch_add_explicit(&sr[127], 1u, memory_order_relaxed); flag[0] = old == 7u ? 1u : 0u; }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (flag[0] == 0u || sgitg != 0) return;
++    const float px = as_type<float>(atomic_load_explicit(&sr[tiisg], memory_order_relaxed));
++    const float pf = as_type<float>(atomic_load_explicit(&sr[32 + tiisg], memory_order_relaxed));
++    const float sxs = simd_sum(px), sfs = simd_sum(pf);
++    if (tiisg == 0) {
++        const float mean = sxs/args.n_embd; scx_r[row] = 1.0f/sqrt(mean + args.rms_eps);
++        const float meanf = sfs/n; mixo_r[24ul * row] = 1.0f/sqrt(meanf + args.rms_eps);
++        atomic_store_explicit(&sr[127], 0u, memory_order_relaxed);
++    }
++}
++kernel void kernel_llms_hcq_apply(constant llms_hcf_args & args [[buffer(0)]], device const float * xo_r [[buffer(1)]], device const float * scx_r [[buffer(2)]],
++        device const float * nw [[buffer(3)]], device float * no_r [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
++    const uint ne4 = (uint)args.n_embd / 4u, row = gid / ne4, d4 = gid % ne4;
++    const float sc = args.canary == 99 ? scx_r[row] * (1.0f + 1.0f / 1024.0f) : scx_r[row];   /* llms HC_FUSEQ canary (canary field 99) */
++    ((device float4 *) (no_r + (ulong)row * (ulong)args.n_embd))[d4] = llms_bf16r4((((device const float4 *) (xo_r + (ulong)row * (ulong)args.n_embd))[d4] * sc) * ((device const float4 *) nw)[d4]);
++}

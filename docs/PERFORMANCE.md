@@ -70,3 +70,37 @@ Historical PRO Q2 measurements on the M3 Ultra are retained in this chart:
 Recent focused TP and DSpark comparisons, including their limitations, live in
 [QA_BEFORE_RELEASES.md](../QA_BEFORE_RELEASES.md). Use its speed-regression
 procedure rather than accumulating one-off timings in the main README.
+
+## Where the optimized profile can gain performance
+
+These are the defaults used by the native binaries on Apple Silicon. Upstream already has SSD
+streaming, DSpark and CED-aware prefill. The fork specializes their execution
+for a single user on a memory-constrained Apple Silicon Mac.
+
+| Mechanism | Work reduced / overlapped | Important qualification |
+| --- | --- | --- |
+| Dense Q4L overlays and specialized Metal kernels | Q8_0 dense parts go from 8.5 to 4.5 bits per weight including scales; paired-row paths reuse reads and reduce intermediate traffic | Lossy; requires calibrated side files |
+| BS64 gate/up and G32 down | Replace expensive quantized-expert decoding with layouts and arithmetic suited to the small row counts used during generation | BS64 is a faster-to-compute representation of already low-bit weights, not a promise of fewer bytes than IQ2_XXS |
+| Resident expert cache and learned lookahead | Start likely expert reads before demand, preserve useful cached experts, overlap SSD I/O with GPU work | Content-dependent; cold and warm sessions differ |
+| Deferred decoder expert contributions | Eligible cache-missing experts in layers 20–34 execute two layers later; encode deferred work only when needed, keep demand reads out of prefetch calibration, and sleep with WFE while awaiting the decision | Approximate; enabled for optimized agent/CLI profiles. Set `LLMS_DS4_LAG=0` to compare without deferral |
+| Specialized speculation | Compact draft support, expert bank, vocabulary shortlist and paired-token verification amortize target-model work over accepted tokens | Acceptance matters; upstream already supports speculation |
+| Short decoder replay and phase-specific execution | Process the full encoder prompt but reduce upper decoder work to a bounded suffix; split calls at the boundary | The selected four-token replay is an approximation, not upstream's exact dependency suffix |
+| Scheduling, fusion and power-aware waiting | Smaller intermediates, specialized reductions, BF16 routers, asynchronous handoffs and WFE waiting reduce overhead and wasted energy | Individual gains interact; they cannot be added as independent percentages |
+
+Some speed also comes from deliberate **quality/performance tradeoffs**, including
+routing policy, reduced precision, deferred expert contributions and short decoder replay. This profile is not
+an exact-routing/exact-model baseline. These choices need end-to-end evaluation,
+not just kernel timing.
+
+**CPU power budgeting does not mean forcing the whole engine onto efficiency
+cores.** The native binaries do not apply `taskpolicy -b` to themselves. Demand-side
+threads retain responsive scheduling; the expert-dispatch waiter uses ARM WFE
+instead of continuously spinning, while speculative read-ahead uses utility QoS.
+The thermal gate disables GPU keep-busy filler when IOReport indicates the GPU's
+thermal clamp. Backgrounding unrelated CPU work may free power and memory
+bandwidth, but backgrounding latency-critical I/O can slow generation. macOS QoS
+is a scheduling policy, not a portable hard core-affinity guarantee.
+
+There is no published, matched whole-stack speedup attribution against the exact
+upstream HEAD for this exported pack. The historical numbers below are from the
+source runtime, not additive contributions or a fresh-clone performance guarantee.

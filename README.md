@@ -1,3 +1,41 @@
+# ds4-m1
+
+**M1 Max, 64 GB: ~133 tokens/s prefill · ~35 tokens/s decode** in source-runtime measurements, with only Ghostty open and no other user workloads.
+Sustained operation is continuously thermally throttled; better cooling may improve throughput. The regenerated public pack has not yet reproduced these rates.
+
+[antirez/ds4](https://github.com/antirez/ds4), optimized for DeepSeek V4.1 Flash
+on a 64-GB Apple Silicon Mac. Same binaries and commands; optimized defaults,
+SSD streaming and program-specific settings are enabled automatically.
+
+## Build, set up once, run
+
+If upstream ds4 already works, reuse its toolchain and **ds41f-q2 GGUF**:
+
+```sh
+make -j2 ds4 ds4-agent ds4-server
+ln -s /path/to/your/existing/model.gguf ds4flash.gguf
+```
+
+**Before the first run:** [generate the optimized pack](docs/METAL_SETUP.md).
+The 10.94-MB calibration bundle and builders are included. Generated assets need
+about **162.1 GB extra disk space** (BS64 99.09 GB, G32 53.79 GB); BS64 also needs
+matching original checkpoint shards. Put the pack in `gguf/ds41/`.
+Then:
+
+```sh
+./ds4-agent
+```
+
+`./ds4` and `./ds4-server` also use optimized defaults. Missing assets produce
+an error naming the files and setup instructions. Existing pack elsewhere:
+set `DS4_MODEL_DIR=/path/to/pack`. Use `-m /path/to/model.gguf` instead of the
+symlink if preferred. For the base-model path: `DS4_PROFILE=upstream ./ds4-agent --ssd-streaming`.
+
+This profile trades some fidelity for speed. [Validation](docs/METAL_VALIDATION.md) ·
+[Performance](docs/PERFORMANCE.md) · [Maintenance](docs/MAINTAINING.md) · [License](LICENSE)
+
+---
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>

@@ -1,0 +1,262 @@
+--- a/dsv4_hc_llms12_llms20_hcf.metal
++++ b/dsv4_hc_llms12_llms20_hcf.metal
+@@ -1633,3 +1633,259 @@
+     threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+     ds4_hc_rms_norm_mix_cluster2_pre_norm_body(args, split_args, x, weight, dst, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, completion, shmem, tgpig, tiisg, sgitg);
+ }
++
++
++
++kernel void kernel_llms_hc_weighted_sum_v4(
++        constant ds4_metal_args_dsv4_hc_weighted_sum & args,
++        device  const char * x,
++        device  const char * weights,
++        device        char * dst,
++        uint gid [[thread_position_in_grid]]) {
++    const uint ne4 = (uint)args.n_embd / 4u;
++    const uint t = gid / ne4, d4 = gid - t * ne4;
++    if (t >= (uint)args.n_tokens) return;
++    const int nh = args.n_hc < 0 ? (int)(-args.n_hc) - 1 : (int)args.n_hc;   // negative = canary: one stream fewer
++    device const char * xt = x + (ulong)t * args.nb_x2;
++    device const char * wt = weights + (ulong)t * args.nb_w1;
++    float4 acc = float4(0.0f);
++    for (int h = 0; h < nh; ++h) {
++        const float4 xv = ((device const float4 *)(xt + (ulong)h * args.nb_x1))[d4];
++        const float wv = *((device const float *)(wt + (ulong)h * args.nb_w0));
++        acc += xv * wv;
++    }
++    ((device float4 *)(dst + (ulong)t * args.nb1))[d4] = acc;
++}
++
++kernel void kernel_llms_hc_expand4_v4(
++        constant ds4_metal_args_dsv4_hc_expand & args,
++        device  const char * block_out,
++        device  const char * residual,
++        device  const char * post,
++        device  const char * comb,
++        device  const char * block_add,
++        device        char * dst,
++        uint gid [[thread_position_in_grid]]) {
++    const uint ne4 = (uint)args.n_embd / 4u;
++    const uint t = gid / ne4, d4 = gid - t * ne4;
++    if (t >= (uint)args.n_tokens) return;
++    float4 block_v = ((device const float4 *)(block_out + (ulong)t * args.nb_block1))[d4];
++    if (args.has_add) block_v += ((device const float4 *)(block_add + (ulong)t * args.nb_add1))[d4];
++    device const char * rt = residual + (ulong)t * args.nb_res2;
++    const float4 r0 = ((device const float4 *)(rt + 0 * args.nb_res1))[d4];
++    const float4 r1 = ((device const float4 *)(rt + 1 * args.nb_res1))[d4];
++    const float4 r2 = ((device const float4 *)(rt + 2 * args.nb_res1))[d4];
++    const float4 r3 = ((device const float4 *)(rt + 3 * args.nb_res1))[d4];
++    device const char * pt = post + (ulong)t * args.nb_post1;
++    device const char * ct = comb + (ulong)t * args.nb_comb2;
++    device char * dt = dst + (ulong)t * args.nb2;
++    for (int dst_hc = 0; dst_hc < 4; ++dst_hc) {
++        float4 acc = block_v * *((device const float *)(pt + (ulong)dst_hc * args.nb_post0));
++        device const char * cr = ct + (ulong)dst_hc * args.nb_comb0;
++        acc += *((device const float *)(cr + 0 * args.nb_comb1)) * r0;
++        acc += *((device const float *)(cr + 1 * args.nb_comb1)) * r1;
++        acc += *((device const float *)(cr + 2 * args.nb_comb1)) * r2;
++        acc += *((device const float *)(cr + 3 * args.nb_comb1)) * r3;
++        ((device float4 *)(dt + (ulong)dst_hc * args.nb1))[d4] = acc;
++    }
++}
++
++
++
++static inline float4 llms_bf16r4(float4 v) {
++    uint4 bits = as_type<uint4>(v);
++    const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
++    bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
++    return as_type<float4>(bits & 0xffff0000u);
++}
++kernel void kernel_llms_hc_weighted_sum_v4b(
++        constant ds4_metal_args_dsv4_hc_weighted_sum & args,
++        device  const char * x,
++        device  const char * weights,
++        device        char * dst,
++        uint gid [[thread_position_in_grid]]) {
++    const uint ne4 = (uint)args.n_embd / 4u;
++    const uint t = gid / ne4, d4 = gid - t * ne4;
++    if (t >= (uint)args.n_tokens) return;
++    const int nh = args.n_hc < 0 ? (int)(-args.n_hc) - 1 : (int)args.n_hc;   // negative = canary: one stream fewer
++    device const char * xt = x + (ulong)t * args.nb_x2;
++    device const char * wt = weights + (ulong)t * args.nb_w1;
++    float4 acc = float4(0.0f);
++    for (int h = 0; h < nh; ++h) {
++        const float4 xv = ((device const float4 *)(xt + (ulong)h * args.nb_x1))[d4];
++        const float wv = *((device const float *)(wt + (ulong)h * args.nb_w0));
++        acc += xv * wv;
++    }
++    ((device float4 *)(dst + (ulong)t * args.nb1))[d4] = llms_bf16r4(acc);
++}
++
++
++kernel void kernel_llms_hc_expand4_v4b(
++        constant ds4_metal_args_dsv4_hc_expand & args,
++        device  const char * block_out,
++        device  const char * residual,
++        device  const char * post,
++        device  const char * comb,
++        device  const char * block_add,
++        device        char * dst,
++        uint gid [[thread_position_in_grid]]) {
++    const uint ne4 = (uint)args.n_embd / 4u;
++    const uint t = gid / ne4, d4 = gid - t * ne4;
++    if (t >= (uint)args.n_tokens) return;
++    float4 block_v = ((device const float4 *)(block_out + (ulong)t * args.nb_block1))[d4];
++    if (args.has_add) block_v += ((device const float4 *)(block_add + (ulong)t * args.nb_add1))[d4];
++    device const char * rt = residual + (ulong)t * args.nb_res2;
++    const float4 r0 = ((device const float4 *)(rt + 0 * args.nb_res1))[d4];
++    const float4 r1 = ((device const float4 *)(rt + 1 * args.nb_res1))[d4];
++    const float4 r2 = ((device const float4 *)(rt + 2 * args.nb_res1))[d4];
++    const float4 r3 = ((device const float4 *)(rt + 3 * args.nb_res1))[d4];
++    device const char * pt = post + (ulong)t * args.nb_post1;
++    device const char * ct = comb + (ulong)t * args.nb_comb2;
++    device char * dt = dst + (ulong)t * args.nb2;
++    for (int dst_hc = 0; dst_hc < 4; ++dst_hc) {
++        float4 acc = block_v * *((device const float *)(pt + (ulong)dst_hc * args.nb_post0));
++        device const char * cr = ct + (ulong)dst_hc * args.nb_comb0;
++        acc += *((device const float *)(cr + 0 * args.nb_comb1)) * r0;
++        acc += *((device const float *)(cr + 1 * args.nb_comb1)) * r1;
++        acc += *((device const float *)(cr + 2 * args.nb_comb1)) * r2;
++        acc += *((device const float *)(cr + 3 * args.nb_comb1)) * r3;
++        ((device float4 *)(dt + (ulong)dst_hc * args.nb1))[d4] = llms_bf16r4(acc);
++    }
++}
++
++
++
++struct llms_hcf_args { int32_t n_embd; int32_t n_hc; int32_t iters; float rms_eps; float hc_eps; int32_t canary; };
++kernel void kernel_llms_hc_pre_fused(
++        constant llms_hcf_args & args [[buffer(0)]],
++        device const float * x     [[buffer(1)]],
++        device const half  * fn    [[buffer(2)]],
++        device const float * scale [[buffer(3)]],
++        device const float * base  [[buffer(4)]],
++        device const float * pre   [[buffer(5)]],
++        device const float * nw    [[buffer(6)]],
++        device       float * split [[buffer(7)]],
++        device       float * xo    [[buffer(8)]],
++        device       float * no    [[buffer(9)]],
++        device atomic_uint * scr   [[buffer(10)]],
++        device       float * mixo  [[buffer(11)]],
++        threadgroup float * shm [[threadgroup(0)]],
++        uint tg [[threadgroup_position_in_grid]],
++        ushort tid [[thread_position_in_threadgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort ntg [[threads_per_threadgroup]]) {   /* 1024 (exact) or 256 (HC_FUSE1=3) */
++    const int n = args.n_hc * args.n_embd, n4 = n / 4, ne4 = args.n_embd / 4;
++    device const float4 * x4 = (device const float4 *) x;
++    threadgroup float * red = shm + args.n_embd;
++    threadgroup float * red2 = red + 32;
++    threadgroup uint * flag = (threadgroup uint *) (red2 + 32);
++    if (tg < 24u) {
++        if (sgitg == 0) red[tiisg] = 0.0f;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* virtual thread tid + ntg*v of the 1024-thread norm kernel: its partial, its simdgroup's sum */
++            float sumf = 0.0f;
++            for (int i = tid + (int)ntg * v; i < n4; i += 1024) sumf += dot(x4[i], x4[i]);
++            sumf = simd_sum(sumf);
++            if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = sumf;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        float sumf;
++        sumf = red[tiisg];
++        sumf = simd_sum(sumf);
++        const float mean = sumf/n;
++        const float sc = 1.0f/sqrt(mean + args.rms_eps);
++        if (sgitg == 0) red2[tiisg] = 0.0f;
++        float sr = 0.0f;
++        if (sgitg < 8) {
++            const short ix = tiisg/2, il = tiisg%2;
++            const int nb = n/32;
++            device const half4 * w4 = (device const half4 *) (fn + (ulong)tg * (ulong)n);
++            for (int ib = sgitg*16 + ix; ib < nb; ib += 8*16) {
++                const int b4 = (ib*32 + il*16)/4;
++                float4 yl4[4];
++                for (short i = 0; i < 4; ++i) yl4[i] = as_type<float4>(as_type<uint4>(x4[b4 + i]*sc));   /* materialize x*scale as the norm kernel stores it (no reassociation into the dot) */
++                float sumq = 0.f;
++                FOR_UNROLL (short i = 0; i < 4; ++i) sumq += dot(float4(w4[b4 + i]), float4(yl4[i]));
++                sr += sumq;
++            }
++            sr = simd_sum(sr);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg < 8 && tiisg == 0) red2[sgitg] = sr;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg == 0) {
++            const float tot = simd_sum(red2[tiisg]);
++            if (tiisg == 0) { if (args.canary >= 2) { mixo[tg] = tot; } else atomic_store_explicit(&scr[tg], as_type<uint>(tot), memory_order_relaxed); }
++        }
++        if (args.canary >= 2) return;   /* exact mode: the split kernel runs after this dispatch on the written mix */
++        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++        if (tid == 0) { const uint old = atomic_fetch_add_explicit(&scr[24], 1u, memory_order_relaxed); flag[0] = old == 23u ? 1u : 0u; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (flag[0] == 0u || tid != 0) return;
++        atomic_store_explicit(&scr[24], 0u, memory_order_relaxed);
++        float m[24];
++        for (int j = 0; j < 24; ++j) { m[j] = as_type<float>(atomic_load_explicit(&scr[j], memory_order_relaxed)); mixo[j] = m[j]; }
++        device const float * mix = mixo;   /* read back as the split kernel reads its input: the same code generation */
++        const float epsv = args.hc_eps, pre_scale = scale[0], post_scale = scale[1], comb_scale = scale[2];
++        const float4 pre_z = *((device const float4 *) mix) * pre_scale + *((device const float4 *) base);
++        *((device float4 *) split) = ds4_hc_sigmoid(pre_z) + epsv;
++        const float4 post_z = *((device const float4 *) (mix + 4)) * post_scale + *((device const float4 *) (base + 4));
++        *((device float4 *) (split + 4)) = ds4_hc_twice_sigmoid(post_z);
++        float4 r0 = *((device const float4 *) (mix + 8)) * comb_scale + *((device const float4 *) (base + 8));
++        float4 r1 = *((device const float4 *) (mix + 12)) * comb_scale + *((device const float4 *) (base + 12));
++        float4 r2 = *((device const float4 *) (mix + 16)) * comb_scale + *((device const float4 *) (base + 16));
++        float4 r3 = *((device const float4 *) (mix + 20)) * comb_scale + *((device const float4 *) (base + 20));
++        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
++        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
++        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
++        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
++        r0 = exp(r0 - m0); r1 = exp(r1 - m1); r2 = exp(r2 - m2); r3 = exp(r3 - m3);
++        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
++        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
++        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
++        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
++        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++        r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;
++        for (int iter = 1; iter < args.iters; ++iter) {
++            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
++            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
++            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
++            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
++            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++            r0 *= col_inv; r1 *= col_inv; r2 *= col_inv; r3 *= col_inv;
++        }
++        *((device float4 *) (split + 8)) = r0;
++        *((device float4 *) (split + 12)) = r1;
++        *((device float4 *) (split + 16)) = r2;
++        *((device float4 *) (split + 20)) = r3;
++        return;
++    }
++    threadgroup float4 * row4 = (threadgroup float4 *) shm;
++    for (int d4 = tid; d4 < ne4; d4 += ntg) {
++        float4 acc = float4(0.0f);
++        for (int h = 0; h < args.n_hc; ++h) {
++            const float4 xv = x4[h * ne4 + d4];
++            const float wv = pre[h];
++            acc += xv * wv;
++        }
++        const float4 r = (args.canary & 1) ? acc : llms_bf16r4(acc);   /* bit 0: the canary; bit 1: exact mode */
++        ((device float4 *) xo)[d4] = r; row4[d4] = r;
++    }
++    if (sgitg == 0) red[tiisg] = 0.0f;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int v = 0; v < 1024 / (int)ntg; ++v) {   /* the 1024-thread norm kernel's partials, emulated */
++        float s1 = 0.0f;
++        for (int i = tid + (int)ntg * v; i < ne4; i += 1024) s1 += dot(row4[i], row4[i]);
++        s1 = simd_sum(s1);
++        if (tiisg == 0) red[sgitg + (int)(ntg / 32) * v] = s1;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    float s;
++    s = red[tiisg];
++    s = simd_sum(s);
++    const float mean = s/args.n_embd;
++    const float sc = 1.0f/sqrt(mean + args.rms_eps);
++    device const float4 * w4n = (device const float4 *) nw;
++    for (int i = tid; i < ne4; i += ntg) ((device float4 *) no)[i] = llms_bf16r4((row4[i]*sc)*w4n[i]);
++}

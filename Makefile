@@ -25,7 +25,7 @@ DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework IOSurface
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
@@ -1419,3 +1419,29 @@ gguf-tools/quality-testing/score_official_verify.o: gguf-tools/quality-testing/s
 
 gguf-tools/quality-testing/score_official_verify: gguf-tools/quality-testing/score_official_verify.o ds4_verify_test_hooks.o $(filter-out ds4.o,$(CORE_OBJS)) rax.o ds4_gpu_args.o
 	$(if $(filter Darwin,$(UNAME_S)),$(CC) $(CFLAGS),$(DS4_LINK)) -o $@ $^ $(if $(filter Darwin,$(UNAME_S)),$(METAL_LDLIBS),$(DS4_LINK_LIBS))
+
+# Program defaults.
+ds4_defaults.h: ds4_defaults.json gguf-tools/generate_defaults.py
+	python3 gguf-tools/generate_defaults.py
+
+ds4_help.o: ds4_defaults.h
+ds4.o ds4_metal.o: ds4_shm.h
+
+# Variant sources are built from small, hash-checked patches; no runtime patching.
+.PHONY: metal-variants
+metal-variants:
+	python3 metal/build_kernels.py
+
+ds4 ds4-agent ds4-server: | metal-variants
+
+.PHONY: test-metal-pack
+test-metal-pack: ds4 ds4-agent ds4-server
+	python3 tests/test_defaults.py
+	python3 tests/test_download_revision.py
+	python3 metal/build_kernels.py --check
+	python3 tests/test_weight_builders.py
+	python3 tests/test_defaults_runtime.py
+	python3 tests/test_metal_source_build.py
+	mkdir -p build/tmp
+	TMPDIR="$(CURDIR)/build/tmp" $(CC) -O1 -o build/test_converter tests/test_fp8_conversion.c gguf-tools/quants.c -lm -lpthread
+	build/test_converter

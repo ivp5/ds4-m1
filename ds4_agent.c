@@ -8,6 +8,7 @@
 #include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
+void ds4_gpu_llms_startup_mark(const char *label);   /* llms STARTUP_LOG */
 
 #include <errno.h>
 #include <ctype.h>
@@ -5365,6 +5366,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
                                     NULL,
                                     load_err, sizeof(load_err));
         if (loaded) {
+            ds4_gpu_llms_startup_mark("agent: sysprompt kv loaded");   /* llms STARTUP_LOG */
             agent_trace(w, "sysprompt kv hit file=%s tokens=%d",
                         w->sysprompt_path, w->transcript.len);
         }
@@ -10240,6 +10242,72 @@ static int worker_force_generated_text(agent_worker *w,
  * This helper is intentionally derived only from the current streaming parser
  * state.  The state object is local to one assistant round, so malformed output,
  * EOS, Ctrl+C, or the next turn cannot accidentally leave sampling greedy. */
+
+
+static const char *agent_dsml41_fixed_next(const char *tail, bool in_invoke, bool param_close) {
+    if (param_close) {   /* the tail is a strict prefix of the parameter close */
+        static const char close[] = "</｜DSML｜ parameter>\n";
+        const size_t n = strlen(tail);
+        return n < sizeof close - 1 && !strncmp(close, tail, n) ? close + n : NULL;
+    }
+    if (!strcmp(tail, "<") || !strcmp(tail, "</")) return "｜DSML｜";
+    if (!strcmp(tail, "<｜DSML｜")) return in_invoke ? " parameter name=\"" : " invoke name=\"";
+    if (!strcmp(tail, "</｜DSML｜")) return in_invoke ? " invoke>\n" : " calls>";
+    if (!strcmp(tail, "</｜DSML｜ invoke")) return ">\n";
+    if (!strcmp(tail, "</｜DSML｜ calls")) return ">";
+    if (!strcmp(tail, "<｜DSML｜ parameter") || !strcmp(tail, "<｜DSML｜ invoke")) return " name=\"";
+    {   /* '<｜DSML｜ parameter name="X"' -> ' string="' ; '... string="true' / '"false' -> '">' ; '<｜DSML｜ invoke name="X"' -> '>\n' */
+        const char *q = strstr(tail, " name=\"");
+        if (q && !strncmp(tail, "<｜DSML｜ parameter", strlen("<｜DSML｜ parameter"))) {
+            const char *v = q + 7, *e = strchr(v, '"');
+            if (e && e[1] == 0) return " string=\"";
+            const char *s = e ? strstr(e, " string=\"") : NULL;
+            if (s && (!strcmp(s + 9, "true") || !strcmp(s + 9, "false"))) return "\">";
+        }
+        if (q && !strncmp(tail, "<｜DSML｜ invoke", strlen("<｜DSML｜ invoke"))) { const char *v = q + 7, *e = strchr(v, '"'); if (e && e[1] == 0) return ">\n"; }
+    }
+    return NULL;
+}
+static int g_agent_hint_seq[3], g_agent_hint_seq_n;   /* llms GRAMMAR_DEPTH */
+static uint64_t g_agent_hint_set, g_agent_hint_none; static int g_agent_hint_log, g_agent_hint_pend = -1; static char g_agent_hint_tail[192], g_agent_hint_fx[48];
+
+
+static int agent_dsml_hint_token(ds4_engine *engine, const agent_stream_renderer *sr, int token) {   /* -1: no hint */
+    static int on = -1; if (on < 0) { const char *e = getenv("LLMS_DS4_DSML_HINT"); on = e && *e && *e != '0'; g_agent_hint_log = e && !strcmp(e, "log");
+                                       if (on) { fprintf(stderr, "llms: dsml hint (the DSML41 grammar's fixed next token as the block-1 draft on greedy markup steps)\n");
+                                                 atexit_b(^{ fprintf(stderr, "llms dsml hint (agent): %llu hints set, %llu greedy markup steps without one\n", (unsigned long long)g_agent_hint_set, (unsigned long long)g_agent_hint_none); }); } }
+    if (!on || !sr || !sr->parser || sr->parser->syntax != AGENT_TOOL_SYNTAX_DSML41 || !sr->dsml_active) return -1;
+    const agent_dsml_parser *p = sr->parser;
+    if (p->state != AGENT_DSML_STRUCTURAL && p->state != AGENT_DSML_PARAM_VALUE) return -1;
+    size_t tl = 0; char *tt = ds4_token_text(engine, token, &tl);
+    if (!tt) return -1;
+    char tail[192]; size_t n = 0;
+    {   /* the raw text since the last '>' or newline (STRUCTURAL) or since the last '<' (a parameter close), then the token's text */
+        const char *raw = p->raw ? p->raw : ""; size_t rl = p->raw_len, k = rl;
+        if (p->state == AGENT_DSML_PARAM_VALUE) { while (k > p->param_value_start && raw[k - 1] != '<') k--; if (k > p->param_value_start) k--; else k = rl; }
+        else while (k > 0 && raw[k - 1] != '>' && raw[k - 1] != '\n') k--;
+        if (rl - k + tl >= sizeof tail) { free(tt); return -1; }
+        memcpy(tail, raw + k, rl - k); n = rl - k; memcpy(tail + n, tt, tl); n += tl; tail[n] = 0;
+    }
+    free(tt);
+    const bool param_close = p->state == AGENT_DSML_PARAM_VALUE && tail[0] == '<';
+    if (p->state == AGENT_DSML_PARAM_VALUE && !param_close) return -1;
+    const bool in_invoke = p->current.name != NULL;
+    const char *fx = agent_dsml41_fixed_next(tail, in_invoke, param_close);
+    if (!fx || !*fx) { g_agent_hint_none++; return -1; }
+    if (g_agent_hint_log) { snprintf(g_agent_hint_tail, sizeof g_agent_hint_tail, "%s", tail); snprintf(g_agent_hint_fx, sizeof g_agent_hint_fx, "%s", fx);
+                            for (char *c = g_agent_hint_tail; *c; c++) if (*c == '\\n') *c = '~';
+                            for (char *c = g_agent_hint_fx; *c; c++) if (*c == '\\n') *c = '~'; }   /* one log line per hint: newlines shown as ~ */
+    static struct { char text[32]; int tok; } cache[24]; static int ncache;
+    if (getenv("LLMS_DS4_GRAMMAR_DEPTH") && *getenv("LLMS_DS4_GRAMMAR_DEPTH") && *getenv("LLMS_DS4_GRAMMAR_DEPTH") != '0') ncache = 0;   /* llms GRAMMAR_DEPTH: the cache holds only the first token -- tokenize every time */
+    for (int i = 0; i < ncache; i++) if (!strcmp(cache[i].text, fx)) { g_agent_hint_set++; return cache[i].tok; }
+    ds4_tokens tk = {0}; ds4_tokenize_rendered_chat(engine, fx, &tk);   /* 12:4x: special tokens parsed -- plain-text tokenization made '｜DSML｜' the character 28217, not the special 128825 (dsmlhint_diag: 0 of 23) */
+    g_agent_hint_seq_n = 0; for (int i = 0; i < tk.len && i < 3; i++) g_agent_hint_seq[g_agent_hint_seq_n++] = tk.v[i];   /* llms GRAMMAR_DEPTH: the whole fixed text, up to 3 tokens */
+    const int first = tk.len > 0 ? tk.v[0] : -1; ds4_tokens_free(&tk);
+    if (ncache < 24 && strlen(fx) < sizeof cache[0].text) { strcpy(cache[ncache].text, fx); cache[ncache].tok = first; ncache++; }
+    if (first >= 0) g_agent_hint_set++;
+    return first;
+}
 static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) {
     if (!sr || !sr->parser) return false;
     if (sr->parser->state == AGENT_DSML_ERROR ||
@@ -10264,6 +10332,20 @@ static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) 
 static bool agent_stream_compaction_needs_lookahead(const agent_stream_renderer *sr) {
     return !sr->dsml_active && sr->parser->state == AGENT_DSML_SEARCH &&
            (sr->pending_len || sr->dsml_start_len);
+}
+
+
+
+static uint64_t g_fk_flips, g_fk_kept, g_fk_redraw, g_fk_invalid, g_fk_shadow_n, g_fk_shadow_same;
+static void llms_flipkeep_report(void) { fprintf(stderr, "llms flipkeep: %llu flips at the first token of a 2-token block, %llu kept, %llu redrawn, %llu invalid; shadow %llu of %llu redraws identical\n",
+    (unsigned long long)g_fk_flips, (unsigned long long)g_fk_kept, (unsigned long long)g_fk_redraw, (unsigned long long)g_fk_invalid, (unsigned long long)g_fk_shadow_same, (unsigned long long)g_fk_shadow_n); }
+
+
+static int llms_flipkeep_mode(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("LLMS_DS4_AGENT_FLIPKEEP"); m = !e || !*e || *e == '0' ? 0 : !strcmp(e, "shadow") ? 2 : 1;
+                 if (m) { fprintf(stderr, "llms: agent flipkeep %s (the accepted draft kept across a sampling-mode flip when the new mode draws it)\n", m == 2 ? "SHADOW" : "on"); atexit(llms_flipkeep_report); } }
+    return m;
 }
 
 static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
@@ -10475,6 +10557,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         bool status_greedy_sampling = false;
+        int fk_shadow_x = -2;   /* llms FLIPKEEP shadow: the x drawn at the last flip (-2: none pending) */
+        bool spec_mode_valid = false, spec_mode_greedy = false;   /* llms DSP41_RESRAW: the mode of the last speculative call */
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
@@ -10482,7 +10566,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 worker_set_greedy_sampling(w, greedy_sampling);
                 status_greedy_sampling = greedy_sampling;
             }
+            if (spec_mode_valid && spec_mode_greedy != greedy_sampling)   /* llms DSP41_RESRAW */
+                (void)ds4_session_dsp41_restore_raw(w->session);
+            spec_mode_valid = false;
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
+            if (fk_shadow_x != -2) { g_fk_shadow_n++; if (token == fk_shadow_x) g_fk_shadow_same++; fk_shadow_x = -2; }   /* llms FLIPKEEP shadow: the shipped redraw vs x */
             if (ds4_token_is_stop_for_think_mode(w->engine, token, think_mode)) {
                 model_stopped = true;
                 if (tool_syntax == AGENT_TOOL_SYNTAX_GLM &&
@@ -10495,6 +10583,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             int toks[17];
             int ntok = 0;
             const int block_start = ds4_session_pos(w->session);
+            if (g_agent_hint_pend >= 0) {   /* llms DSML_HINT log: the previous hint was not accepted -- the token that followed is this input token */
+                size_t l1 = 0, l2 = 0; char *t1 = ds4_token_text(w->engine, g_agent_hint_pend, &l1), *t2 = ds4_token_text(w->engine, token, &l2); for (size_t q = 0; t1 && q < l1; q++) if (t1[q] == '\n') t1[q] = '~'; for (size_t q = 0; t2 && q < l2; q++) if (t2[q] == '\n') t2[q] = '~';
+                fprintf(stderr, "llms dsml hint LOG: tail [%s] fixed [%s] hint %d [%.*s] actual %d [%.*s] %s\n", g_agent_hint_tail, g_agent_hint_fx, g_agent_hint_pend, (int)l1, t1 ? t1 : "", token, (int)l2, t2 ? t2 : "", g_agent_hint_pend == token ? "MATCH" : "MISS");
+                free(t1); free(t2); g_agent_hint_pend = -1;
+            }
+            int llms_hint_now = -1;
+            if (greedy_sampling) { g_agent_hint_seq_n = 0; const int hint = agent_dsml_hint_token(w->engine, &stream, token); if (hint >= 0) { ds4_session_set_draft_hint(w->session, hint); llms_hint_now = hint;
+                                     if (g_agent_hint_seq_n >= 2) ds4_session_set_draft_hint_seq(w->session, g_agent_hint_seq, g_agent_hint_seq_n); } }   /* llms GRAMMAR_DEPTH */   /* llms DSML_HINT */
             if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
                 getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
                 ntok = ds4_session_eval_speculative(
@@ -10510,6 +10606,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     agent_set_error(w, err);
                     return 1;
                 }
+                spec_mode_valid = true; spec_mode_greedy = greedy_sampling;   /* llms DSP41_RESRAW */
             } else {
                 if (ds4_session_eval(w->session, token,
                                      err, sizeof(err)) != 0) {
@@ -10524,6 +10621,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 agent_dsml_parser_free(&dsml);
                 agent_set_error(w, "decode returned no tokens");
                 return 1;
+            }
+            if (g_agent_hint_log && llms_hint_now >= 0) {   /* llms DSML_HINT log: accepted -> toks[1]; else the next input token tells */
+                if (ntok >= 2) { size_t l1 = 0; char *t1 = ds4_token_text(w->engine, llms_hint_now, &l1); for (size_t q = 0; t1 && q < l1; q++) if (t1[q] == '\n') t1[q] = '~';
+                                 fprintf(stderr, "llms dsml hint LOG: tail [%s] fixed [%s] hint %d [%.*s] actual %d %s\n", g_agent_hint_tail, g_agent_hint_fx, llms_hint_now, (int)l1, t1 ? t1 : "", toks[1], toks[1] == llms_hint_now ? "MATCH (accepted)" : "MISS (accepted another)"); free(t1); }
+                else g_agent_hint_pend = llms_hint_now;
             }
 
             bool stop_block = false;
@@ -10604,6 +10706,16 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                  * either mode; only exact sampling needs a new distribution. */
                 if (ti + 1 < ntok && ds4_engine_mtp_exact_sampling(w->engine) &&
                     cfg->gen.temperature > 0.0f && next_greedy != greedy_sampling) {
+                    const int fk = llms_flipkeep_mode();   /* llms FLIPKEEP: 0 off, 1 keep, 2 shadow */
+                    if (fk && ti == 0 && ntok == 2) {
+                        const uint64_t rs = rng; g_fk_flips++;
+                        const int x = ds4_session_dsp41_sample_row(w->session, block_start, 0, next_greedy ? 0.0f : cfg->gen.temperature, 0,
+                                                                   next_greedy ? 1.0f : cfg->gen.top_p, next_greedy ? 0.0f : cfg->gen.min_p, &rng);
+                        if (x < 0) { rng = rs; g_fk_invalid++; }
+                        else if (fk == 2) { rng = rs; fk_shadow_x = x; }
+                        else if (x == toks[1]) { g_fk_kept++; greedy_sampling = next_greedy; continue; }   /* the draft IS the new-mode draw: keep the block */
+                        else { rng = rs; g_fk_redraw++; }   /* the shipped path redraws the same x from the same logits */
+                    }
                     /* Later tokens were proposed under the old parser mode.
                      * Re-evaluate this boundary token to restore its logits,
                      * then sample the suffix under the new mode. */
@@ -11134,6 +11246,7 @@ static void worker_run_deferred_compact(agent_worker *w) {
  * thread owns all DS4 session mutation, tool execution, and compaction. */
 static void *worker_main(void *arg) {
     agent_worker *w = arg;
+    ds4_gpu_llms_startup_mark("agent: worker start");
     agent_trace(w, "agent worker start ctx=%d backend=%s model=%s trace=%s",
                 agent_worker_effective_ctx_size(w),
                 ds4_backend_name(w->cfg->engine.backend),
@@ -12706,6 +12819,9 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
                     cfg->gen.trace_path, strerror(errno));
             return -1;
         }
+        { const char *gd = getenv("LLMS_DS4_GUARDS"); if (gd && *gd && *gd != '0') {
+              agent_trace_time(w->trace);
+              fputs(" llms trace format: every per-token line has one shape -- the lines right after a batch header (its label, start, len) are that batch's PROMPT tokens (len - start of them); the lines between a round's prefill-sync-done and its generation-finished are GENERATED tokens\n", w->trace); fflush(w->trace); } }
     }
     if (pthread_create(&w->thread, NULL, worker_main, w) != 0) return -1;
     return 0;
@@ -13548,7 +13664,7 @@ int main(int argc, char **argv) {
         }
         if (skip_cuda) {
             cfg.engine.backend = DS4_BACKEND_CPU;
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+            if ((llms_adopted_engine_defaults(&cfg.engine), ds4_engine_open(&engine, &cfg.engine)) != 0) return 1;
         } else {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -13563,7 +13679,7 @@ int main(int argc, char **argv) {
             if (ds4_engine_create_with_gpu_config(
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+    } else if ((llms_adopted_engine_defaults(&cfg.engine), ds4_engine_open(&engine, &cfg.engine)) != 0) {
         return 1;
     }
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {

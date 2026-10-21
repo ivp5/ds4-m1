@@ -9,6 +9,7 @@ QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
+MODEL_REVISION=main
 DS41_Q2_FILE="DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf"
 DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
 DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
@@ -289,6 +290,7 @@ case "$MODEL" in
     ds41f-q2)
         REPO=$DS41_REPO
         MODEL_FILE=$DS41_Q2_FILE
+        MODEL_REVISION=9dcee51692e6540f697141fc98b097e3c96492a3
         FORCE_HF_DOWNLOAD=1
         ;;
     ds41f-q4)
@@ -459,7 +461,7 @@ artifact_identity() {
             ;;
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
-            expected_sha=1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
+            expected_sha=5296e85ff64b42ecb62c8d0c0c54e1caa07e3df8e93112f2365ebbaed62ce93a
             ;;
         "$DS41_Q4_FILE")
             expected_bytes=518596067328
@@ -536,9 +538,9 @@ download_one_hf() {
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+        "$HF_CMD" download "$REPO" "$file" --repo-type model --revision "$MODEL_REVISION" --local-dir "$OUT_DIR" --token "$TOKEN"
     else
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
+        "$HF_CMD" download "$REPO" "$file" --repo-type model --revision "$MODEL_REVISION" --local-dir "$OUT_DIR"
     fi
 
     if [ "$hf_out" != "$out" ] && [ -s "$hf_out" ]; then

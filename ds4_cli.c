@@ -1,4 +1,6 @@
 #include "ds4.h"
+int ds4_session_llms_rerun_rows(ds4_session *s, const int *tokens, int k, float *row_logits);   /* llms PPL_REPEAT */
+int ds4_gpu_llms_alt_off(const char *name);   /* llms PPL_REPEAT */
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
@@ -611,7 +613,76 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
+        {
+            static long tb = -2; static int inside = -1; static int fpv[64]; static int fpn = 0, fpi = -1;
+            if (tb == -2) { const char *e = getenv("LLMS_DS4_THINK_BUDGET"); tb = (e && *e) ? atol(e) : -1; }
+            if (inside < 0) inside = ds4_think_mode_enabled(think_mode) ? 1 : 0;
+            const int te = ds4_token_think_end(engine);
+            if (fpi >= 0 && fpi < fpn) token = fpv[fpi++];
+            else if (tb > 0 && inside && generated >= tb && te >= 0 && token != te) {
+                token = te;
+                fprintf(stderr, "llms: think budget %ld reached at completion %d: </think> forced\n", tb, generated);
+                const char *fp = getenv("LLMS_DS4_THINK_FORCE_PREFIX");
+                if (fp && *fp && fpi < 0) {
+                    char buf[256]; size_t n = 0;
+                    for (const char *q = fp; *q && n + 1 < sizeof buf; q++) { if (q[0] == '\\' && q[1] == 'n') { buf[n++] = '\n'; q++; } else buf[n++] = *q; }
+                    buf[n] = 0;
+                    ds4_tokens tv = {0}; ds4_tokenize_text(engine, buf, &tv);
+                    fpn = 0; for (int k = 0; k < tv.len && k < 64; k++) fpv[fpn++] = tv.v[k];
+                    ds4_tokens_free(&tv); fpi = 0;
+                    fprintf(stderr, "llms: answer opening forced after the think budget (%d tokens)\n", fpn);
+                }
+            }
+            if (token == te) inside = 0;
+        }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
+        {
+            static int sc = -1; static int *hist; static int hn, hcap; static float *rows; static int vocab; static long vsteps, vacc, osteps;
+            if (sc < 0) { const char *e2 = getenv("LLMS_DS4_SPEC_COPY"); sc = e2 && *e2 && *e2 != '0' && cfg->gen.temperature <= 0.0f;
+                          if (sc) { fprintf(stderr, "llms: spec copy (a copy drafter's proposal verified as a 2-row step)\n");
+                                    hcap = prompt->len + max_tokens + 16; hist = malloc((size_t)hcap * sizeof(int)); memcpy(hist, prompt->v, (size_t)prompt->len * sizeof(int)); hn = prompt->len;
+                                    float probe[1]; (void)probe; vocab = 1 << 17; while (vocab <= (1 << 22)) { float *t = malloc((size_t)vocab * sizeof(float)); const int n = ds4_session_copy_logits(session, t, vocab); free(t); if (n > 0) { vocab = n; break; } vocab *= 2; }
+                                    rows = malloc((size_t)2 * vocab * sizeof(float));
+                                    atexit_b(^{ fprintf(stderr, "llms spec copy: %ld verify steps (%ld accepted), %ld one-token steps\n", vsteps, vacc, osteps); }); } }
+            if (sc) {
+                size_t piece_len = 0; char *piece = ds4_token_text(engine, token, &piece_len);
+                token_printer_write_text(&printer, piece, piece_len); fflush(stdout); free(piece);
+                generated++; hist[hn++] = token;
+                if (generated >= max_tokens || cli_interrupt_requested()) continue;
+                int prop = -1;   /* the longest earlier occurrence of the current suffix (8 / 6 / 4 / 3 tokens), most recent first */
+                static const int ns[4] = { 8, 6, 4, 3 };
+                for (int q = 0; q < 4 && prop < 0; q++) {
+                    const int n = ns[q]; if (hn < n + 1) continue;
+                    for (int jj = hn - 1; jj >= n; jj--) {   /* an occurrence ending at jj (exclusive) with a known continuation hist[jj], jj < hn */
+                        if (jj == hn) continue;
+                        if (memcmp(&hist[jj - n], &hist[hn - n], (size_t)n * sizeof(int)) == 0 && jj < hn) { prop = hist[jj]; break; }
+                    }
+                }
+                cli_dist_busy_set(cfg, true);
+                if (prop < 0 || generated + 1 > max_tokens) {
+                    const int rc2 = ds4_session_eval(session, token, err, sizeof(err)); osteps++;
+                    cli_dist_busy_set(cfg, false);
+                    if (rc2 != 0) { fprintf(stderr, "ds4: decode failed: %s\n", err); ds4_session_free(session); return 1; }
+                    continue;
+                }
+                const int vt[2] = { token, prop };
+                const int rc3 = ds4_session_eval_rows(session, vt, 2, rows, err, sizeof(err)); vsteps++;
+                cli_dist_busy_set(cfg, false);
+                if (rc3 != 0) { fprintf(stderr, "ds4: verify failed: %s\n", err); ds4_session_free(session); return 1; }
+                int a0 = 0; for (int v = 1; v < vocab; v++) if (rows[v] > rows[a0]) a0 = v;
+                if (a0 == prop) {   /* accepted: the proposal is the next token; the second row's logits are in the session already */
+                    vacc++;
+                    if (ds4_token_is_stop_for_think_mode(engine, prop, think_mode)) break;
+                    piece_len = 0; piece = ds4_token_text(engine, prop, &piece_len);
+                    token_printer_write_text(&printer, piece, piece_len); fflush(stdout); free(piece);
+                    generated++; hist[hn++] = prop;
+                } else {
+                    if (ds4_session_rollback_rows(session, 1, 2) != 0) { fprintf(stderr, "ds4: rollback failed\n"); ds4_session_free(session); return 1; }
+                    ds4_session_set_logits(session, rows, vocab);
+                }
+                continue;
+            }
+        }
 
         int toks[17];
         int ntok = 0;
@@ -1102,12 +1173,28 @@ static int run_decode_consistency(ds4_engine *engine, const cli_config *cfg,
 static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     char *text = read_prompt_file(cfg->gen.perplexity_file_path, true);
     ds4_tokens tokens = {0};
-    ds4_tokenize_text(engine, text, &tokens);
+    {
+
+        const char *e = getenv("LLMS_DS4_PPL_IDS");
+        if (e && *e && *e != '0') {
+            char *s = text, *end = NULL;
+            for (long v = strtol(s, &end, 10); end != s; s = end, v = strtol(s, &end, 10)) ds4_tokens_push(&tokens, (int)v);
+            fprintf(stderr, "llms: perplexity ids (%d token ids read from the file, no tokenization)\n", tokens.len);
+        } else ds4_tokenize_text(engine, text, &tokens);
+    }
     free(text);
 
     /* Seed the graph with enough real context to stay on the normal Metal
      * prefill path; scoring starts immediately after this fixed prefix. */
-    const int prefix_len = 32;
+    int prefix_len = 32;
+    { const char *e = getenv("LLMS_DS4_PPL_PREFIX"); if (e && *e && atoi(e) >= 32) { prefix_len = atoi(e); fprintf(stderr, "llms: perplexity prefix %d tokens (through the prompt path)\n", prefix_len); } }   /* llms PPL_PREFIX (apply_ppl_prefix.py) */
+    {
+
+        const char *pf = getenv("LLMS_DS4_PPL_PREFIX_FILE");
+        if (pf && *pf) { char *t2 = read_prompt_file(pf, true); ds4_tokens tp = {0}; ds4_tokenize_text(engine, t2, &tp); free(t2);
+                         if (tp.len >= 32) prefix_len = tp.len;
+                         fprintf(stderr, "llms: perplexity prefix file %d tokens (of %d)\n", prefix_len, tokens.len); ds4_tokens_free(&tp); }
+    }
     if (tokens.len <= prefix_len) {
         fprintf(stderr, "ds4: --perplexity-file needs more than %d tokens\n", prefix_len);
         ds4_tokens_free(&tokens);
@@ -1147,7 +1234,105 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     }
     ds4_tokens_free(&prefix);
 
-    double nll = 0.0;
+    double nll = 0.0;   /* llms VERIFY_ROWS: shared with the one-token loop below */
+    {   /* llms VERIFY_ROWS: LLMS_DS4_PPL_ROWS=k scores the text through k-row verify steps (perfect drafts) */
+        const char *pr = getenv("LLMS_DS4_PPL_ROWS"); const int K = pr ? atoi(pr) : 0;
+        if (K >= 2 || (K == 1 && getenv("LLMS_DS4_VERIFY_ONE"))) {   /* llms VERIFY_ONE: K = 1 through the batched step */
+            const char *lp = getenv("LLMS_DS4_PPL_ROWS_LOG"); FILE *lf = lp && *lp ? fopen(lp, "w") : NULL;
+            const char *pp = getenv("LLMS_DS4_PPL_DUMP"); FILE *pd = pp && *pp ? fopen(pp, "w") : NULL;
+            const int nv = ds4_session_copy_logits(session, NULL, 0) ;
+            (void)nv;
+            float *held = malloc((size_t)1 << 20), *rows = NULL; int vocab = 0;
+            { float probe[1]; (void)probe; }
+            vocab = 0; while (!ds4_session_copy_logits(session, held, vocab)) { vocab = vocab ? vocab * 2 : 65536; held = realloc(held, (size_t)vocab * sizeof(float)); if (vocab > (1 << 22)) break; }
+            vocab = ds4_session_copy_logits(session, held, vocab);
+            rows = malloc((size_t)K * (size_t)vocab * sizeof(float));
+            int j = 0;
+            while (j < scored) {
+                const int i = prefix_len + j;
+                ds4_token_score sc;
+                if (!ds4_session_token_logprob(session, tokens.v[i], &sc)) { fprintf(stderr, "ds4: failed to score token %d\n", i); return 1; }
+                nll -= (double)sc.logprob; if (pd) fprintf(pd, "%d %d %.9f\n", i, tokens.v[i], (double)sc.logprob);
+                { static int llms_rtk = -1; static ds4_token_score llms_rtkb[256];   /* llms PPL_ROWS_TOPK */ if (llms_rtk < 0) { const char *e = getenv("LLMS_DS4_PPL_TOPK"); llms_rtk = e && atoi(e) > 0 ? (atoi(e) > 256 ? 256 : atoi(e)) : 0; } if (pd && llms_rtk) { const int n = ds4_session_top_logprobs(session, llms_rtkb, llms_rtk); fprintf(pd, "K %d", i); for (int q = 0; q < n; q++) fprintf(pd, " %d %.6f", llms_rtkb[q].id, (double)llms_rtkb[q].logprob); fputc('\n', pd); } }
+                int c = scored - j; if (c > K) c = K;
+                if (j + c >= scored) c = scored - j;   /* the last chunk: its final row's logits are never used */
+                if (c < (K == 1 ? 1 : 2)) { j += 1; if (j < scored && ds4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) { fprintf(stderr, "\nds4: eval failed at %d: %s\n", i, err); return 1; } continue; }
+                {   /* llms PPL_JUNK (apply_ppl_junk.py): [x_i, junk] rolled back to row 0 */
+                    static int pj = -1; if (pj < 0) { pj = getenv("LLMS_DS4_PPL_JUNK") != NULL; if (pj) fprintf(stderr, "llms: ppl junk (2-row steps [x, junk] rolled back to row 0)\n"); }
+                    if (pj && K == 2) {
+                        const int jt[2] = { tokens.v[i], tokens.v[i] == 13 ? 14 : 13 };
+                        if (ds4_session_eval_rows(session, jt, 2, rows, err, sizeof(err)) != 0 || ds4_session_rollback_rows(session, 1, 2) != 0) {
+                            fprintf(stderr, "\nds4: junk step failed at %d: %s\n", i, err); return 1; }
+                        ds4_session_set_logits(session, rows, vocab);
+                        j += 1;
+                        continue;
+                    }
+                }
+                struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+                if (ds4_session_eval_rows(session, &tokens.v[i], c, rows, err, sizeof(err)) != 0) { fprintf(stderr, "\nds4: verify rows failed at %d: %s\n", i, err); return 1; }
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                if (lf) { fprintf(lf, "%.3f %d %d\n", (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, c, i); fflush(lf); }
+                {
+
+
+#define llms_rep_am(nm) ({ int _am = -1; if (nm) { _am = 0; char _nb[256]; snprintf(_nb, sizeof _nb, "%s", nm); int _bi = 0; char *_sv = NULL; \
+    for (char *_t = strtok_r(_nb, ",", &_sv); _t && _bi < 8; _t = strtok_r(NULL, ",", &_sv), _bi++) _am |= ds4_gpu_llms_alt_off(_t) << _bi; } _am; })
+                    static int rep = -1; static FILE *rf; static const char *rname; static float *held; static size_t heldn;
+                    extern void ds4_gpu_llms_alt_force(const char *names);
+                    static int randrep = -1;
+                    if (randrep < 0) { const char *e = getenv("LLMS_DS4_PPL_RANDOM"); randrep = e && *e && *e != '0'; }
+                    if (rep < 0) { const char *e = getenv("LLMS_DS4_PPL_REPEAT"); rep = e && atoi(e) > 1 ? atoi(e) : 0; const char *p = getenv("LLMS_DS4_PPL_REP_LOG");
+                                   rf = p && *p ? fopen(p, "w") : NULL; rname = getenv("LLMS_DS4_PPL_REP_NAME"); if (rname && !*rname) rname = NULL;
+                                   if (rep) fprintf(stderr, "llms: ppl repeat %d (each full %d-row step re-run at its position after a keep-0 rollback; LLMS_DS4_DEEPRB=1 needed)\n", rep, K); }
+                    if (rep && c == K) {
+                        int phase = 0;
+                        if (randrep) {
+                            const char *a = getenv("LLMS_DS4_ALTW"), *b = getenv("LLMS_DS4_ALT"), *d = getenv("LLMS_DS4_ALT2D");
+                            if (rep != 5 || !rf || !rname || strchr(rname, ',') || (a && *a) || (b && *b) || (d && *d)) {
+                                fprintf(stderr, "random repeat requires R5, log, one ALT name and no periodic ALT schedule\n"); return 1;
+                            }
+                            phase = arc4random_uniform(2) ? 1 : -1;
+                            fprintf(rf, "R %d %d\n", i, phase); fflush(rf);
+                        }
+                        const size_t nf = (size_t)c * (size_t)vocab;
+                        if (heldn < nf) { free(held); held = malloc(nf * sizeof(float)); heldn = held ? nf : 0; }
+                        if (held) memcpy(held, rows, nf * sizeof(float));
+                        if (rf) fprintf(rf, "%d 0 %.3f 0 %d\n", i, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, llms_rep_am(rname));
+                        for (int q = 1; q < rep; q++) {
+                            if (randrep) {
+                                const int off = (q == 1 || q == 4) ? phase == 1 : phase == -1;
+                                ds4_gpu_llms_alt_force(off ? rname : "");
+                            }
+                            struct timespec r0, r1; clock_gettime(CLOCK_MONOTONIC, &r0);
+                            const int rr = ds4_session_llms_rerun_rows(session, &tokens.v[i], c, rows);
+                            clock_gettime(CLOCK_MONOTONIC, &r1);
+                            if (randrep && rr != 0) ds4_gpu_llms_alt_force("");
+                            if (rr != 0) { fprintf(stderr, "\nds4: ppl repeat failed at %d (repeat %d, code %d)\n", i, q, rr); return 1; }
+                            double mx = 0.0; if (held) for (size_t z = 0; z < nf; z++) { const double dd = fabs((double)rows[z] - (double)held[z]); if (dd > mx) mx = dd; }
+                            if (rf) fprintf(rf, "%d %d %.3f %.3g %d\n", i, q, (r1.tv_sec - r0.tv_sec) * 1e3 + (r1.tv_nsec - r0.tv_nsec) / 1e6, mx, llms_rep_am(rname));
+                        }
+                        if (randrep) ds4_gpu_llms_alt_force("");
+                        if (rf) fflush(rf);
+                    }
+                }
+                for (int r = 0; r + 1 < c; r++) {   /* row r's logits predict token i + r + 1 */
+                    ds4_session_set_logits(session, rows + (size_t)r * vocab, vocab);
+                    if (!ds4_session_token_logprob(session, tokens.v[i + r + 1], &sc)) { fprintf(stderr, "ds4: failed to score token %d\n", i + r + 1); return 1; }
+                    nll -= (double)sc.logprob; if (pd) fprintf(pd, "%d %d %.9f\n", i + r + 1, tokens.v[i + r + 1], (double)sc.logprob);
+                    { static int llms_rtk = -1; static ds4_token_score llms_rtkb[256];   /* llms PPL_ROWS_TOPK */ if (llms_rtk < 0) { const char *e = getenv("LLMS_DS4_PPL_TOPK"); llms_rtk = e && atoi(e) > 0 ? (atoi(e) > 256 ? 256 : atoi(e)) : 0; } if (pd && llms_rtk) { const int n = ds4_session_top_logprobs(session, llms_rtkb, llms_rtk); fprintf(pd, "K %d", i + r + 1); for (int q = 0; q < n; q++) fprintf(pd, " %d %.6f", llms_rtkb[q].id, (double)llms_rtkb[q].logprob); fputc('\n', pd); } }
+                }
+                ds4_session_set_logits(session, rows + (size_t)(c - 1) * vocab, vocab);
+                j += c;
+                if ((j % 256) < c || j >= scored) { fprintf(stderr, "ds4: perplexity (rows %d) scored %d/%d\r", K, j, scored); fflush(stderr); }
+            }
+            if (pd) fclose(pd); if (lf) fclose(lf); free(rows); free(held);
+            fputc('\n', stderr);
+            const double avg_nll = nll / (double)scored;
+            printf("tokens=%d scored=%d nll=%.9f avg_nll=%.9f ppl=%.9f (verify rows %d)\n", tokens.len, scored, nll, avg_nll, exp(avg_nll), K);
+            ds4_session_free(session); ds4_tokens_free(&tokens);
+            return 0;
+        }
+    }
     for (int j = 0; j < scored; j++) {
         const int i = prefix_len + j;
         ds4_token_score score;
@@ -1158,6 +1343,16 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
             return 1;
         }
         nll -= (double)score.logprob;
+        { static FILE *llms_pd = NULL; static int llms_pd_init = 0;   /* llms LLMS_DS4_PPL_DUMP */
+          if (!llms_pd_init) { const char *pp = getenv("LLMS_DS4_PPL_DUMP"); llms_pd = (pp && *pp) ? fopen(pp, "w") : NULL; llms_pd_init = 1; }
+          if (llms_pd) { fprintf(llms_pd, "%d %d %.9f\n", i, tokens.v[i], (double)score.logprob);
+                         static int llms_tk = -1; static ds4_token_score llms_tkb[256];   /* llms PPL_TOPK (apply_ppl_topk.py) */
+                         if (llms_tk < 0) { const char *e = getenv("LLMS_DS4_PPL_TOPK"); llms_tk = e && atoi(e) > 0 ? (atoi(e) > 256 ? 256 : atoi(e)) : 0; }
+                         if (llms_tk) { const int n = ds4_session_top_logprobs(session, llms_tkb, llms_tk);
+                                        fprintf(llms_pd, "K %d", i);
+                                        for (int q = 0; q < n; q++) fprintf(llms_pd, " %d %.6f", llms_tkb[q].id, (double)llms_tkb[q].logprob);
+                                        fputc('\n', llms_pd); }
+                         fflush(llms_pd); } }
 
         if (((j + 1) % 256) == 0 || j + 1 == scored) {
             fprintf(stderr, "ds4: perplexity scored %d/%d\r", j + 1, scored);
@@ -2312,7 +2507,7 @@ int main(int argc, char **argv) {
         }
         cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
         if (skip_cuda) {
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+            if ((llms_adopted_engine_defaults(&cfg.engine), ds4_engine_open(&engine, &cfg.engine)) != 0) {
                 ds4_dist_options_free(cfg.dist);
                 free(cfg.prompt_owned);
                 return 1;
@@ -2334,7 +2529,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+    } else if ((llms_adopted_engine_defaults(&cfg.engine), ds4_engine_open(&engine, &cfg.engine)) != 0) {
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return 1;

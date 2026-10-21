@@ -1,0 +1,993 @@
+--- a/dsv4_misc_sg_llms4_llms11_llms13_llms15_llms16_llms17_llms18_tkfast.metal
++++ b/dsv4_misc_sg_llms4_llms11_llms13_llms15_llms16_llms17_llms18_tkfast.metal
+@@ -5474,24 +5474,6 @@
+     }
+ }
+ 
+-// Copy the selected compressed-key mask while retaining causal visibility.
+-// Image bidirectionality applies to raw keys only, never compressed keys.
+-struct ds4_metal_args_causal_comp_mask {
+-    uint n_comp, n_tokens, pos0, ratio, n_keys;
+-};
+-
+-kernel void kernel_dsv4_causal_comp_mask(
+-        constant ds4_metal_args_causal_comp_mask &args,
+-        device const float *selected_mask,
+-        device half *dst,
+-        uint2 gid [[thread_position_in_grid]]) {
+-    const uint col = gid.x, row = gid.y;
+-    if (col >= args.n_comp || row >= args.n_tokens) return;
+-    const ulong visible = (ulong(args.pos0) + ulong(row) + 1ul) / args.ratio;
+-    dst[ulong(row) * args.n_keys + col] = ulong(col) < visible
+-        ? half(selected_mask[ulong(row) * args.n_comp + col]) : half(-INFINITY);
+-}
+-
+ // Sorts each token's selected compressed rows by row id. The indexer selects by
+ // score, but attention scans compressed K/V in cache order in the dense graph.
+ // Sorting preserves that order while still letting the indexed attention kernel
+@@ -7108,3 +7090,965 @@
+ 
+     dst[ic * args.head_dim + id] = acc/sum;
+ }
++
++// llms LLMS_DS4_IDX_SCORE_SG (apply_ds4_idx_score_sg.py): indexer scores, R compressed rows per simdgroup, no threadgroup memory,
++// no barrier; same per-lane dots, same simd_sum, same relu x scale x weight, heads added in the engine's order, strictly.
++template<short R, short NSGX>
++void kernel_glm_indexer_score_one_sg_impl(
++        constant ds4_metal_args_glm_indexer_score_one & args,
++        device const char *q,
++        device const float *weights,
++        device const char *indexer_key_cache,
++        device float *scores,
++        uint tg,
++        ushort lane,
++        ushort sg) {
++    const uint row0 = (tg * (uint)NSGX + (uint)sg) * (uint)R;
++    if (row0 >= args.n_rows || args.n_head != 32u || args.head_dim != 128u || args.cache_f16 != 0u) {
++        return;
++    }
++    float4 k[R];
++    FOR_UNROLL (short r = 0; r < R; ++r) {
++        const uint row = min(row0 + (uint)r, args.n_rows - 1u);   // reads clamped, writes guarded
++        k[r] = ((device const float4 *)indexer_key_cache)[(uint64_t)row * 32u + lane];
++    }
++    float acc[R];
++    FOR_UNROLL (short r = 0; r < R; ++r) acc[r] = 0.0f;
++    device const float4 *q4 = (device const float4 *)q;
++    for (uint head0 = 0; head0 < 32u; head0 += 4u) {
++        float p[R][4];
++        FOR_UNROLL (short j = 0; j < 4; ++j) {
++            const float4 qv = q4[(head0 + (uint)j) * 32u + lane];
++            const float w = weights[head0 + (uint)j];
++            FOR_UNROLL (short r = 0; r < R; ++r) {
++                float s = dot(qv, k[r]);
++                s = simd_sum(s);
++                p[r][j] = max(s * args.scale, 0.0f) * w;
++            }
++        }
++        FOR_UNROLL (short r = 0; r < R; ++r) {
++#pragma clang fp reassociate(off)
++#pragma clang fp contract(off)
++            acc[r] = acc[r] + p[r][0];
++            acc[r] = acc[r] + p[r][1];
++            acc[r] = acc[r] + p[r][2];
++            acc[r] = acc[r] + p[r][3];
++        }
++    }
++    if (lane == 0) {
++        FOR_UNROLL (short r = 0; r < R; ++r) {
++            if (row0 + (uint)r < args.n_rows) scores[row0 + (uint)r] = acc[r];
++        }
++    }
++}
++kernel void kernel_glm_indexer_score_one_sg(
++        constant ds4_metal_args_glm_indexer_score_one & args,
++        device const char *q,
++        device const float *weights,
++        device const char *indexer_key_cache,
++        device float *scores,
++        uint tg [[threadgroup_position_in_grid]],
++        ushort lane [[thread_index_in_simdgroup]],
++        ushort sg [[simdgroup_index_in_threadgroup]]) {
++    kernel_glm_indexer_score_one_sg_impl<4, 4>(args, q, weights, indexer_key_cache, scores, tg, lane, sg);   // 4 rows per simdgroup, 4 simdgroups
++}
++
++// ---- appended from dsv4_misc_llms.metal (rows attention, LLMS_DS4_V41_ROWS_ATTN) ----
++
++
++// batched step. Copy of kernel_dsv4_indexed_mixed_attention_heads8_split / _split_reduce with every per-session quantity taken from a
++// per-row record (GPU addresses of q, raw window ring, compressed cache, top-k row, output heads; position, ring start, n_raw, n_comp).
++struct llms_v41_row {
++    ulong q, raw, comp, topk, dst;
++    uint pos, raw_start, n_raw, n_comp;
++};
++
++kernel void kernel_llms_v41_rows_attn_split(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        constant llms_v41_row *rows,
++        device       char *tmp,
++        threadgroup half4 *kv_shared [[threadgroup(0)]],
++        uint3  tgpig [[threadgroup_position_in_grid]],
++        ushort tid   [[thread_index_in_threadgroup]],
++        ushort lane  [[thread_index_in_simdgroup]],
++        ushort sg    [[simdgroup_index_in_threadgroup]]) {
++    constexpr uint rows_per_block = 16u;
++    constexpr uint vecs_per_row = 128u;
++    const uint token = tgpig.x;
++    const uint head = tgpig.y * 8u + (uint)sg;
++    const uint split = tgpig.z;
++    const uint n_splits = args.n_splits;
++    if (token >= args.n_tokens || head >= args.n_head || n_splits < 2u || n_splits > 31u || split >= n_splits) return;
++    const llms_v41_row R = rows[token];
++    device const char *q = reinterpret_cast<device const char *>(R.q);
++    device const char *raw_kv = reinterpret_cast<device const char *>(R.raw);
++    device const char *comp_kv = reinterpret_cast<device const char *>(R.comp);
++    device const int32_t *row_topk = reinterpret_cast<device const int32_t *>(R.topk);
++
++    device const float4 *q4 = (device const float4 *)(q + (uint64_t)head * args.q_head_stride);
++    const half4 q0 = (half4)q4[lane +  0];
++    const half4 q1 = (half4)q4[lane + 32];
++    const half4 q2 = (half4)q4[lane + 64];
++    const half4 q3 = (half4)q4[lane + 96];
++    float M = -FLT_MAX/2.0f;
++    float S = 0.0f;
++    float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
++
++    const uint qpos = R.pos;
++    const uint first_raw_pos = qpos + 1u - R.n_raw;
++    const uint raw_last_pos = qpos;
++    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ? qpos + 1u - args.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first);
++    const uint raw_last = min(qpos, raw_last_pos);
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint total_rows = raw_count + args.top_k;
++    const uint rows_per_split = (total_rows + n_splits - 1u) / n_splits;
++    const uint split_first = min(split * rows_per_split, total_rows);
++    const uint split_last = min(split_first + rows_per_split, total_rows);
++    const uint visible = min((qpos + 1u) / args.ratio, R.n_comp);
++
++    for (uint seq0 = split_first; seq0 < split_last; seq0 += rows_per_block) {
++        const uint n_rows = min(rows_per_block, split_last - seq0);
++        for (uint off = (uint)tid; off < n_rows * vecs_per_row; off += 256u) {
++            const uint r = off / vecs_per_row;
++            const uint c = off - r * vecs_per_row;
++            const uint seq = seq0 + r;
++            half4 value = half4(0.0h);
++            if (seq < raw_count) {
++                const uint pos = raw_first + seq;
++                const uint logical = pos - first_raw_pos;
++                const uint row = (R.raw_start + logical) % args.raw_cap;
++                device const float4 *src = (device const float4 *)(raw_kv + (uint64_t)row * args.raw_row_stride);
++                value = (half4)src[c];
++            } else {
++                const int32_t idx = row_topk[seq - raw_count];
++                if (idx >= 0 && (uint)idx < visible) {
++                    value = dsv4_load_cache_h4(comp_kv, args.comp_row_stride, (uint)idx, c, args.comp_kv_f16 != 0u);
++                }
++            }
++            kv_shared[off] = value;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (uint r = 0; r < n_rows; r++) {
++            const uint seq = seq0 + r;
++            bool valid = true;
++            if (seq >= raw_count) {
++                const int32_t idx = row_topk[seq - raw_count];
++                valid = idx >= 0 && (uint)idx < visible;
++            }
++            if (valid) {
++                dsv4_attend_shared_h4_row_at(kv_shared, r, q0, q1, q2, q3, args.scale, lane, M, S, o0, o1, o2, o3);
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    const uint64_t row = (uint64_t)token * args.n_head + head;
++    device float4 *partials = (device float4 *)tmp;
++    partials[(row * vecs_per_row + lane +  0u) * n_splits + split] = o0;
++    partials[(row * vecs_per_row + lane + 32u) * n_splits + split] = o1;
++    partials[(row * vecs_per_row + lane + 64u) * n_splits + split] = o2;
++    partials[(row * vecs_per_row + lane + 96u) * n_splits + split] = o3;
++    if (lane == 0u) {
++        device float *stats = (device float *)(partials + n_rows * vecs_per_row * n_splits);
++        const uint64_t stat = (row * n_splits + split) * 2u;
++        stats[stat + 0u] = S;
++        stats[stat + 1u] = M;
++    }
++}
++
++kernel void kernel_llms_v41_rows_attn_reduce(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        constant llms_v41_row *rows,
++        device const char *tmp,
++        device const char *sinks,
++        uint tgpig [[threadgroup_position_in_grid]],
++        ushort lane [[thread_index_in_simdgroup]],
++        ushort sg   [[simdgroup_index_in_threadgroup]]) {
++    constexpr uint vecs_per_row = 128u;
++    const uint n_splits = args.n_splits;
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    const uint64_t row = tgpig;
++    if (row >= n_rows || n_splits < 2u || n_splits > 31u) return;
++    const uint token = (uint)(row / args.n_head);
++    const uint head = (uint)(row % args.n_head);
++    device const float4 *partials = (device const float4 *)tmp;
++    device const float *stats = (device const float *)(partials + n_rows * vecs_per_row * n_splits);
++    float part_sum = 0.0f;
++    float part_max = -FLT_MAX/2.0f;
++    if ((uint)lane < n_splits) {
++        const uint64_t stat = (row * n_splits + (uint)lane) * 2u;
++        part_sum = stats[stat + 0u];
++        part_max = stats[stat + 1u];
++    } else if ((uint)lane == n_splits) {
++        part_sum = 1.0f;
++        part_max = ((device const float *)sinks)[head];
++    }
++    const float global_max = simd_max(part_max);
++    const float part_scale = part_sum > 0.0f ? exp(part_max - global_max) : 0.0f;
++    const float total_sum = simd_sum(part_sum * part_scale);
++    const float inv_sum = total_sum > 0.0f ? 1.0f / total_sum : 0.0f;
++    device float4 *out = reinterpret_cast<device float4 *>(rows[token].dst + (ulong)head * args.dst_head_stride);
++    for (uint i = (uint)sg; i < vecs_per_row; i += 4u) {
++        float4 value = float4(0.0f);
++        if ((uint)lane < n_splits) {
++            value = partials[(row * vecs_per_row + i) * n_splits + (uint)lane] * part_scale;
++        }
++        value = simd_sum(value);
++        if (lane == 0u) {
++            out[i] = value * inv_sum;
++        }
++    }
++}
++
++/* llms ROWS_ROPE (make_misc_rope_rows.py): kernel_dsv41_rope for several rows at their own positions and addresses */
++struct llms_rope_row { ulong x; uint pos; uint pad; };
++struct llms_rope_rows_args { uint width; uint heads; uint rows; uint inverse; uint bf16_first; uint pad[3]; float frequencies[32]; };
++kernel void kernel_llms_dsv41_rope_rows(
++        constant llms_rope_rows_args &args [[buffer(0)]],
++        constant llms_rope_row *rows [[buffer(1)]],
++        uint2 group [[threadgroup_position_in_grid]],
++        uint lane [[thread_index_in_simdgroup]]) {
++    device float *x = (device float *)rows[group.y].x;
++    const float theta = float(rows[group.y].pos) * args.frequencies[lane];
++    const float c = precise::cos(theta);
++    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
++    const ulong h0 = (ulong)group.x * args.width;
++    if (args.bf16_first) for (uint e = lane; e < args.width - 64u; e += 32u) x[h0 + e] = dsv41_bf16(x[h0 + e]);
++    const ulong i = h0 + args.width - 64u + 2u * lane;
++    float re = x[i], im = x[i + 1u];
++    if (args.bf16_first) { re = dsv41_bf16(re); im = dsv41_bf16(im); }
++    x[i] = dsv41_bf16(re * c - im * s);
++    x[i + 1u] = dsv41_bf16(re * s + im * c);
++}
++
++// llms ROWS_ATTN_HG (make_misc_attn_hg.py): the split kernel with 16 heads per threadgroup (512 threads); the KV rows staged 4 times per token instead of 8
++kernel void kernel_llms_v41_rows_attn_split_hg16(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        constant llms_v41_row *rows,
++        device       char *tmp,
++        threadgroup half4 *kv_shared [[threadgroup(0)]],
++        uint3  tgpig [[threadgroup_position_in_grid]],
++        ushort tid   [[thread_index_in_threadgroup]],
++        ushort lane  [[thread_index_in_simdgroup]],
++        ushort sg    [[simdgroup_index_in_threadgroup]]) {
++    constexpr uint rows_per_block = 16u;
++    constexpr uint vecs_per_row = 128u;
++    const uint token = tgpig.x;
++    const uint head = tgpig.y * 16u + (uint)sg;   /* llms ROWS_ATTN_HG: 16 heads per threadgroup */
++    const uint split = tgpig.z;
++    const uint n_splits = args.n_splits;
++    if (token >= args.n_tokens || head >= args.n_head || n_splits < 2u || n_splits > 31u || split >= n_splits) return;
++    const llms_v41_row R = rows[token];
++    device const char *q = reinterpret_cast<device const char *>(R.q);
++    device const char *raw_kv = reinterpret_cast<device const char *>(R.raw);
++    device const char *comp_kv = reinterpret_cast<device const char *>(R.comp);
++    device const int32_t *row_topk = reinterpret_cast<device const int32_t *>(R.topk);
++
++    device const float4 *q4 = (device const float4 *)(q + (uint64_t)head * args.q_head_stride);
++    const half4 q0 = (half4)q4[lane +  0];
++    const half4 q1 = (half4)q4[lane + 32];
++    const half4 q2 = (half4)q4[lane + 64];
++    const half4 q3 = (half4)q4[lane + 96];
++    float M = -FLT_MAX/2.0f;
++    float S = 0.0f;
++    float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
++
++    const uint qpos = R.pos;
++    const uint first_raw_pos = qpos + 1u - R.n_raw;
++    const uint raw_last_pos = qpos;
++    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ? qpos + 1u - args.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first);
++    const uint raw_last = min(qpos, raw_last_pos);
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint total_rows = raw_count + args.top_k;
++    const uint rows_per_split = (total_rows + n_splits - 1u) / n_splits;
++    const uint split_first = min(split * rows_per_split, total_rows);
++    const uint split_last = min(split_first + rows_per_split, total_rows);
++    const uint visible = min((qpos + 1u) / args.ratio, R.n_comp);
++
++    for (uint seq0 = split_first; seq0 < split_last; seq0 += rows_per_block) {
++        const uint n_rows = min(rows_per_block, split_last - seq0);
++        for (uint off = (uint)tid; off < n_rows * vecs_per_row; off += 512u) {
++            const uint r = off / vecs_per_row;
++            const uint c = off - r * vecs_per_row;
++            const uint seq = seq0 + r;
++            half4 value = half4(0.0h);
++            if (seq < raw_count) {
++                const uint pos = raw_first + seq;
++                const uint logical = pos - first_raw_pos;
++                const uint row = (R.raw_start + logical) % args.raw_cap;
++                device const float4 *src = (device const float4 *)(raw_kv + (uint64_t)row * args.raw_row_stride);
++                value = (half4)src[c];
++            } else {
++                const int32_t idx = row_topk[seq - raw_count];
++                if (idx >= 0 && (uint)idx < visible) {
++                    value = dsv4_load_cache_h4(comp_kv, args.comp_row_stride, (uint)idx, c, args.comp_kv_f16 != 0u);
++                }
++            }
++            kv_shared[off] = value;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (uint r = 0; r < n_rows; r++) {
++            const uint seq = seq0 + r;
++            bool valid = true;
++            if (seq >= raw_count) {
++                const int32_t idx = row_topk[seq - raw_count];
++                valid = idx >= 0 && (uint)idx < visible;
++            }
++            if (valid) {
++                dsv4_attend_shared_h4_row_at(kv_shared, r, q0, q1, q2, q3, args.scale, lane, M, S, o0, o1, o2, o3);
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    const uint64_t row = (uint64_t)token * args.n_head + head;
++    device float4 *partials = (device float4 *)tmp;
++    partials[(row * vecs_per_row + lane +  0u) * n_splits + split] = o0;
++    partials[(row * vecs_per_row + lane + 32u) * n_splits + split] = o1;
++    partials[(row * vecs_per_row + lane + 64u) * n_splits + split] = o2;
++    partials[(row * vecs_per_row + lane + 96u) * n_splits + split] = o3;
++    if (lane == 0u) {
++        device float *stats = (device float *)(partials + n_rows * vecs_per_row * n_splits);
++        const uint64_t stat = (row * n_splits + split) * 2u;
++        stats[stat + 0u] = S;
++        stats[stat + 1u] = M;
++    }
++}
++
++
++// llms ROWS_ATTN_HG (make_misc_attn_hg.py): the split kernel with 32 heads per threadgroup (1024 threads); the KV rows staged 2 times per token instead of 8
++kernel void kernel_llms_v41_rows_attn_split_hg32(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        constant llms_v41_row *rows,
++        device       char *tmp,
++        threadgroup half4 *kv_shared [[threadgroup(0)]],
++        uint3  tgpig [[threadgroup_position_in_grid]],
++        ushort tid   [[thread_index_in_threadgroup]],
++        ushort lane  [[thread_index_in_simdgroup]],
++        ushort sg    [[simdgroup_index_in_threadgroup]]) {
++    constexpr uint rows_per_block = 16u;
++    constexpr uint vecs_per_row = 128u;
++    const uint token = tgpig.x;
++    const uint head = tgpig.y * 32u + (uint)sg;   /* llms ROWS_ATTN_HG: 32 heads per threadgroup */
++    const uint split = tgpig.z;
++    const uint n_splits = args.n_splits;
++    if (token >= args.n_tokens || head >= args.n_head || n_splits < 2u || n_splits > 31u || split >= n_splits) return;
++    const llms_v41_row R = rows[token];
++    device const char *q = reinterpret_cast<device const char *>(R.q);
++    device const char *raw_kv = reinterpret_cast<device const char *>(R.raw);
++    device const char *comp_kv = reinterpret_cast<device const char *>(R.comp);
++    device const int32_t *row_topk = reinterpret_cast<device const int32_t *>(R.topk);
++
++    device const float4 *q4 = (device const float4 *)(q + (uint64_t)head * args.q_head_stride);
++    const half4 q0 = (half4)q4[lane +  0];
++    const half4 q1 = (half4)q4[lane + 32];
++    const half4 q2 = (half4)q4[lane + 64];
++    const half4 q3 = (half4)q4[lane + 96];
++    float M = -FLT_MAX/2.0f;
++    float S = 0.0f;
++    float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
++
++    const uint qpos = R.pos;
++    const uint first_raw_pos = qpos + 1u - R.n_raw;
++    const uint raw_last_pos = qpos;
++    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ? qpos + 1u - args.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first);
++    const uint raw_last = min(qpos, raw_last_pos);
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint total_rows = raw_count + args.top_k;
++    const uint rows_per_split = (total_rows + n_splits - 1u) / n_splits;
++    const uint split_first = min(split * rows_per_split, total_rows);
++    const uint split_last = min(split_first + rows_per_split, total_rows);
++    const uint visible = min((qpos + 1u) / args.ratio, R.n_comp);
++
++    for (uint seq0 = split_first; seq0 < split_last; seq0 += rows_per_block) {
++        const uint n_rows = min(rows_per_block, split_last - seq0);
++        for (uint off = (uint)tid; off < n_rows * vecs_per_row; off += 1024u) {
++            const uint r = off / vecs_per_row;
++            const uint c = off - r * vecs_per_row;
++            const uint seq = seq0 + r;
++            half4 value = half4(0.0h);
++            if (seq < raw_count) {
++                const uint pos = raw_first + seq;
++                const uint logical = pos - first_raw_pos;
++                const uint row = (R.raw_start + logical) % args.raw_cap;
++                device const float4 *src = (device const float4 *)(raw_kv + (uint64_t)row * args.raw_row_stride);
++                value = (half4)src[c];
++            } else {
++                const int32_t idx = row_topk[seq - raw_count];
++                if (idx >= 0 && (uint)idx < visible) {
++                    value = dsv4_load_cache_h4(comp_kv, args.comp_row_stride, (uint)idx, c, args.comp_kv_f16 != 0u);
++                }
++            }
++            kv_shared[off] = value;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (uint r = 0; r < n_rows; r++) {
++            const uint seq = seq0 + r;
++            bool valid = true;
++            if (seq >= raw_count) {
++                const int32_t idx = row_topk[seq - raw_count];
++                valid = idx >= 0 && (uint)idx < visible;
++            }
++            if (valid) {
++                dsv4_attend_shared_h4_row_at(kv_shared, r, q0, q1, q2, q3, args.scale, lane, M, S, o0, o1, o2, o3);
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    const uint64_t row = (uint64_t)token * args.n_head + head;
++    device float4 *partials = (device float4 *)tmp;
++    partials[(row * vecs_per_row + lane +  0u) * n_splits + split] = o0;
++    partials[(row * vecs_per_row + lane + 32u) * n_splits + split] = o1;
++    partials[(row * vecs_per_row + lane + 64u) * n_splits + split] = o2;
++    partials[(row * vecs_per_row + lane + 96u) * n_splits + split] = o3;
++    if (lane == 0u) {
++        device float *stats = (device float *)(partials + n_rows * vecs_per_row * n_splits);
++        const uint64_t stat = (row * n_splits + split) * 2u;
++        stats[stat + 0u] = S;
++        stats[stat + 1u] = M;
++    }
++}
++
++
++// ---- llms IDX_SCORE_SGM (make_misc_idx_tiles.py): the indexer score on simdgroup-matrix tiles ----
++template<short NRT>
++void kernel_llms_indexer_score_sgm_impl(constant ds4_metal_args_glm_indexer_score_one & args, device const char *q, device const float *weights,
++                                        device const char *indexer_key_cache, device float *scores, threadgroup float *shmem, uint tg, ushort lane, ushort sg) {
++    constexpr uint NR = NRT * 8;
++    if (args.n_head != 32u || args.head_dim != 128u || args.cache_f16 != 0u || args.n_rows < NR) return;
++    const uint r0 = min(tg * NR, args.n_rows - NR);
++    device const float *K = (device const float *)indexer_key_cache + (uint64_t)r0 * 128u;
++    device const float *Q = (device const float *)q + (uint)sg * 8u * 128u;
++    simdgroup_float8x8 C[NRT];
++    FOR_UNROLL (short t = 0; t < NRT; t++) C[t] = make_filled_simdgroup_matrix<float, 8>(0.f);
++    for (short kt = 0; kt < 16; kt++) {
++        simdgroup_float8x8 B; simdgroup_load(B, Q + kt * 8, 128, ulong2(0, 0), true);
++        FOR_UNROLL (short t = 0; t < NRT; t++) { simdgroup_float8x8 A; simdgroup_load(A, K + t * 8 * 128 + kt * 8, 128); simdgroup_multiply_accumulate(C[t], A, B, C[t]); }
++    }
++    FOR_UNROLL (short t = 0; t < NRT; t++) simdgroup_store(C[t], shmem + (t * 8) * 32 + sg * 8, 32);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (sg == 0) {
++        for (uint row = lane; row < NR; row += 32u) {
++#pragma clang fp reassociate(off)
++#pragma clang fp contract(off)
++            float acc = 0.0f;
++            for (uint h = 0; h < 32u; h++) acc = acc + max(shmem[row * 32u + h] * args.scale, 0.0f) * weights[h];
++            scores[r0 + row] = acc;
++        }
++    }
++}
++#define LLMS_IDX_SGM(NAME, NRT) \
++kernel void NAME(constant ds4_metal_args_glm_indexer_score_one & args, device const char *q, device const float *weights, \
++                 device const char *indexer_key_cache, device float *scores, threadgroup float *shmem [[threadgroup(0)]], \
++                 uint tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { \
++    kernel_llms_indexer_score_sgm_impl<NRT>(args, q, weights, indexer_key_cache, scores, shmem, tg, lane, sg); }
++LLMS_IDX_SGM(kernel_llms_indexer_score_sgm_t2, 2)
++LLMS_IDX_SGM(kernel_llms_indexer_score_sgm_t4, 4)
++LLMS_IDX_SGM(kernel_llms_indexer_score_sgm_t8, 8)
++
++
++// ---- llms ROWS_WIN (apply_ds4_rows_win.py): one dispatch writes every row's KV row into its own raw window slot ----
++struct llms_copy_row { ulong src, dst; };
++kernel void kernel_llms_rows_copy(
++        constant uint & nfloat4 [[buffer(0)]],
++        constant llms_copy_row * rows [[buffer(1)]],
++        uint tg [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]],
++        ushort nt [[threads_per_threadgroup]]) {
++    device const float4 * s = reinterpret_cast<device const float4 *>(rows[tg].src);
++    device float4 * d = reinterpret_cast<device float4 *>(rows[tg].dst);
++    for (uint i = tid; i < nfloat4; i += nt) d[i] = s[i];
++}
++
++
++
++template<short NRT>
++void kernel_llms_indexer_score_sgm_h_impl(constant ds4_metal_args_glm_indexer_score_one & args, device const char *q, device const float *weights,
++                                          device const char *indexer_key_cache, device float *scores, threadgroup float *shmem, uint tg, uint ntg, ushort lane, ushort sg) {
++    constexpr uint NR = NRT * 8;
++    if (args.n_head != 32u || args.head_dim != 128u || args.cache_f16 == 0u || args.n_rows < NR) return;
++    threadgroup half *qs = (threadgroup half *)(shmem + NR * 32u);          // the query: 32 heads x 128, after the C tiles; staged ONCE
++    for (uint i = (uint)sg * 32u + lane; i < 32u * 128u; i += 128u) qs[i] = (half)(((device const float *)q)[i]);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    threadgroup const half *Q = qs + (uint)sg * 8u * 128u;
++    const uint nblk = (args.n_rows + NR - 1u) / NR;
++    for (uint blk = tg; blk < nblk; blk += ntg) {                          // persistent: a threadgroup walks several row blocks
++        const uint r0 = min(blk * NR, args.n_rows - NR);
++        device const half *K = (device const half *)indexer_key_cache + (uint64_t)r0 * 128u;
++        simdgroup_float8x8 C[NRT];
++        FOR_UNROLL (short t = 0; t < NRT; t++) C[t] = make_filled_simdgroup_matrix<float, 8>(0.f);
++        for (short kt = 0; kt < 16; kt++) {
++            simdgroup_half8x8 B; simdgroup_load(B, Q + kt * 8, 128, ulong2(0, 0), true);
++            FOR_UNROLL (short t = 0; t < NRT; t++) { simdgroup_half8x8 A; simdgroup_load(A, K + t * 8 * 128 + kt * 8, 128); simdgroup_multiply_accumulate(C[t], A, B, C[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        FOR_UNROLL (short t = 0; t < NRT; t++) simdgroup_store(C[t], shmem + (t * 8) * 32 + sg * 8, 32);
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sg == 0) {
++            for (uint row = lane; row < NR; row += 32u) {
++#pragma clang fp reassociate(off)
++#pragma clang fp contract(off)
++                float acc = 0.0f;
++                for (uint h = 0; h < 32u; h++) acc = acc + max(shmem[row * 32u + h] * args.scale, 0.0f) * weights[h];
++                scores[r0 + row] = acc;
++            }
++        }
++    }
++}
++#define LLMS_IDX_SGM_H(NAME, NRT) \
++kernel void NAME(constant ds4_metal_args_glm_indexer_score_one & args, device const char *q, device const float *weights, \
++                 device const char *indexer_key_cache, device float *scores, threadgroup float *shmem [[threadgroup(0)]], \
++                 uint tg [[threadgroup_position_in_grid]], uint ntg [[threadgroups_per_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { \
++    kernel_llms_indexer_score_sgm_h_impl<NRT>(args, q, weights, indexer_key_cache, scores, shmem, tg, ntg, lane, sg); }
++LLMS_IDX_SGM_H(kernel_llms_indexer_score_sgm_h_t2, 2)
++LLMS_IDX_SGM_H(kernel_llms_indexer_score_sgm_h_t4, 4)
++LLMS_IDX_SGM_H(kernel_llms_indexer_score_sgm_h_t8, 8)
++
++
++
++static inline int llms_e4m3fn_index(float x) {   // the magnitude index dsv4_e4m3fn_dequant picks (x > 0 here)
++    const float ax = min(abs(x), 448.0f);
++    int lo = 0, hi = 126;
++    while (lo < hi) { const int mid = (lo + hi + 1) >> 1; if (dsv4_e4m3fn_value(mid) <= ax) lo = mid; else hi = mid - 1; }
++    int best = lo;
++    if (best < 126) {
++        const float best_diff = abs(ax - dsv4_e4m3fn_value(best));
++        const float next_diff = abs(ax - dsv4_e4m3fn_value(best + 1));
++        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) best = best + 1;
++    }
++    return best;
++}
++static inline int llms_e2m1fn_index(float x) {   // the magnitude index dsv4_e2m1fn_dequant picks
++    const float ax = min(abs(x), 6.0f);
++    int best = 0; float best_diff = abs(ax - dsv4_e2m1fn_values[0]);
++    for (int i = 1; i < 8; i++) { const float diff = abs(ax - dsv4_e2m1fn_values[i]);
++        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) { best = i; best_diff = diff; } }
++    return best;
++}
++static inline float llms_fp4_code_value(uint code) {   // sign | magnitude index; code 8 = -0.0
++    const float m = dsv4_e2m1fn_values[code & 7u];
++    return (code & 8u) ? -m : m;
++}
++static inline half4 llms_fp4_load_h4(device const char *comp, uint row, uint c) {   // dims 4c..4c+3 of a packed row
++    device const uchar *rp = (device const uchar *)comp + (ulong)row * 288u;
++    const uint nib = (uint)((device const ushort *)rp)[c];
++    const float sc = dsv4_e4m3fn_value((int)rp[256u + (c >> 2)]);
++    return half4((half)(llms_fp4_code_value(nib & 15u) * sc), (half)(llms_fp4_code_value((nib >> 4) & 15u) * sc),
++                 (half)(llms_fp4_code_value((nib >> 8) & 15u) * sc), (half)(llms_fp4_code_value((nib >> 12) & 15u) * sc));
++}
++struct llms_fp4_pack_args { uint rows; uint canary; ulong dst_row0; };   // dst_row0: the first packed row written; canary: block's first code sign-flipped
++kernel void kernel_llms_dsv41_quantize_fp4_pack(constant llms_fp4_pack_args & a, device float *x, device uchar *dst,
++        uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
++    const uint block = 16u;
++    const uint column = group.x * block + lane;
++    const bool valid = lane < block && column < 512u;
++    const ulong index = (ulong)group.y * 512u + column;
++    const float value = valid ? dsv41_bf16(x[index]) : 0.0f;
++    const float amax = simd_max(abs(value));
++    const int sidx = llms_e4m3fn_index(max(amax, 0.01171875f) / 6.0f);
++    const float scale = dsv4_e4m3fn_value(sidx);                       // == dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
++    const int cidx = llms_e2m1fn_index(abs(value) / scale);
++    const float result = copysign(dsv4_e2m1fn_values[cidx], value) * scale;   // == mode 3's result
++    if (valid) x[index] = dsv41_bf16(result);
++    const uint code = ((uint)cidx | (signbit(result) ? 8u : 0u)) ^ (a.canary && lane == 0u ? 8u : 0u);
++    const uint upper = simd_shuffle_down(code, (ushort)1);
++    device uchar *row = dst + (a.dst_row0 + (ulong)group.y) * 288u;
++    if (valid && (lane & 1u) == 0u) row[column >> 1] = (uchar)(code | (upper << 4));
++    if (lane == 0u) row[256u + group.x] = (uchar)sidx;
++}
++kernel void kernel_llms_fp4_rows_to_half(constant uint & n_rows, device const char *src, device half4 *dst, uint gid [[thread_position_in_grid]]) {
++    const uint row = gid >> 7, c = gid & 127u;
++    if (row >= n_rows) return;
++    dst[(ulong)row * 128u + c] = llms_fp4_load_h4(src, row, c);
++}
++
++kernel void kernel_llms_v41_rows_attn_split_fp4(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        constant llms_v41_row *rows,
++        device       char *tmp,
++        threadgroup half4 *kv_shared [[threadgroup(0)]],
++        uint3  tgpig [[threadgroup_position_in_grid]],
++        ushort tid   [[thread_index_in_threadgroup]],
++        ushort lane  [[thread_index_in_simdgroup]],
++        ushort sg    [[simdgroup_index_in_threadgroup]]) {
++    constexpr uint rows_per_block = 16u;
++    constexpr uint vecs_per_row = 128u;
++    const uint token = tgpig.x;
++    const uint head = tgpig.y * 8u + (uint)sg;
++    const uint split = tgpig.z;
++    const uint n_splits = args.n_splits;
++    if (token >= args.n_tokens || head >= args.n_head || n_splits < 2u || n_splits > 31u || split >= n_splits) return;
++    const llms_v41_row R = rows[token];
++    device const char *q = reinterpret_cast<device const char *>(R.q);
++    device const char *raw_kv = reinterpret_cast<device const char *>(R.raw);
++    device const char *comp_kv = reinterpret_cast<device const char *>(R.comp);
++    device const int32_t *row_topk = reinterpret_cast<device const int32_t *>(R.topk);
++
++    device const float4 *q4 = (device const float4 *)(q + (uint64_t)head * args.q_head_stride);
++    const half4 q0 = (half4)q4[lane +  0];
++    const half4 q1 = (half4)q4[lane + 32];
++    const half4 q2 = (half4)q4[lane + 64];
++    const half4 q3 = (half4)q4[lane + 96];
++    float M = -FLT_MAX/2.0f;
++    float S = 0.0f;
++    float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
++
++    const uint qpos = R.pos;
++    const uint first_raw_pos = qpos + 1u - R.n_raw;
++    const uint raw_last_pos = qpos;
++    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ? qpos + 1u - args.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first);
++    const uint raw_last = min(qpos, raw_last_pos);
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint total_rows = raw_count + args.top_k;
++    const uint rows_per_split = (total_rows + n_splits - 1u) / n_splits;
++    const uint split_first = min(split * rows_per_split, total_rows);
++    const uint split_last = min(split_first + rows_per_split, total_rows);
++    const uint visible = min((qpos + 1u) / args.ratio, R.n_comp);
++
++    for (uint seq0 = split_first; seq0 < split_last; seq0 += rows_per_block) {
++        const uint n_rows = min(rows_per_block, split_last - seq0);
++        for (uint off = (uint)tid; off < n_rows * vecs_per_row; off += 256u) {
++            const uint r = off / vecs_per_row;
++            const uint c = off - r * vecs_per_row;
++            const uint seq = seq0 + r;
++            half4 value = half4(0.0h);
++            if (seq < raw_count) {
++                const uint pos = raw_first + seq;
++                const uint logical = pos - first_raw_pos;
++                const uint row = (R.raw_start + logical) % args.raw_cap;
++                device const float4 *src = (device const float4 *)(raw_kv + (uint64_t)row * args.raw_row_stride);
++                value = (half4)src[c];
++            } else {
++                const int32_t idx = row_topk[seq - raw_count];
++                if (idx >= 0 && (uint)idx < visible) {
++                    value = llms_fp4_load_h4(comp_kv, (uint)idx, c);   // llms KV_FP4
++                }
++            }
++            kv_shared[off] = value;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (uint r = 0; r < n_rows; r++) {
++            const uint seq = seq0 + r;
++            bool valid = true;
++            if (seq >= raw_count) {
++                const int32_t idx = row_topk[seq - raw_count];
++                valid = idx >= 0 && (uint)idx < visible;
++            }
++            if (valid) {
++                dsv4_attend_shared_h4_row_at(kv_shared, r, q0, q1, q2, q3, args.scale, lane, M, S, o0, o1, o2, o3);
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    const uint64_t row = (uint64_t)token * args.n_head + head;
++    device float4 *partials = (device float4 *)tmp;
++    partials[(row * vecs_per_row + lane +  0u) * n_splits + split] = o0;
++    partials[(row * vecs_per_row + lane + 32u) * n_splits + split] = o1;
++    partials[(row * vecs_per_row + lane + 64u) * n_splits + split] = o2;
++    partials[(row * vecs_per_row + lane + 96u) * n_splits + split] = o3;
++    if (lane == 0u) {
++        device float *stats = (device float *)(partials + n_rows * vecs_per_row * n_splits);
++        const uint64_t stat = (row * n_splits + split) * 2u;
++        stats[stat + 0u] = S;
++        stats[stat + 1u] = M;
++    }
++}
++
++
++
++
++struct llms_topk_args { uint n, k, rows, canary; ulong score_stride, sel_stride; };
++static inline uint llms_fkey(float f) { const uint u = as_type<uint>(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
++kernel void kernel_llms_topk_radix(constant llms_topk_args & a, device const float *scores, device int *selected,
++                                   threadgroup uint *tg [[threadgroup(0)]], uint row [[threadgroup_position_in_grid]],
++                                   ushort tid [[thread_index_in_threadgroup]]) {
++    threadgroup uint *hist = tg;                          // 2048 bins
++    threadgroup uint *ctl = tg + 2048;                    // [0] digit, [1] need, [2] count >, [3] count ==
++    threadgroup uint *skey = tg + 2048 + 16;              // 1024 keys of the collected (sorted later)
++    threadgroup int  *sidx = (threadgroup int *)(tg + 2048 + 16 + 1024);
++    if (row >= a.rows) return;
++    device const float *s = scores + (ulong)row * a.score_stride;
++    const uint n = a.n, k = a.k;
++    uint prefix = 0u, pmask = 0u, need = k;
++    const bool all = k >= n;   /* llms TOPK_FAST: every element selected */
++    for (uint pass = 0; pass < (all ? 0u : 3u); pass++) {
++        const uint shift = pass == 0 ? 21u : pass == 1 ? 10u : 0u, nb = pass == 2 ? 1024u : 2048u;
++        for (uint i = tid; i < nb; i += 1024u) hist[i] = 0u;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (uint i = tid; i < n; i += 1024u) {
++            const uint key = llms_fkey(s[i]);
++            if ((key & pmask) == prefix) atomic_fetch_add_explicit((threadgroup atomic_uint *)&hist[(key >> shift) & (nb - 1u)], 1u, memory_order_relaxed);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        {   /* llms TOPK_FAST (make_topk_fast.py): the digit by a parallel count from the top -- the serial loop's result exactly */
++            const uint per = nb / 1024u;   /* 2 bins per thread (nb 2048) or 1 (nb 1024) */
++            const uint b_hi = nb - 1u - tid * per, b_lo = per == 2u ? b_hi - 1u : b_hi;
++            const uint c_hi = hist[b_hi], c_lo = per == 2u ? hist[b_lo] : 0u, loc = c_hi + c_lo;
++            const uint lane = tid & 31u, sg = tid >> 5;
++            const uint incl = simd_prefix_inclusive_sum(loc);
++            threadgroup uint *sgt = skey;   /* 32 simdgroup totals (skey is re-initialised after the passes) */
++            if (lane == 31u) sgt[sg] = incl;
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            if (sg == 0u) { const uint v = sgt[lane]; const uint vi = simd_prefix_inclusive_sum(v); sgt[32u + lane] = vi - v; if (lane == 31u) sgt[64] = vi; }
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            const uint above = sgt[32u + sg] + incl - loc;   /* keys counted in the bins above this thread's */
++            if (above < need && above + c_hi >= need) { ctl[0] = b_hi; ctl[1] = need - above; }
++            else if (per == 2u && above + c_hi < need && above + loc >= need) { ctl[0] = b_lo; ctl[1] = need - (above + c_hi); }
++            if (tid == 0u && sgt[64] < need) { ctl[0] = 0u; ctl[1] = need - sgt[64]; }   /* the serial loop's fall-through */
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        prefix |= ctl[0] << shift; pmask |= (nb - 1u) << shift; need = ctl[1];
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    // prefix = the key of the k-th largest; need = how many keys equal to it belong to the top k
++    if (tid == 0) { ctl[2] = 0u; ctl[3] = 0u; }
++    for (uint i = tid; i < 1024u; i += 1024u) { skey[i] = 0u; sidx[i] = 0x7fffffff; }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    const uint n_gt = k - need;
++    if (all) { for (uint i = tid; i < n; i += 1024u) { skey[i] = llms_fkey(s[i]); sidx[i] = (int)i; } }   /* llms TOPK_FAST */
++    else
++    for (uint i = tid; i < n; i += 1024u) {
++        const uint key = llms_fkey(s[i]);
++        if (key > prefix) { const uint slot = atomic_fetch_add_explicit((threadgroup atomic_uint *)&ctl[2], 1u, memory_order_relaxed); skey[slot] = key; sidx[slot] = (int)i; }
++        else if (key == prefix) { const uint e = atomic_fetch_add_explicit((threadgroup atomic_uint *)&ctl[3], 1u, memory_order_relaxed);
++                                  if (e < need) { skey[n_gt + e] = key; sidx[n_gt + e] = (int)i; } }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    // ties at the threshold were taken in arrival order: restore index order among them by sorting everything (key desc, index asc)
++    uint m = 1u; while (m < k) m <<= 1;
++    for (uint size = 2u; size <= m; size <<= 1) {
++        for (uint stride = size >> 1; stride > 0u; stride >>= 1) {
++            for (uint i = tid; i < m; i += 1024u) {
++                const uint j = i ^ stride;
++                if (j > i) {
++                    const bool desc = (i & size) == 0u;   // descending blocks first: final order = key desc
++                    const uint ki = skey[i], kj = skey[j]; const int ii = sidx[i], ij = sidx[j];
++                    const bool i_first = ki > kj || (ki == kj && ii < ij);   // the order we want: key desc, index asc
++                    if (desc ? !i_first : i_first) { skey[i] = kj; skey[j] = ki; sidx[i] = ij; sidx[j] = ii; }
++                }
++            }
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++        }
++    }
++    device int *out = selected + (ulong)row * a.sel_stride;
++    for (uint i = tid; i < k; i += 1024u) out[i] = sidx[i] == 0x7fffffff ? -1 : sidx[i] ^ (a.canary && i == 0u ? 1 : 0);
++}
++
++#include <metal_simdgroup_matrix>
++
++
++
++struct llms_agemm_args { uint n_rows, n_head, top_k, nk, raw_cap, window, ratio, comp_fmt; ulong raw_row_stride, comp_row_stride; float scale; uint canary; };
++// grid: x = 64 threads per key row (one dim block of 8 each), y = key slot (nk) + q head slots (n_head), z = row
++kernel void kernel_llms_agemm_gather(constant llms_agemm_args &a, constant llms_v41_row *rows, device half *kt, device half *qt, device float *kmask,
++                                     uint3 gid [[thread_position_in_grid]]) {
++    const uint db = gid.x, j = gid.y, r = gid.z;
++    if (db >= 64u || r >= a.n_rows) return;
++    const llms_v41_row R = rows[r];
++    const uint nkb = a.nk / 8u;
++    if (j >= a.nk) {
++        const uint h = j - a.nk; if (h >= a.n_head) return;
++        device const float4 *src = (device const float4 *)R.q + (ulong)h * 128u + db * 2u;
++        const float4 x0 = src[0], x1 = src[1];
++        device half4 *dst = (device half4 *)(qt + ((((ulong)r * (a.n_head / 8u) + h / 8u) * 64u + db) * 64u + (h & 7u) * 8u));
++        dst[0] = (half4)x0; dst[1] = (half4)x1;
++        return;
++    }
++    const uint qpos = R.pos, first_raw_pos = qpos + 1u - R.n_raw;
++    const uint window_first = (a.window != 0u && qpos + 1u > a.window) ? qpos + 1u - a.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first), raw_last = qpos;
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint visible = min((qpos + 1u) / a.ratio, R.n_comp);
++    half4 v0 = half4(0.0h), v1 = half4(0.0h); bool ok = false;
++    if (j < raw_count) {
++        const uint pos = raw_first + j, logical = pos - first_raw_pos, row = (R.raw_start + logical) % a.raw_cap;
++        device const float4 *p = (device const float4 *)((device const char *)R.raw + (ulong)row * a.raw_row_stride) + db * 2u;
++        v0 = (half4)p[0]; v1 = (half4)p[1]; ok = true;
++    } else if (j - raw_count < a.top_k && !(a.canary != 0u && j - raw_count + 8u >= a.top_k)) {
++        const int idx = ((device const int *)R.topk)[j - raw_count];
++        if (idx >= 0 && (uint)idx < visible) {
++            device const char *comp = (device const char *)R.comp;
++            if (a.comp_fmt == 2u) { v0 = llms_fp4_load_h4(comp, (uint)idx, db * 2u); v1 = llms_fp4_load_h4(comp, (uint)idx, db * 2u + 1u); }
++            else {
++                device const char *rp = comp + (ulong)(uint)idx * a.comp_row_stride;
++                if (a.comp_fmt == 1u) { device const half4 *p = (device const half4 *)rp + db * 2u; v0 = p[0]; v1 = p[1]; }
++                else { device const float4 *p = (device const float4 *)rp + db * 2u; v0 = (half4)p[0]; v1 = (half4)p[1]; }
++            }
++            ok = true;
++        }
++    }
++    device half4 *dst = (device half4 *)(kt + ((((ulong)r * nkb + j / 8u) * 64u + db) * 64u + (j & 7u) * 8u));
++    dst[0] = v0; dst[1] = v1;
++    if (db == 0u) kmask[(ulong)r * a.nk + j] = ok ? 0.0f : 1.0f;
++}
++// grid: threadgroups (nk / 32, n_head / 32, rows) of one simdgroup
++kernel void kernel_llms_agemm_qk(constant llms_agemm_args &a, device const half *kt, device const half *qt, device float *S,
++                                 uint3 tg [[threadgroup_position_in_grid]]) {
++    const uint kb0 = tg.x * 4u, hb0 = tg.y * 4u, r = tg.z;
++    const uint nkb = a.nk / 8u, nhb = a.n_head / 8u;
++    if (kb0 >= nkb || hb0 >= nhb || r >= a.n_rows) return;
++    device const half *q = qt + ((ulong)r * nhb + hb0) * 4096u;
++    device const half *k = kt + ((ulong)r * nkb + kb0) * 4096u;
++    simdgroup_float8x8 c[4][4];
++    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) c[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    for (uint db = 0; db < 64u; db++) {
++        simdgroup_half8x8 A[4], B[4];
++        for (int i = 0; i < 4; i++) simdgroup_load(A[i], q + ((ulong)i * 64u + db) * 64u, 8);
++        for (int j = 0; j < 4; j++) simdgroup_load(B[j], k + ((ulong)j * 64u + db) * 64u, 8, ulong2(0, 0), true);
++        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) simdgroup_multiply_accumulate(c[i][j], A[i], B[j], c[i][j]);
++    }
++    device float *s = S + ((ulong)r * a.n_head + hb0 * 8u) * a.nk + kb0 * 8u;
++    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) simdgroup_store(c[i][j], s + (ulong)(8 * i) * a.nk + 8 * j, a.nk);
++}
++// one simdgroup per (row, head); nk <= 768
++kernel void kernel_llms_agemm_softmax(constant llms_agemm_args &a, device const float *S, device const float *kmask, device const float *sinks,
++                                      device half *pt, uint tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
++    const uint r = tg / a.n_head, h = tg % a.n_head;
++    if (r >= a.n_rows) return;
++    device const float *s = S + ((ulong)r * a.n_head + h) * a.nk;
++    device const float *mk = kmask + (ulong)r * a.nk;
++    float x[24];
++    float m = -FLT_MAX;
++    const uint n = (a.nk + 31u) / 32u;
++    for (uint i = 0; i < 24u; i++) { x[i] = -FLT_MAX; if (i < n) { const uint k = i * 32u + lane; if (k < a.nk && mk[k] == 0.0f) { x[i] = s[k] * a.scale; m = max(m, x[i]); } } }
++    const float sink = sinks[h];
++    m = max(simd_max(m), sink);
++    float sum = 0.0f;
++    for (uint i = 0; i < 24u; i++) { if (i < n) { x[i] = x[i] == -FLT_MAX ? 0.0f : exp(x[i] - m); sum += x[i]; } }
++    sum = simd_sum(sum) + exp(sink - m);
++    const float inv = 1.0f / sum;
++    const uint nkb = a.nk / 8u;
++    device half *p = pt + ((ulong)r * (a.n_head / 8u) + h / 8u) * nkb * 64u + (h & 7u) * 8u;
++    for (uint i = 0; i < 24u; i++) { if (i < n) { const uint k = i * 32u + lane; if (k < a.nk) p[(k / 8u) * 64u + (k & 7u)] = (half)(x[i] * inv); } }
++}
++// grid: threadgroups (512 / 32, n_head / 32, rows) of one simdgroup
++kernel void kernel_llms_agemm_pv(constant llms_agemm_args &a, constant llms_v41_row *rows, device const half *kt, device const half *pt,
++                                 uint3 tg [[threadgroup_position_in_grid]]) {
++    const uint db0 = tg.x * 4u, hb0 = tg.y * 4u, r = tg.z;
++    const uint nkb = a.nk / 8u, nhb = a.n_head / 8u;
++    if (db0 >= 64u || hb0 >= nhb || r >= a.n_rows) return;
++    device const half *p = pt + ((ulong)r * nhb + hb0) * nkb * 64u;
++    device const half *v = kt + (ulong)r * nkb * 4096u + (ulong)db0 * 64u;
++    simdgroup_float8x8 c[4][4];
++    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) c[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    for (uint kb = 0; kb < nkb; kb++) {
++        simdgroup_half8x8 A[4], B[4];
++        for (int i = 0; i < 4; i++) simdgroup_load(A[i], p + ((ulong)i * nkb + kb) * 64u, 8);
++        for (int j = 0; j < 4; j++) simdgroup_load(B[j], v + ((ulong)kb * 64u + j) * 64u, 8);
++        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) simdgroup_multiply_accumulate(c[i][j], A[i], B[j], c[i][j]);
++    }
++    device float *o = (device float *)rows[r].dst + (ulong)hb0 * 8u * 512u + db0 * 8u;
++    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) simdgroup_store(c[i][j], o + (ulong)(8 * i) * 512u + 8 * j, 512);
++}
++
++
++
++kernel void kernel_llms_agemm2_gather(constant llms_agemm_args &a, constant llms_v41_row *rows, device half *kt, device half *qt, device float *kmask,
++                                     uint3 gid [[thread_position_in_grid]]) {
++    const uint db = gid.x, j = gid.y, r = gid.z;
++    if (db >= 64u || r >= a.n_rows) return;
++    const llms_v41_row R = rows[r];
++    const uint nkb = a.nk / 8u;
++    if (j >= a.nk) {
++        const uint h = j - a.nk; if (h >= a.n_head) return;
++        device const float4 *src = (device const float4 *)R.q + (ulong)h * 128u + db * 2u;
++        const float4 x0 = src[0], x1 = src[1];
++        device half4 *dst = (device half4 *)(qt + ((((ulong)r * (a.n_head / 8u) + h / 8u) * 64u + db) * 64u + (h & 7u) * 8u));
++        dst[0] = (half4)x0; dst[1] = (half4)x1;
++        return;
++    }
++    const uint qpos = R.pos, first_raw_pos = qpos + 1u - R.n_raw;
++    const uint window_first = (a.window != 0u && qpos + 1u > a.window) ? qpos + 1u - a.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first), raw_last = qpos;
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint visible = min((qpos + 1u) / a.ratio, R.n_comp);
++    half4 v0 = half4(0.0h), v1 = half4(0.0h); bool ok = false;
++    if (j < raw_count && !(a.canary == 2u && j + 1u == raw_count)) {   // canary 2: the newest raw key masked
++        const uint pos = raw_first + j, logical = pos - first_raw_pos, row = (R.raw_start + logical) % a.raw_cap;
++        device const float4 *p = (device const float4 *)((device const char *)R.raw + (ulong)row * a.raw_row_stride) + db * 2u;
++        v0 = (half4)p[0]; v1 = (half4)p[1]; ok = true;
++    } else if (j >= raw_count && j - raw_count < a.top_k && !(a.canary == 1u && j - raw_count + 8u >= a.top_k)) {
++        const int idx = ((device const int *)R.topk)[j - raw_count];
++        if (idx >= 0 && (uint)idx < visible) {
++            device const char *comp = (device const char *)R.comp;
++            if (a.comp_fmt == 2u) { v0 = llms_fp4_load_h4(comp, (uint)idx, db * 2u); v1 = llms_fp4_load_h4(comp, (uint)idx, db * 2u + 1u); }
++            else {
++                device const char *rp = comp + (ulong)(uint)idx * a.comp_row_stride;
++                if (a.comp_fmt == 1u) { device const half4 *p = (device const half4 *)rp + db * 2u; v0 = p[0]; v1 = p[1]; }
++                else { device const float4 *p = (device const float4 *)rp + db * 2u; v0 = (half4)p[0]; v1 = (half4)p[1]; }
++            }
++            ok = true;
++        }
++    }
++    device half4 *dst = (device half4 *)(kt + ((((ulong)r * nkb + j / 8u) * 64u + db) * 64u + (j & 7u) * 8u));
++    dst[0] = v0; dst[1] = v1;
++    if (db == 0u) kmask[(ulong)r * a.nk + j] = ok ? 0.0f : 1.0f;
++}
++
++kernel void kernel_llms_agemm2_softmax(constant llms_agemm_args &a, device const float *S, device const float *kmask, device const float *sinks,
++                                       device float *pt, uint tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
++    const uint r = tg / a.n_head, h = tg % a.n_head;
++    if (r >= a.n_rows) return;
++    device const float *s = S + ((ulong)r * a.n_head + h) * a.nk;
++    device const float *mk = kmask + (ulong)r * a.nk;
++    float x[24];
++    float m = -FLT_MAX;
++    const uint n = (a.nk + 31u) / 32u;
++    for (uint i = 0; i < 24u; i++) { x[i] = -FLT_MAX; if (i < n) { const uint k = i * 32u + lane; if (k < a.nk && mk[k] == 0.0f) { x[i] = s[k] * a.scale; m = max(m, x[i]); } } }
++    const float sink = sinks[h];
++    m = max(simd_max(m), sink);
++    float sum = 0.0f;
++    for (uint i = 0; i < 24u; i++) { if (i < n) { x[i] = x[i] == -FLT_MAX ? 0.0f : exp(x[i] - m); sum += x[i]; } }
++    sum = simd_sum(sum) + exp(sink - m);
++    const float inv = 1.0f / sum;
++    const uint nkb = a.nk / 8u;
++    device float *p = pt + ((ulong)r * (a.n_head / 8u) + h / 8u) * nkb * 64u + (h & 7u) * 8u;
++    for (uint i = 0; i < 24u; i++) { if (i < n) { const uint k = i * 32u + lane; if (k < a.nk) p[(k / 8u) * 64u + (k & 7u)] = x[i] * inv; } }
++}
++kernel void kernel_llms_agemm2_pv(constant llms_agemm_args &a, constant llms_v41_row *rows, device const half *kt, device const float *pt,
++                                  uint3 tg [[threadgroup_position_in_grid]]) {
++    const uint db0 = tg.x * 4u, hb0 = tg.y * 4u, r = tg.z;
++    const uint nkb = a.nk / 8u, nhb = a.n_head / 8u;
++    if (db0 >= 64u || hb0 >= nhb || r >= a.n_rows) return;
++    device const float *p = pt + ((ulong)r * nhb + hb0) * nkb * 64u;
++    device const half *v = kt + (ulong)r * nkb * 4096u + (ulong)db0 * 64u;
++    simdgroup_float8x8 c[4][4];
++    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) c[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
++    for (uint kb = 0; kb < nkb; kb++) {
++        simdgroup_float8x8 A[4]; simdgroup_half8x8 B[4];
++        for (int i = 0; i < 4; i++) simdgroup_load(A[i], p + ((ulong)i * nkb + kb) * 64u, 8);
++        for (int j = 0; j < 4; j++) simdgroup_load(B[j], v + ((ulong)kb * 64u + j) * 64u, 8);
++        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) simdgroup_multiply_accumulate(c[i][j], A[i], B[j], c[i][j]);
++    }
++    device float *o = (device float *)rows[r].dst + (ulong)hb0 * 8u * 512u + db0 * 8u;
++    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) simdgroup_store(c[i][j], o + (ulong)(8 * i) * 512u + 8 * j, 512);
++}
++
++// ---- upstream antirez/ds4 5379c1c (PR #1135, e5b19e2), verbatim ----
++// Copy the selected compressed-key mask while retaining causal visibility.
++// Image bidirectionality applies to raw keys only, never compressed keys.
++struct ds4_metal_args_causal_comp_mask {
++    uint n_comp, n_tokens, pos0, ratio, n_keys;
++};
++
++kernel void kernel_dsv4_causal_comp_mask(
++        constant ds4_metal_args_causal_comp_mask &args,
++        device const float *selected_mask,
++        device half *dst,
++        uint2 gid [[thread_position_in_grid]]) {
++    const uint col = gid.x, row = gid.y;
++    if (col >= args.n_comp || row >= args.n_tokens) return;
++    const ulong visible = (ulong(args.pos0) + ulong(row) + 1ul) / args.ratio;
++    dst[ulong(row) * args.n_keys + col] = ulong(col) < visible
++        ? half(selected_mask[ulong(row) * args.n_comp + col]) : half(-INFINITY);
++}

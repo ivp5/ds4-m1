@@ -392,7 +392,9 @@ static hf_model_metadata load_hf_model_metadata(const char *hf_dir,
     size_t len = 0;
     char *text = read_file(path, &len);
     json_doc d = json_parse_text(text, len);
-    int ratios = json_obj_get(&d, 0, "compress_ratios");
+    int text_root = json_obj_get(&d, 0, "text_config");
+    if (text_root < 0) text_root = 0;
+    int ratios = json_obj_get(&d, text_root, "compress_ratios");
     if (ratios < 0 || d.v[ratios].type != JT_ARRAY) {
         fprintf(stderr, "error: missing compress_ratios array in %s\n", path);
         exit(1);
@@ -416,7 +418,7 @@ static hf_model_metadata load_hf_model_metadata(const char *hf_dir,
         m.compress_ratios[j++] = (uint32_t)value;
     }
 
-    int rms_eps = json_obj_get(&d, 0, "rms_norm_eps");
+    int rms_eps = json_obj_get(&d, text_root, "rms_norm_eps");
     if (rms_eps < 0) {
         fprintf(stderr, "error: missing rms_norm_eps in %s\n", path);
         exit(1);
@@ -846,12 +848,12 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP8 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t in_dim = w->shape[1];
-    const int64_t block_out = 128;
-    const int64_t block_in = 128;
-    if (out_dim % block_out || in_dim % block_in) die("FP8 dims are not divisible by 128");
-    const int64_t scale_rows = out_dim / block_out;
-    const int64_t scale_cols = in_dim / block_in;
-    if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
+    const int64_t scale_rows = scale->shape[0], scale_cols = scale->shape[1];
+    if (scale_rows <= 0 || scale_cols <= 0 || out_dim % scale_rows || in_dim % scale_cols)
+        die("FP8 scale shape mismatch");
+    const int64_t block_out = out_dim / scale_rows, block_in = in_dim / scale_cols;
+    if (!((block_out == 128 && block_in == 128) || (block_out == 32 && block_in == 32)))
+        die("FP8 expects 128x128 or 32x32 scale blocks");
     /* shape and data_offsets are independent header fields; cross-check that the
      * on-disk buffers (sized from data_offsets by db_read) are actually large
      * enough for the shape-driven indexing below. Without this, a weight that
@@ -2253,6 +2255,8 @@ static const dspark_name_rule dspark_stage_rules[] = {
     {"main_proj.scale", "main_proj.weight", "consume_scale"},
     {"main_norm.weight", "main_norm.weight", "emit"},
     {"norm.weight", "norm.weight", "emit"},
+    {"markov_head.embed.weight", "markov_head.markov_w1.weight", "emit"},
+    {"markov_head.head.weight", "markov_head.markov_w2.weight", "emit"},
     {"markov_head.markov_w1.weight", "markov_head.markov_w1.weight", "emit"},
     {"markov_head.markov_w2.weight", "markov_head.markov_w2.weight", "emit"},
     {"confidence_head.proj.weight", "confidence_head.proj.weight", "emit"},

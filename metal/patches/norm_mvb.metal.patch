@@ -1,0 +1,30 @@
+--- a/norm_mvb.metal
++++ b/norm_mvb.metal
+@@ -1,3 +1,6 @@
++#ifndef LLMS_MVB16_CANARY
++#define LLMS_MVB16_CANARY 0
++#endif
+ struct ds4_metal_args_norm {
+     int32_t  ne00;
+     int32_t  ne00_t;
+@@ -72,6 +75,12 @@
+         if (F == 2) {
+             y[i00] = (x[i00]*scale)*f0[i00];
+         }
++        if (F == 4) {   /* llms MVB16: kernel_dsv41_bf16_linear's rounding in the store */
++            uint4 bits = as_type<uint4>((float4)((x[i00]*scale)*f0[i00]));
++            const bool4 fin = (bits & 0x7f800000u) != 0x7f800000u;
++            bits += select(uint4(0), LLMS_MVB16_CANARY ? uint4(0) : (uint4(0x7fffu) + ((bits >> 16u) & 1u)), fin);
++            y[i00] = (T)as_type<float4>(bits & 0xffff0000u);
++        }
+         if (F == 3) {
+             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
+         }
+@@ -83,6 +92,7 @@
+ // Host-visible RMSNorm variants: plain norm and norm multiplied by weight.
+ template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
+ template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
++template [[host_name("kernel_rms_norm_mul_f32_4_b")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 4>;   /* llms MVB16 */
+ 
+ kernel void kernel_add_rms_norm_mul_f32_4(
+         constant ds4_metal_args_norm & args,

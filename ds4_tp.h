@@ -31,7 +31,7 @@ enum {
     DS4_TP_GATE_FFN = 1,
     DS4_TP_GATES_PER_LAYER = 2,
     /* Includes the seed row as well as drafted tokens. */
-    DS4_TP_BATCH_MAX_ROWS = 8,
+    DS4_TP_BATCH_MAX_ROWS = 128,
     DS4_TP_BATCH_GATES_PER_LAYER = 2,
 };
 

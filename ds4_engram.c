@@ -198,6 +198,43 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
     return true;
 }
 
+/* llms ENGRAM_RA (apply_ds4_engram_ra.py): ds4_engram_read's decode, from a read-only mapping of the table instead of pread */
+bool ds4_engram_read_mapped(const ds4_engram_table *t, const uint8_t *map, uint64_t map_file_off,
+                            const uint32_t *rows, size_t count, float *out) {
+    if (!t || !map || t->offset < map_file_off || (count && (!rows || !out)) ||
+        count > SIZE_MAX / (DS4_ENGRAM_DIM * sizeof(*out))) {
+        errno = EINVAL;
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (rows[i] >= t->rows) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t *raw = map + (t->offset - map_file_off) + (uint64_t)rows[i] * DS4_ENGRAM_ROW_BYTES;
+        for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
+            uint8_t code = raw[j], scale = raw[DS4_ENGRAM_DIM + j / 32];
+            if ((code & 127) == 127 || scale == 255) {
+                errno = EDOM;
+                return false;
+            }
+            float value = ldexpf(e4m3(code), (int)scale - 127);
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+            memcpy(&value, &bits, sizeof(value));
+            if (!isfinite(value)) {
+                errno = EDOM;
+                return false;
+            }
+            out[i * DS4_ENGRAM_DIM + j] = value;
+        }
+    }
+    return true;
+}
+
 typedef struct {
     uint32_t row, output;
 } engram_request;

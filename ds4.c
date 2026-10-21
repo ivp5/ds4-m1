@@ -1,3 +1,6 @@
+#include "ds4_shm.h"
+unsigned ds4_gpu_llms_rows_max_public(void);   /* llms F32ROWS_CAP (unsigned: before stdint.h) */
+void ds4_gpu_llms_t32_round(int on); int ds4_gpu_llms_t32_rounded(void);   /* llms T32_BF16 */
 /* =========================================================================
  * ds4.c - DeepSeek V4 inference engine.
  * =========================================================================
@@ -15,8 +18,19 @@
  */
 
 #include <errno.h>
+const char *llms_srckey(const char *src, const char *key); int llms_strict_after(int printed, const char *what); void llms_guard_fail(const char *what);   /* llms GUARDS (ds4_metal.m) */
+#define LLMS_G_KERN "a Metal kernel lookup failed (the line above names the kernel)"
+#define LLMS_G_NAME "a set switch was turned off by its source file's NAME (the line above)"
+#define LLMS_G_MISS "a set switch found its kernels or buffers missing (the line above)"
 #include <fcntl.h>
 #include <float.h>
+
+#include <stdatomic.h>
+enum { LLMS_SAMP_MAX_CAND = 262144, LLMS_SAMP_CAND_BYTES = 12 };
+static _Alignas(64) unsigned char g_llms_samp_cand[LLMS_SAMP_MAX_CAND * LLMS_SAMP_CAND_BYTES];   /* the fast sampler's candidates */
+static atomic_int g_llms_samp_busy;                                                             /* in-use: a concurrent sampler takes the heap */
+static uint64_t g_llms_samp_calls, g_llms_samp_heap;                                            /* reported at exit */
+/* ==== end STATIC_STATE ==== */
 #include <inttypes.h>
 #include <ctype.h>
 #include <limits.h>
@@ -32,6 +46,7 @@
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
@@ -40,6 +55,340 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach-o/dyld.h>
+#include <spawn.h>
+#include <sys/sysctl.h>
+extern char **environ;
+/* Locks must agree across checkouts, working directories and HOME overrides. */
+#include <pwd.h>
+static char llms_guard_paths[3][PATH_MAX];
+static void llms_guard_paths_init(void) {
+    struct passwd *pw=getpwuid(getuid()); char dir[PATH_MAX];
+    if (!pw || !pw->pw_dir || snprintf(dir,sizeof dir,"%s/.ds4-runtime",pw->pw_dir)>=(int)sizeof dir) {
+        fprintf(stderr,"ds4 memory guard: cannot locate the account home (exit 75)\n"); _exit(75);
+    }
+    if (mkdir(dir,0700) && errno!=EEXIST) {
+        fprintf(stderr,"ds4 memory guard: cannot create runtime directory: %s (exit 75)\n",strerror(errno)); _exit(75);
+    }
+    struct stat st;
+    if (lstat(dir,&st) || !S_ISDIR(st.st_mode) || st.st_uid!=getuid() || (st.st_mode&0077)) {
+        fprintf(stderr,"ds4 memory guard: runtime directory must be owned by this user with mode 0700 (exit 75)\n"); _exit(75);
+    }
+    const char *names[]={"engine.lock","guardian.lock","guardian.log"};
+    for(int k=0;k<3;k++) if(snprintf(llms_guard_paths[k],PATH_MAX,"%s/%s",dir,names[k])>=PATH_MAX) _exit(75);
+}
+#define LLMS_MG_LOCK llms_guard_paths[0]
+#define LLMS_MG_GLOCK llms_guard_paths[1]
+#define LLMS_MG_GLOG llms_guard_paths[2]
+#define LLMS_MG_GIB 1073741824.0
+#define LLMS_MG_RESERVE_GIB 4.0        /* admission: what must stay free after the plan */
+#define LLMS_MG_FIXED_GIB 4.6          /* engine memory beside the slabs: static buffers 2.61 + DSP bank 1.19 + DSP support 0.63 + 0.17 */
+#define LLMS_MG_FILE_HOT_GIB 5.9       /* file-backed weights read every step: Q4L copies 4.19 + static tensors 1.72 */
+#define LLMS_MG_APPS_FACTOR 0.5        /* other processes' anonymous memory, counted at 2x compression */
+static int g_llms_mg_test;             /* LLMS_DS4_MEMGUARD_TEST: 1 'admit0' (refuse at start), 2 'admit' (refuse the plan), 3 'watch' (fire at once), 4 'guard' (the guardian drops at once) */
+static int g_llms_mg_lock_fd = -1;
+typedef struct { double phys, free, spec, inact, wired, purg, ext, intl, comp, seg_frac; int level; } llms_mg_vm;
+static uint64_t llms_mg_sysctl_u64(const char *name) {
+    uint64_t v8 = 0; uint32_t v4 = 0; size_t sz = sizeof v8;
+    if (sysctlbyname(name, &v8, &sz, NULL, 0) == 0) return sz == 4 ? (uint64_t)(*(uint32_t *)&v8) : v8;
+    sz = sizeof v4; if (sysctlbyname(name, &v4, &sz, NULL, 0) == 0) return v4;
+    return 0;
+}
+static int llms_mg_sample(llms_mg_vm *o) {
+    vm_statistics64_data_t vs; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &n) != KERN_SUCCESS) return -1;
+    const double pg = (double)vm_kernel_page_size;
+    o->phys = (double)llms_mg_sysctl_u64("hw.memsize"); o->free = vs.free_count * pg; o->spec = vs.speculative_count * pg; o->inact = vs.inactive_count * pg;
+    o->wired = vs.wire_count * pg; o->purg = vs.purgeable_count * pg; o->ext = vs.external_page_count * pg; o->intl = vs.internal_page_count * pg;
+    o->comp = vs.compressor_page_count * pg;
+    const uint64_t st = llms_mg_sysctl_u64("vm.compressor.segment.total"), sl = llms_mg_sysctl_u64("vm.compressor.segment.limit");
+    o->seg_frac = sl ? (double)st / (double)sl : 0.0;
+    int lvl = 0; size_t sz = sizeof lvl; if (sysctlbyname("kern.memorystatus_vm_pressure_level", &lvl, &sz, NULL, 0) != 0) lvl = 0; o->level = lvl;
+    return o->phys > 0.0 ? 0 : -1;
+}
+static void llms_mg_unlink_shm(void) {   /* our shm cache: the header, the drafter bank, the slabs (the names llms_shm_drop_stale uses) */
+    char nm[48];
+    for (int k = -1; k <= 64; k++) {
+        if (k < 0) snprintf(nm, sizeof nm, llms_shm_name(0)); else if (k == 64) snprintf(nm, sizeof nm, llms_shm_name(1)); else snprintf(nm, sizeof nm, llms_shm_name(2), k);
+        shm_unlink(nm);
+    }
+}
+static int llms_mg_shm_exists(void) { int fd = shm_open(llms_shm_name(4), O_RDONLY, 0); if (fd < 0) return 0; close(fd); return 1; }
+static double llms_mg_shm_resident_seq(void) {   /* resident bytes of our shm segments (mincore): our own cache, reused or dropped -- not another process's memory */
+    double tot = 0.0; char nm[48]; const uint64_t pg = (uint64_t)vm_kernel_page_size; char *vec = NULL; size_t cap = 0;
+    for (int k = -1; k <= 64; k++) {
+        if (k < 0) snprintf(nm, sizeof nm, llms_shm_name(0)); else if (k == 64) snprintf(nm, sizeof nm, llms_shm_name(1)); else snprintf(nm, sizeof nm, llms_shm_name(2), k);
+        int fd = shm_open(nm, O_RDONLY, 0); if (fd < 0) continue;
+        struct stat st; if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); continue; }
+        void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd); if (p == MAP_FAILED) continue;
+        const size_t np = (size_t)(((uint64_t)st.st_size + pg - 1) / pg);
+        if (np > cap) { free(vec); vec = malloc(np); cap = vec ? np : 0; }
+        if (vec && mincore(p, (size_t)st.st_size, vec) == 0) for (size_t i = 0; i < np; i++) if (vec[i] & 1) tot += (double)pg;
+        munmap(p, (size_t)st.st_size);
+    }
+    free(vec); return tot;
+}
+
+
+static double llms_mg_shm_resident(void) {
+    static int par = -1; if (par < 0) { const char *e = getenv("LLMS_DS4_MG_PAR"); par = e && *e ? atoi(e) : 0; }
+    if (par <= 0) return llms_mg_shm_resident_seq();
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    double part[66] = {0}; double *pp = part;
+    dispatch_apply(66, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+        const int k = (int)i - 1; char nm[48]; const uint64_t pg = (uint64_t)vm_kernel_page_size;
+        if (k < 0) snprintf(nm, sizeof nm, llms_shm_name(0)); else if (k == 64) snprintf(nm, sizeof nm, llms_shm_name(1)); else snprintf(nm, sizeof nm, llms_shm_name(2), k);
+        int fd = shm_open(nm, O_RDONLY, 0); if (fd < 0) return;
+        struct stat st; if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return; }
+        void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd); if (p == MAP_FAILED) return;
+        const size_t np = (size_t)(((uint64_t)st.st_size + pg - 1) / pg); char *vec = malloc(np); double t = 0.0;
+        if (vec && mincore(p, (size_t)st.st_size, vec) == 0) for (size_t j = 0; j < np; j++) if (vec[j] & 1) t += (double)pg;
+        free(vec); munmap(p, (size_t)st.st_size); pp[i] = t;
+    });
+    double tot = 0.0; for (int i = 0; i < 66; i++) tot += part[i];
+    const double ms = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) * 1e-6;
+    if (par >= 2) { const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); const double s = llms_mg_shm_resident_seq(); const double ms2 = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t1) * 1e-6;
+                    fprintf(stderr, "llms mg par: parallel %.0f B in %.1f ms, sequential %.0f B in %.1f ms -- %s\n", tot, ms, s, ms2, tot == s ? "EQUAL" : "DIFFER"); }
+    else fprintf(stderr, "llms mg par: %.2f GiB of our shm resident, counted in %.1f ms (concurrent mincore)\n", tot / 1073741824.0, ms);
+    return tot;
+}
+static const char *llms_mg_scarce_now(const llms_mg_vm *v) {   /* (2) at start: memory ALREADY scarce */
+    if (g_llms_mg_test == 1) return "TEST admit0";
+    if (v->level >= 4) return "kernel memory pressure CRITICAL";
+    if (v->comp >= 3.0 * LLMS_MG_GIB) return "compressor occupancy >= 3 GiB";
+    if (v->seg_frac >= 0.40) return "compressor segments >= 40 % of the limit";   /* 16:1x: 10 % fired on normal fragmentation (3.7 -> 10.4 % in ~2 h at a steady 1.7 GiB) */
+    if (v->free + v->spec + v->inact + v->purg < 1.0 * LLMS_MG_GIB) return "free + reclaimable < 1 GiB";
+    return NULL;
+}
+static void llms_mg_print_vm(const char *pre, const llms_mg_vm *v) {
+    fprintf(stderr, "%sphys %.1f GiB, wired %.2f, free %.2f, speculative %.2f, inactive %.2f, purgeable %.2f, file-backed %.2f, anonymous %.2f, compressor %.2f GiB, "
+            "segments %.1f %% of the limit, pressure level %d\n", pre, v->phys / LLMS_MG_GIB, v->wired / LLMS_MG_GIB, v->free / LLMS_MG_GIB, v->spec / LLMS_MG_GIB,
+            v->inact / LLMS_MG_GIB, v->purg / LLMS_MG_GIB, v->ext / LLMS_MG_GIB, v->intl / LLMS_MG_GIB, v->comp / LLMS_MG_GIB, 100.0 * v->seg_frac, v->level);
+}
+static void *llms_mg_watch(void *arg) {   /* (3) */
+    (void)arg; int low = 0;
+    for (;;) {
+        llms_mg_vm v;
+        if (llms_mg_sample(&v) == 0) {
+            const char *why = NULL;
+            if (g_llms_mg_test == 3) why = "TEST watch";
+            else if (v.level >= 4) why = "kernel memory pressure CRITICAL";
+            else if (v.comp >= 7.0 * LLMS_MG_GIB) why = "compressor occupancy >= 7 GiB";   /* 16:5x: the panic sat at 9.45 GiB */
+            else if (v.comp >= 4.0 * LLMS_MG_GIB && v.ext < 4.0 * LLMS_MG_GIB) why = "compressor occupancy >= 4 GiB with the file cache < 4 GiB";   /* 16:5x: 4 GiB ALONE fired on a
+               normal COLD start after a rebuild (k3x_live_test 16:50: compressor 4.65 GiB, file cache 14.66 GiB, segments 6.5 %) -- the panic drained the file cache first (9 MB) */
+            else if (v.seg_frac >= 0.60) why = "compressor segments >= 60 % of the limit";   /* 16:1x: was 25 %; the panic sat at 100 %, the occupancy trigger fires first */
+            else if (v.free + v.spec < 0.25 * LLMS_MG_GIB && v.ext < 1.0 * LLMS_MG_GIB) { if (++low >= 4) why = "free < 0.25 GiB with the file cache < 1 GiB for 1 s"; }
+            else low = 0;
+            if (why) {   /* unlink FIRST, then one non-blocking write: a full stderr pipe must not hold the exit */
+                llms_mg_unlink_shm();
+                char m[512]; const int k = snprintf(m, sizeof m, "\nllms memguard: SYSTEM MEMORY CRITICAL (%s: compressor %.2f GiB, segments %.1f %% of the limit, "
+                    "free %.2f GiB, file-backed %.2f GiB, wired %.2f GiB, pressure level %d) -- shm cache dropped, exiting NOW to release this engine's memory (exit 76)\n",
+                    why, v.comp / LLMS_MG_GIB, 100.0 * v.seg_frac, v.free / LLMS_MG_GIB, v.ext / LLMS_MG_GIB, v.wired / LLMS_MG_GIB, v.level);
+                const int fl = fcntl(2, F_GETFL); if (fl >= 0) fcntl(2, F_SETFL, fl | O_NONBLOCK);
+                if (k > 0) { ssize_t w = write(2, m, (size_t)(k < (int)sizeof m ? k : (int)sizeof m - 1)); (void)w; }
+                _exit(76);
+            }
+        }
+        usleep(250000);
+    }
+    return NULL;
+}
+static int llms_mg_engine_holder(void) {   /* the pid holding the engine lock, 0 if free (F_GETLK: queries without taking it) */
+    int fd = open(LLMS_MG_LOCK, O_RDWR | O_CLOEXEC); if (fd < 0) return 0;
+    struct flock fl; memset(&fl, 0, sizeof fl); fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET;
+    int pid = 0; if (fcntl(fd, F_GETLK, &fl) == 0 && fl.l_type != F_UNLCK) pid = fl.l_pid > 0 ? fl.l_pid : 1;
+    close(fd); return pid;
+}
+static void llms_mg_glog(const char *msg) {
+    int fd = open(LLMS_MG_GLOG, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600); if (fd < 0) return;
+    char b[512]; const time_t t = time(NULL); struct tm tmv; localtime_r(&t, &tmv); char ts[32]; strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
+    const int n = snprintf(b, sizeof b, "%s pid %d %s\n", ts, (int)getpid(), msg); if (n > 0) { ssize_t w = write(fd, b, (size_t)(n < (int)sizeof b ? n : (int)sizeof b - 1)); (void)w; }
+    close(fd);
+}
+static void llms_mg_guardian(int parent) {   /* (4) never returns */
+    int gfd = open(LLMS_MG_GLOCK, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    struct flock fl; memset(&fl, 0, sizeof fl); fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET;
+    if (gfd < 0 || fcntl(gfd, F_SETLK, &fl) != 0) _exit(0);   /* another guardian already watches */
+    llms_mg_glog("guardian start");
+    char self[4096]; uint32_t ssz = sizeof self; struct stat st0; memset(&st0, 0, sizeof st0);
+    const int self_ok = _NSGetExecutablePath(self, &ssz) == 0 && stat(self, &st0) == 0;
+    time_t t0 = time(NULL); int warn = 0, low = 0, paused = 0; char msg[256];
+    for (;;) {
+        sleep(1);
+        if (!llms_mg_shm_exists()) { llms_mg_glog("guardian exit: no shm cache left"); _exit(0); }
+        struct stat st1;   /* (b) the binary was relinked: continue in the new image; if that fails, drop the cache rather than leave it unguarded */
+        if (self_ok && (stat(self, &st1) != 0 || st1.st_ino != st0.st_ino || st1.st_mtime != st0.st_mtime)) {
+            llms_mg_glog("guardian: its executable changed -- re-exec");
+            char pp[32]; snprintf(pp, sizeof pp, "%d", parent); char *av[] = { self, (char *)"--llms-memguard-guardian", pp, g_llms_mg_test == 4 ? (char *)"test" : NULL, NULL };
+            close(gfd); execv(self, av);
+            llms_mg_unlink_shm(); llms_mg_glog("guardian: re-exec failed -- dropped the shm cache"); _exit(0);
+        }
+        const int h = llms_mg_engine_holder();
+        if (h) {   /* (a) an engine runs: its watchdog covers; pause, never leave the cache unguarded after it */
+            if (!paused) { snprintf(msg, sizeof msg, "guardian paused: engine pid %d holds the lock", h); llms_mg_glog(msg); paused = 1; }
+            t0 = time(NULL); warn = low = 0; continue;
+        }
+        if (paused) { llms_mg_glog("guardian resumed: no engine holds the lock"); paused = 0; }
+        llms_mg_vm v; if (llms_mg_sample(&v) != 0) continue;
+        const char *why = NULL;
+        if (v.level >= 2) { if (++warn >= 5) why = "pressure WARN or worse for 5 s"; } else warn = 0;
+        if (!why && v.comp >= 3.0 * LLMS_MG_GIB) why = "compressor >= 3 GiB";
+        if (!why && v.seg_frac >= 0.35) why = "compressor segments >= 35 % of the limit";   /* 16:1x: was 15 % */
+        if (!why) { if (v.free + v.spec + v.inact + v.purg < 2.0 * LLMS_MG_GIB) { if (++low >= 5) why = "free + reclaimable < 2 GiB for 5 s"; } else low = 0; }
+        if (!why && time(NULL) - t0 > 6 * 3600) why = "6 h without an engine";
+        if (!why && g_llms_mg_test == 4) why = "TEST guard";
+        if (why) {
+            llms_mg_unlink_shm();
+            snprintf(msg, sizeof msg, "guardian dropped the shm cache: %s (compressor %.2f GiB, free %.2f GiB, level %d)", why, v.comp / LLMS_MG_GIB, v.free / LLMS_MG_GIB, v.level);
+            llms_mg_glog(msg); _exit(0);
+        }
+    }
+}
+void llms_mg_spawn_guardian(void) {   /* called by the shm cache's exit save, after the header is valid */
+    char path[4096]; uint32_t sz = sizeof path; if (_NSGetExecutablePath(path, &sz) != 0) return;
+    char ppid[32]; snprintf(ppid, sizeof ppid, "%d", (int)getpid());
+    posix_spawnattr_t at; posix_spawnattr_init(&at); posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT);
+    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    char *av[] = { path, (char *)"--llms-memguard-guardian", ppid, g_llms_mg_test == 4 ? (char *)"test" : NULL, NULL }; char *ev[] = { (char *)"PATH=/usr/bin:/bin", NULL };
+    pid_t pid = 0; const int rc = posix_spawn(&pid, path, &fa, &at, av, ev);
+    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&at);
+    if (rc == 0) fprintf(stderr, "llms memguard: guardian pid %d watches the shm cache while no engine runs (log %s)\n", (int)pid, LLMS_MG_GLOG);
+    else { fprintf(stderr, "llms memguard: cannot spawn the guardian (%s) -- dropping the shm cache instead\n", strerror(rc)); llms_mg_unlink_shm(); }
+}
+static void llms_mg_refuse(const char *why, const llms_mg_vm *v, int code) {
+    fprintf(stderr, "llms memguard: REFUSING TO RUN -- %s (exit %d)\n", why, code);
+    if (v) llms_mg_print_vm("llms memguard: ", v);
+    _exit(code);
+}
+void llms_mg_admit_slabs(uint32_t slots, uint64_t slot_bytes) {   /* (2) the plan, once, before the first expert slab */
+    static int done; if (done) return; done = 1;
+    {
+        extern const char LLMS_ADOPTED_CACHE_GIB_NONSERVER[], LLMS_ADOPTED_CACHE_GIB_SERVER[];
+        const char *ge = getenv("LLMS_DS4_GUARDS"), *gs = getenv("LLMS_DS4_EXPERT_CACHE_GIB"), *bs = getenv("LLMS_DS4_EXPERT_CACHE_SLOT_BYTES"), *xs = getenv("LLMS_DS4_EXPERT_CACHE_EXPERIMENT");
+        const char *pn = getprogname(); const int srv = pn && !strcmp(pn, "ds4-server"), exper = xs && *xs == '1';
+        if (ge && *ge && *ge != '0' && gs && *gs && bs && *bs) {
+            const double gib = atof(gs), adopted = atof(srv ? LLMS_ADOPTED_CACHE_GIB_SERVER : LLMS_ADOPTED_CACHE_GIB_NONSERVER);
+            const unsigned long long sb = strtoull(bs, NULL, 10); const unsigned long want = sb ? (unsigned long)((gib * 1073741824.0) / (double)sb) : 0ul;
+            if (fabs(gib - adopted) > 1e-6 && !exper) {
+                fprintf(stderr, "llms CACHE BUDGET GUARD: REFUSING TO RUN -- LLMS_DS4_EXPERT_CACHE_GIB=%s is not the adopted budget %.3f GiB. The budget is settled: larger LOST on "
+                        "agent sessions while the "
+                        "install-heavy pair_steps read it as a gain. A footprint experiment sets LLMS_DS4_EXPERT_CACHE_EXPERIMENT=1 and is priced in PRODUCTION (warm agent "
+                        "sessions, a block design). (exit 78)\n", gs, adopted);
+                _exit(78);
+            }
+            if (sb != slot_bytes && !exper) {
+                fprintf(stderr, "llms CACHE BUDGET GUARD: %s -- the expert slot is %llu B but the budget assumes %llu B (the expert formats changed); the "
+                        "cache would hold %.2f GiB, not %.3f. Regenerate ds4_defaults.h from ds4_defaults.json or set "
+                        "LLMS_DS4_EXPERT_CACHE_SLOT_BYTES=%llu for this arm.%s\n", srv ? "WARNING" : "REFUSING TO RUN", (unsigned long long)slot_bytes, sb,
+                        (double)slots * (double)slot_bytes / 1073741824.0, gib, (unsigned long long)slot_bytes, srv ? "" : " (exit 78)");
+                if (!srv) _exit(78);
+            }
+            if (want > slots)
+                fprintf(stderr, "llms CACHE GUARD: the %.3f GiB budget derives %lu slots, %u planned -- the cache is %.1f %% SMALLER (the planner fitted it for headroom and "
+                        "may have taken a prefill reserve: read the 'ds4: memory:' line)\n", gib, want, slots, 100.0 * (1.0 - (double)slots / (double)want));
+        }
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        llms_mg_vm v; if (llms_mg_sample(&v) != 0) llms_mg_refuse("cannot read the VM statistics", NULL, 77);
+        const double ours = llms_mg_shm_resident(), slabs = (double)slots * (double)slot_bytes;
+        const double apps = v.intl > ours ? v.intl - ours : 0.0;
+        const double left = v.phys - (v.wired + slabs + LLMS_MG_FIXED_GIB * LLMS_MG_GIB) - LLMS_MG_FILE_HOT_GIB * LLMS_MG_GIB - LLMS_MG_APPS_FACTOR * apps - v.comp;
+        fprintf(stderr, "llms memguard: admission -- phys %.1f GiB - wired now %.2f - slabs %.2f (%u x %.2f MiB) - fixed engine set %.1f - hot file weights %.1f - other "
+                "anonymous %.2f x %.1f - compressor %.2f = %.2f GiB left (reserve %.1f)\n", v.phys / LLMS_MG_GIB, v.wired / LLMS_MG_GIB, slabs / LLMS_MG_GIB, slots,
+                (double)slot_bytes / 1048576.0, LLMS_MG_FIXED_GIB, LLMS_MG_FILE_HOT_GIB, apps / LLMS_MG_GIB, LLMS_MG_APPS_FACTOR, v.comp / LLMS_MG_GIB, left / LLMS_MG_GIB, LLMS_MG_RESERVE_GIB);
+        if (left >= LLMS_MG_RESERVE_GIB * LLMS_MG_GIB && g_llms_mg_test != 2) return;
+        {   /* llms MG_WIRED_LAG (adopt_mgpar.py; 10-21 04:3x par_startup_job ps_5: 'wired now 49.81 GiB' -- a previous engine's GPU memory not yet
+               released -- dropped a valid 39 GiB cache on pass 0): while wired exceeds the slabs' size below the reserve, re-sample (<= 10 x 200 ms) */
+            static int wl_waits; if (left < LLMS_MG_RESERVE_GIB * LLMS_MG_GIB && v.wired > slabs && wl_waits < 10 && g_llms_mg_test != 2) {
+                wl_waits++; fprintf(stderr, "llms memguard: %.2f GiB wired, more than the slabs' %.2f -- a previous engine's GPU memory still releasing? re-sampling in 0.2 s (%d of 10)\n",
+                                    v.wired / LLMS_MG_GIB, slabs / LLMS_MG_GIB, wl_waits); usleep(200000); pass--; continue; }
+        }
+        if (pass == 0 && ours > 0.0 && g_llms_mg_test != 2) { fprintf(stderr, "llms memguard: below the reserve -- dropping our shm cache (%.2f GiB resident) and checking again\n", ours / LLMS_MG_GIB); llms_mg_unlink_shm(); continue; }
+        {   /* the accounting lag (canary 10-20 16:03): a just-unlinked cache still counts as anonymous memory for a moment -- re-sample before refusing */
+            static int lag_waits; if (ours <= 0.0 && apps > 20.0 * LLMS_MG_GIB && lag_waits < 5 && g_llms_mg_test != 2) {
+                lag_waits++; fprintf(stderr, "llms memguard: %.2f GiB of other anonymous memory and no cache of ours -- re-sampling in 1 s (%d of 5; a just-unlinked cache drains)\n", apps / LLMS_MG_GIB, lag_waits);
+                sleep(1); pass = -1; continue; } }
+        const double fit = (left - LLMS_MG_RESERVE_GIB * LLMS_MG_GIB + slabs) / (double)slot_bytes;
+        char why[256]; snprintf(why, sizeof why, "not enough memory for %u expert slots: at most %d fit with the %.0f GiB reserve (set LLMS_DS4_EXPERT_CACHE_GIB lower, or close applications)",
+                                slots, fit > 0.0 ? (int)fit : 0, LLMS_MG_RESERVE_GIB);
+        llms_mg_refuse(g_llms_mg_test == 2 ? "TEST admit" : why, &v, 77);
+    }
+}
+void llms_mg_admit_alloc(uint64_t bytes, const char *what) {   /* (2) one on-demand allocation: it must leave the reserve too */
+    llms_mg_vm v; if (llms_mg_sample(&v) != 0) llms_mg_refuse("cannot read the VM statistics", NULL, 77);
+    const double left = v.free + v.spec + v.inact + v.purg - (double)bytes;
+    if (left >= LLMS_MG_RESERVE_GIB * LLMS_MG_GIB && llms_mg_scarce_now(&v) == NULL) return;
+    char why[200]; snprintf(why, sizeof why, "a new %s of %.2f GiB would leave %.2f GiB free + reclaimable (reserve %.1f)", what, (double)bytes / LLMS_MG_GIB, left / LLMS_MG_GIB, LLMS_MG_RESERVE_GIB);
+    llms_mg_refuse(why, &v, 77);
+}
+int llms_mg_holds_engine_lock(void) { return g_llms_mg_lock_fd >= 0; }
+__attribute__((constructor(102))) static void llms_mg_init(int argc, char **argv, char **envp) {
+    (void)envp;
+    llms_guard_paths_init();
+    const char *t = getenv("LLMS_DS4_MEMGUARD_TEST");
+    g_llms_mg_test = !t || !*t ? 0 : !strcmp(t, "admit0") ? 1 : !strcmp(t, "admit") ? 2 : !strcmp(t, "watch") ? 3 : !strcmp(t, "guard") ? 4 : 0;
+    if (argc >= 2 && argv && argv[1] && !strcmp(argv[1], "--llms-memguard-guardian")) { if (argc >= 4 && argv[3] && !strcmp(argv[3], "test")) g_llms_mg_test = 4;
+                                                                                          llms_mg_guardian(argc >= 3 && argv[2] ? atoi(argv[2]) : 0); }
+    /* (1) one engine at a time */
+    const int fd = open(LLMS_MG_LOCK, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) { fprintf(stderr, "llms memguard: REFUSING TO RUN -- cannot open the engine lock %s (%s) (exit 75)\n", LLMS_MG_LOCK, strerror(errno)); _exit(75); }
+    struct flock fl; memset(&fl, 0, sizeof fl); fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET;
+    if (fcntl(fd, F_SETLK, &fl) != 0) {
+        char who[256] = {0}; const ssize_t r = pread(fd, who, sizeof who - 1, 0); if (r > 0) who[r] = 0; who[strcspn(who, "\n")] = 0;
+        fprintf(stderr, "llms memguard: REFUSING TO RUN -- another ds4 engine holds the engine lock (%s): two engines exceed this machine's memory "
+                "(exit 75)\n", who[0] ? who : "pid unknown");
+        _exit(75);
+    }
+    char me[320]; const int n = snprintf(me, sizeof me, "pid %d %s\n", (int)getpid(), argc >= 1 && argv && argv[0] ? argv[0] : "?");
+    if (ftruncate(fd, 0) == 0 && n > 0) { ssize_t w = pwrite(fd, me, (size_t)n, 0); (void)w; }
+    g_llms_mg_lock_fd = fd;
+    /* (2) memory already scarce: refuse before anything is mapped */
+    llms_mg_vm v; if (llms_mg_sample(&v) != 0) llms_mg_refuse("cannot read the VM statistics", NULL, 77);
+    const char *why = llms_mg_scarce_now(&v); if (why) llms_mg_refuse(why, &v, 77);
+    /* (3) the watchdog, for the whole process lifetime */
+    {   /* the watchdog must run when memory is gone: its code pages and its own stack are locked in RAM */
+        const uintptr_t pg = (uintptr_t)vm_kernel_page_size;
+        const void *fn[] = { (const void *)llms_mg_watch, (const void *)llms_mg_sample, (const void *)llms_mg_sysctl_u64, (const void *)llms_mg_unlink_shm };
+        for (size_t i = 0; i < sizeof fn / sizeof fn[0]; i++) { const uintptr_t p0 = (uintptr_t)fn[i] & ~(pg - 1u); mlock((const void *)p0, (size_t)(2u * pg)); }
+    }
+    const size_t wsz = 256u * 1024u; void *wst = mmap(NULL, wsz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (wst == MAP_FAILED) llms_mg_refuse("cannot map the watchdog's stack", &v, 77);
+    mlock(wst, wsz);
+    pthread_attr_t a; pthread_attr_init(&a); pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INTERACTIVE, 0); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstack(&a, wst, wsz);
+    pthread_t th; if (pthread_create(&th, &a, llms_mg_watch, NULL) != 0) llms_mg_refuse("cannot start the memory watchdog", &v, 77);
+    pthread_attr_destroy(&a);
+}
+#endif   /* ==== end llms MEMGUARD ==== */
 
 #include "ds4.h"
 #include "ds4_tool_text.h"
@@ -2758,6 +3107,46 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 /* Engram is deliberately outside the weight mapping, not merely absent from
  * a residency list. Startup warming and any future weight-view code must not
  * turn its 189 GiB of random-access rows into a resident model allocation. */
+
+static uint64_t g_llms_dense_side_bytes;   /* the side region at the end of m->size (0 when none) */
+static uint64_t llms_dense_side_attach(ds4_model *m, uint64_t start) {
+    const char *idx = getenv("LLMS_DS4_DENSE_SIDE");
+    if (!idx || !*idx) return 0;
+    FILE *f = fopen(idx, "r");
+    if (!f) ds4_die_errno("cannot open dense side index", idx);
+    char side_path[4096]; unsigned long long gguf_bytes = 0;
+    if (!fgets(side_path, sizeof side_path, f)) ds4_die("dense side index: no side path");
+    side_path[strcspn(side_path, "\r\n")] = 0;
+    if (fscanf(f, "gguf_bytes %llu\n", &gguf_bytes) != 1) ds4_die("dense side index: no gguf_bytes line");
+    if (gguf_bytes != m->file_size) { fprintf(stderr, "llms: dense side index is for another GGUF (%llu bytes); ignored\n", gguf_bytes); fclose(f); return 0; }
+    const int sfd = open(side_path, O_RDONLY);
+    if (sfd < 0) ds4_die_errno("cannot open dense side file", side_path);
+    struct stat st;
+    if (fstat(sfd, &st) != 0 || st.st_size <= 0) ds4_die_errno("cannot stat dense side file", side_path);
+    const uint64_t page = 16384u, side = ((uint64_t)st.st_size + page - 1u) / page * page;
+    if (start % page || start + side > m->size) ds4_die("dense side: the side file does not fit the released Engram range");
+    void *p = mmap((void *)(m->map + start), (size_t)st.st_size, PROT_READ, MAP_SHARED | MAP_FIXED, sfd, 0);
+    if (p == MAP_FAILED || (const uint8_t *)p != (const uint8_t *)(m->map + start)) ds4_die_errno("cannot map dense side file", side_path);
+    close(sfd);
+    char name[512]; unsigned long long off, bytes; unsigned type; uint64_t n = 0, tot = 0;
+    while (fscanf(f, "%511s %llu %llu %u\n", name, &off, &bytes, &type) == 4) {
+        ds4_tensor *t = NULL;
+        for (uint64_t i = 0; i < m->n_tensors && !t; i++) if (ds4_streq(m->tensors[i].name, name)) t = &m->tensors[i];
+        if (!t) { fprintf(stderr, "llms dense side: tensor %s not in the GGUF\n", name); ds4_die("dense side: unknown tensor"); }
+        uint64_t want = 0;
+        if (off % page || off + bytes > (uint64_t)st.st_size || !tensor_nbytes(type, t->elements, &want) || want != bytes) {
+            fprintf(stderr, "llms dense side: %s offset %llu bytes %llu type %u (expected %llu bytes)\n", name, off, bytes, type, (unsigned long long)want);
+            ds4_die("dense side: inconsistent entry");
+        }
+        t->abs_offset = start + off; t->bytes = bytes; t->type = type; n++; tot += bytes;
+    }
+    fclose(f);
+    g_llms_dense_side_bytes = side;
+    fprintf(stderr, "llms: dense side %s: %llu tensors (%.2f GB) redirected; side mapped at the end of the resident weights\n",
+            side_path, (unsigned long long)n, tot / 1e9);
+    return side;
+}
+
 static void model_unmap_engram(ds4_model *m) {
     ds4_str arch = {0}, encoding = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
@@ -2790,9 +3179,10 @@ static void model_unmap_engram(ds4_model *m) {
     if (page <= 0 || start % (uint64_t)page || resident_end > start ||
         tables[1]->abs_offset < start + tables[0]->bytes)
         ds4_die("V4.1 Engram tables must follow the page-aligned main weights");
-    if (munmap((void *)(m->map + start), (size_t)(m->size - start)) != 0)
+    const uint64_t llms_side = llms_dense_side_attach(m, start);   /* llms DENSE_SIDE */
+    if (start + llms_side < m->size && munmap((void *)(m->map + start + llms_side), (size_t)(m->size - start - llms_side)) != 0)
         ds4_die_errno("cannot unmap disk-only region", "Engram");
-    m->size = start;
+    m->size = start + llms_side;
 }
 
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
@@ -3170,6 +3560,8 @@ static void model_summary(const ds4_model *m) {
         model_get_u32(m, "deepseek41.index_n_heads", &indexer_heads);
         model_get_u32(m, "deepseek41.index_head_dim", &indexer_head_dim);
         model_get_u32(m, "deepseek41.index_topk", &indexer_top_k);
+        { const char *e = getenv("LLMS_DS4_INDEX_TOPK"); const long k = e && *e ? atol(e) : 0;   /* llms INDEX_TOPK (apply_ds4_fidelity_dials.py): a FIDELITY DIAL */
+          if (k > 0 && (uint32_t)k < indexer_top_k) { fprintf(stderr, "llms: INDEX_TOPK %ld -- FIDELITY DIAL: the sparse attention's top-k lowered from %u; NOT the model\n", k, indexer_top_k); indexer_top_k = (uint32_t)k; } }
         model_get_u32(m, "deepseek41.n_routed_experts", &n_expert);
         model_get_u32(m, "deepseek41.num_experts_per_tok", &n_expert_used);
     }
@@ -5180,9 +5572,10 @@ static bool ds4_streaming_prefill_headroom_bytes(
         return false;
     }
     (void)cacheable_experts;
+    uint32_t llms_headroom_layers = DS4_STREAMING_PREFILL_HEADROOM_LAYERS;   /* llms PREFILL_RESERVE_LAYERS */
+    { const char *e = getenv("LLMS_DS4_PREFILL_RESERVE_LAYERS"); if (e && *e) { const long v = atol(e); if (v >= 0 && v <= 2) llms_headroom_layers = (uint32_t)v; } }
     const uint32_t reserve_layers =
-        cacheable_layers < DS4_STREAMING_PREFILL_HEADROOM_LAYERS ?
-        cacheable_layers : DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+        cacheable_layers < llms_headroom_layers ? cacheable_layers : llms_headroom_layers;
     if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
         return false;
     }
@@ -6947,8 +7340,10 @@ static void config_validate_deepseek41_model(const ds4_model *m) {
     for (uint32_t i = 0; i < 2; i++) {
         ds4_tensor *t = required_tensorf(m, "blk.%u.engram_embd.weight", engram[i]);
         tensor_expect_layout(t, DS4_TENSOR_I8, 2, 264, rows[i], 0);
-        if (t->abs_offset < m->size) ds4_die("Engram table is still mapped");
+        if (t->abs_offset < m->size - g_llms_dense_side_bytes) ds4_die("Engram table is still mapped");   /* llms DENSE_SIDE: the side region is not the table */
     }
+    { const char *e = getenv("LLMS_DS4_INDEX_TOPK"); const long k = e && *e ? atol(e) : 0;   /* llms INDEX_TOPK2 (apply_ds4_index_topk2.py): a FIDELITY DIAL, after the metadata checks */
+      if (k > 0 && (uint32_t)k < g_ds4_shape.n_indexer_top_k) { fprintf(stderr, "llms: INDEX_TOPK %ld -- FIDELITY DIAL: the sparse attention's top-k lowered from %u; NOT the model\n", k, g_ds4_shape.n_indexer_top_k); g_ds4_shape.n_indexer_top_k = (uint32_t)k; } }
 }
 
 static void config_read_qwen4_u64_array(
@@ -16778,6 +17173,7 @@ static void layer_glm_routed_moe_one_f32_ref(
                      &mid_ctx);
     ds4_parallel_for(down_out0, glm_routed_moe_f32_down_worker, &down_ctx);
 }
+
 
 static void layer_glm_shared_ffn_one_f32_ref(
         float                   *out,
@@ -30292,6 +30688,23 @@ static bool metal_graph_refresh_ratio4_compressor_state(
      * mixing those two accumulation orders changes a few FP8 rounding
      * decisions in later chunks.
      */
+    {
+        static int rt = -1; static uint64_t rt_n;
+        if (rt < 0) { const char *e = getenv("LLMS_DS4_R4TAIL_REUSE"); rt = e && *e && *e != '0';
+            if (rt) { fprintf(stderr, "llms: R4TAIL_REUSE (ratio-4 compressor state from the chunk projection's last four rows; no 4-token re-projection)\n");
+                      atexit_b(^{ fprintf(stderr, "llms r4tail: %llu state refreshes from the chunk projection\n", (unsigned long long)rt_n); }); } }
+        if (rt) {
+            ds4_gpu_tensor *kv4 = ds4_gpu_tensor_view(metal_graph_batch_comp_kv(g), (uint64_t)(n_tokens - 4u) * width * sizeof(float), 4ull * width * sizeof(float));
+            ds4_gpu_tensor *sc4 = ds4_gpu_tensor_view(metal_graph_batch_comp_sc(g), (uint64_t)(n_tokens - 4u) * width * sizeof(float), 4ull * width * sizeof(float));
+            bool ok4 = kv4 && sc4 && ds4_gpu_compressor_prefill_state_ratio4_tensor(state_kv, state_score, kv4, sc4, model->map, model->size, ape->abs_offset, ape->type,
+                                                                                    head_dim, pos0 + n_tokens - 4u) != 0;
+            if (kv4) ds4_gpu_tensor_free(kv4);
+            if (sc4) ds4_gpu_tensor_free(sc4);
+            if (!ok4) fprintf(stderr, "ds4: ratio-4 compressor state refresh (R4TAIL_REUSE) failed\n");
+            else rt_n++;
+            return ok4;
+        }
+    }
     ds4_gpu_tensor *tail_hc = ds4_gpu_tensor_view(
             metal_graph_batch_attn_norm(g),
             (uint64_t)(n_tokens - 4u) * DS4_N_EMBD * sizeof(float),
@@ -40902,6 +41315,12 @@ typedef struct {
 #undef DS41_ROW_FIELD
 } ds41_prefill_row;
 
+static uint32_t llms_prefill_cap(void) {   /* llms PREFILL_CAP (apply_ds4_prefill_cap.py): 0 = off */
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LLMS_DS4_PREFILL_CAP"); v = e && *e ? atoi(e) : 0; if (v < 0) v = 0;
+                 if (v) fprintf(stderr, "llms: prefill cap %d rows, no prefill carry (a decode-time memory layout)\n", v); }
+    return (uint32_t)v;
+}
 typedef struct ds41_dspark ds41_dspark;
 static void ds41_dspark_free(ds41_dspark *d);
 static void ds41_dspark_reset(ds41_dspark *d);
@@ -40909,8 +41328,9 @@ static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows);
 
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
-    const uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
+    uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
         (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : DS41_PREFILL_CAP;
+    if (llms_prefill_cap() && llms_prefill_cap() < limit) limit = llms_prefill_cap();   /* llms PREFILL_CAP */
     return ctx < limit ? ctx : limit;
 }
 
@@ -40920,6 +41340,10 @@ static uint32_t ds41_carry_words(uint32_t width, uint32_t format, bool compact) 
 }
 
 static uint32_t ds41_carry_cap(uint32_t ctx) {
+    if (llms_prefill_cap()) return 0;   /* llms PREFILL_CAP: no prefill carry */
+    { static int nc = -1; if (nc < 0) { const char *e = getenv("LLMS_DS4_NO_CARRY"); nc = e && *e && *e != '0';
+                                        if (nc) fprintf(stderr, "llms: no carry (the prefill carry buffers and their Engram prefetch rows not allocated; prefill_cap kept)\n"); }
+      if (nc) return 0; }
     const bool compact = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY");
     const uint64_t row_bytes = ((uint64_t)ds41_carry_words(DS4_N_HC * DS4_N_EMBD,
         DS4_V41_CARRY_BF16, compact) + DS4_N_HC + 24u + DS4_N_INDEXER_TOP_K +
@@ -40991,6 +41415,7 @@ typedef struct {
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
+    bool llms_ws_shared;   /* llms LLMS_DS4_V41_SHARE_WS: prefill transients belong to g_llms_ws_owner */
     ds41_dspark *dspark;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
@@ -41005,8 +41430,41 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
     return cursor_read(&c, out, bytes);
 }
 
+static ds41_gpu_graph *g_llms_ws_owner;   /* llms LLMS_DS4_V41_SHARE_WS */
+static int g_llms_tail_publish;   /* llms TAILFULL (apply_tailfull3.py); defined again beside ds4_session_copy_tail */
+static ds4_gpu_tensor *g_llms_tail_cap[128];   /* llms TAILFULL (apply_tailfull5.py): per batch row, (2 D + 12) floats: norm, selected (int32 bits), route_weights, the unrounded f */
+static uint32_t g_llms_tail_cap_rows;
+static bool llms_tail_capture_l39_at(const ds41_prefill_row *a, uint32_t rows, uint32_t row0) {   /* apply_tailfull6.py: rows of `a` are batch rows row0 .. row0 + rows - 1 */
+    if (row0 + rows > 128u || !a->norm || !a->selected || !a->route_weights || !a->block) return true;   /* nothing captured: the records say so (has_l39 = 0) */
+    const uint64_t D = DS4_N_EMBD, K = DS4_N_EXPERT_USED, bytes = (2u * D + 2u * K) * sizeof(float);
+    for (uint32_t i = 0; i < rows; i++) {
+        if (!g_llms_tail_cap[row0 + i]) { g_llms_tail_cap[row0 + i] = ds4_gpu_tensor_alloc(bytes); if (!g_llms_tail_cap[row0 + i]) return false; }
+        ds4_gpu_tensor *t = g_llms_tail_cap[row0 + i];
+        if (!ds4_gpu_tensor_copy(t, 0, a->norm, (uint64_t)i * D * sizeof(float), D * sizeof(float)) ||
+            !ds4_gpu_tensor_copy(t, D * sizeof(float), a->selected, (uint64_t)i * K * sizeof(int32_t), K * sizeof(int32_t)) ||
+            !ds4_gpu_tensor_copy(t, (D + K) * sizeof(float), a->route_weights, (uint64_t)i * K * sizeof(float), K * sizeof(float)) ||
+            !ds4_gpu_tensor_copy(t, (D + 2u * K) * sizeof(float), a->block, (uint64_t)i * D * sizeof(float), D * sizeof(float))) return false;
+    }
+    if (row0 + rows > g_llms_tail_cap_rows || row0 == 0) g_llms_tail_cap_rows = row0 + rows; return true;
+}
+static int llms_share_scratch(void) {   /* llms SHARE_SCRATCH (apply_ds4_share_scratch.py) */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_SHARE_SCRATCH"); on = e && *e && *e != '0'; if (on) fprintf(stderr, "llms: share scratch (index_packed, raw_prefill, index_scores, selected_kv: one for all sessions)\n"); }
+    return on;
+}
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+    if (g == g_llms_ws_owner) g_llms_ws_owner = NULL;
+    if (g->llms_ws_shared) {   /* llms SHARE_WS: these belong to the owner */
+#define DS41_UNSHARE(name, count) g->batch.name = NULL;
+        DS41_PREFILL_ROWS(DS41_UNSHARE)
+#undef DS41_UNSHARE
+#define DS41_UNSHARE_CARRY(name, count, format) g->carry.name = NULL;
+        DS41_CARRY_ROWS(DS41_UNSHARE_CARRY)
+#undef DS41_UNSHARE_CARRY
+        g->rows_view = NULL; g->engram_prefetch = NULL; g->prefill_tokens = NULL; g->prefill_ids = NULL;
+        if (llms_share_scratch()) { g->index_packed = NULL; g->raw_prefill = NULL; g->index_scores = NULL; g->selected_kv = NULL; }   /* llms SHARE_SCRATCH */
+    }
     ds41_dspark_free(g->dspark);
     ds4_engram_reader_free(g->engram_reader);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41047,15 +41505,28 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     g->table[0].fd = g->table[1].fd = -1;
 }
 
+static int llms_kv_half(void); static int llms_idx_half(void); static int llms_kv_fp4(void);   /* llms KV_ACCOUNT: defined below */
+static int llms_kv_account(void) {   /* llms KV_ACCOUNT (apply_ds4_kv_account.py): the planner counts the compressed / index caches at their stored size */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_KV_ACCOUNT"); on = e && *e && *e != '0';
+                  if (on) fprintf(stderr, "llms: kv account (the memory planner counts the compressed KV and indexer key caches at their stored size)\n"); }
+    return on;
+}
+static uint64_t llms_kv_row_bytes(void) {   /* llms KV_ACCOUNT: one compressed row's KV + indexer key, as allocated */
+    return (uint64_t)(llms_kv_fp4() ? 288u : 512u * (llms_kv_half() ? 2u : 4u)) + 128u * (llms_idx_half() ? 2u : 4u);
+}
 static uint64_t ds41_graph_bytes(uint32_t ctx) {
     const ds41_gpu_graph shape = {.ctx = ctx,
         .prefill_cap = ds41_prefill_limit(ctx),
         .carry_cap = ds41_carry_cap(ctx),
         .prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS"),
         .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
-    uint64_t floats = (uint64_t)40 * 128 * 512;
-    for (uint32_t i = 0; i < 4; i++)
-        floats += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) * (512u + 128u) + 2u * 512u;
+    uint64_t floats = (uint64_t)40 * 128 * 512, llms_kvb = 0;   /* llms KV_ACCOUNT: stored bytes of the caches when on */
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint64_t llms_cap = (uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u;
+        if (llms_kv_account()) { llms_kvb += llms_cap * llms_kv_row_bytes(); floats += 2u * 512u; }
+        else floats += llms_cap * (512u + 128u) + 2u * 512u;
+    }
     floats += (uint64_t)2 * 2 * DS4_N_EMBD * DS4_N_HC;
 #define DS41_COUNT(name, count) floats += (count);
     DS41_SCRATCH(DS41_COUNT)
@@ -41077,7 +41548,7 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
         (g->prefill_cap > 4096u ? UINT64_C(512) : UINT64_C(256)) * 1024 * 1024 : 0;
     /* The index sorter owns two full-width merge buffers outside the graph. */
     const uint64_t sort = (uint64_t)DS41_INDEX_BATCH * ctx * 2u * sizeof(uint32_t);
-    return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort;
+    return floats * sizeof(float) + llms_kvb + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort;
 }
 
 static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
@@ -41086,10 +41557,42 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
     m.raw_bytes = 40u * 128u * 512u * sizeof(float);
     for (uint32_t i = 0; i < 4; i++)
         m.compressed_bytes += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) *
-                              (512u + 128u) * sizeof(float);
+                              (llms_kv_account() ? llms_kv_row_bytes() : (512u + 128u) * sizeof(float));   /* llms KV_ACCOUNT */
     m.total_bytes = ds41_graph_bytes(ctx);
     m.scratch_bytes = m.total_bytes - m.raw_bytes - m.compressed_bytes;
     return m;
+}
+
+/* llms SHARE_WS: bytes of the transients a non-owner session does not allocate (mirrors ds41_graph_bytes) */
+static int llms_share_ws_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_V41_SHARE_WS"); on = e && *e && *e != '0'; }
+    return on;
+}
+static uint64_t llms_ds41_shared_bytes(uint32_t ctx) {
+    if (!llms_share_ws_on()) return 0;
+    const ds41_gpu_graph shape = {.ctx = ctx, .prefill_cap = ds41_prefill_limit(ctx), .carry_cap = ds41_carry_cap(ctx),
+        .prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS"),
+        .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
+    uint64_t floats = 0;
+#define DS41_SB(name, count) floats += (uint64_t)(count) * g->prefill_cap;
+    DS41_PREFILL_STORAGE(DS41_SB)
+    if (!g->prefill_alias) { DS41_PREFILL_ALIASES(DS41_SB) }
+#undef DS41_SB
+#define DS41_SC(name, count, format) floats += (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap;
+    DS41_CARRY_ROWS(DS41_SC)
+#undef DS41_SC
+    floats += (uint64_t)(g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM;   /* engram_prefetch */
+    if (llms_share_scratch()) floats += ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u + (uint64_t)(g->prefill_cap + 128u) * DS4_N_HEAD_DIM +
+                                        (uint64_t)DS41_INDEX_BATCH * g->ctx + (uint64_t)DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM;   /* llms SHARE_SCRATCH */
+    uint64_t llms_global = 0;   /* llms PACKED_ONCE (apply_ds4_packed_once.py): the packed RHS buffer and the sorter's merge buffers are global */
+    { static int on = -1; if (on < 0) { const char *e = getenv("LLMS_DS4_PACKED_ONCE"); on = e && *e && *e != '0'; if (on) fprintf(stderr, "llms: packed once (the prefill's packed buffer and the index sorter's buffers counted once, not per session)\n"); }
+      if (on) llms_global = (g->prefill_cap >= 512 ? (g->prefill_cap > 4096u ? UINT64_C(512) : UINT64_C(256)) * 1024 * 1024 : 0) + (uint64_t)DS41_INDEX_BATCH * ctx * 2u * sizeof(uint32_t); }
+    return floats * sizeof(float) + llms_global;
+}
+static uint64_t llms_ds41_sessions_bytes(uint32_t ctx, uint32_t sessions) {
+    const uint64_t one = ds41_graph_bytes(ctx), sh = llms_ds41_shared_bytes(ctx);
+    return sessions <= 1 ? one : one + (uint64_t)(sessions - 1) * (one - sh);
 }
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
@@ -41101,6 +41604,48 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
      * partial pair is overwritten by its even-position token before use. */
 }
 
+/* llms LLMS_DS4_KV_HALF (apply_ds4_kv_half.py): the compressed latent cache stored as half. 1 on, 2 canary (kernels told float) */
+static uint64_t g_llms_kvh_copies;
+static void llms_kv_half_report(void) { fprintf(stderr, "llms kv half: %llu half copies\n", (unsigned long long)g_llms_kvh_copies); }
+static int llms_kv_half(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_KV_HALF"); on = e && *e && *e != '0' ? (!strcmp(e, "canary") ? 2 : 1) : 0;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: compressed cache as half -- CANARY: the kernels read it as float\n" : "llms: compressed cache stored as half\n");
+                            ds4_gpu_llms_set_kv_half(on == 1); atexit(llms_kv_half_report); } }
+    return on;
+}
+static int llms_idx_half(void) {   /* llms IDX_HALF (apply_ds4_idx_half.py): the indexer key cache stored as half */
+    static int on = -2;
+    if (on < -1) { const char *e = getenv("LLMS_DS4_IDX_HALF"), *src = getenv("DS4_METAL_DSV4_MISC_SOURCE"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? -1 : 1;
+                   if (on && !(src && llms_srckey(src, "llms13") != NULL)) { llms_strict_after(fprintf(stderr, "llms: LLMS_DS4_IDX_HALF ignored: DS4_METAL_DSV4_MISC_SOURCE does not name an *llms13* source\n"), LLMS_G_NAME); on = 0; }
+                   if (on) fprintf(stderr, on < 0 ? "llms: indexer key cache as half -- CANARY: the half score grid sized for half the rows\n" : "llms: indexer key cache stored as half\n"); }
+    return on;
+}
+static int llms_kv_fp4(void) {   /* llms KV_FP4 (apply_ds4_kv_fp4.py) */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_KV_FP4"), *src = getenv("DS4_METAL_DSV4_MISC_SOURCE"); on = e && *e && *e != '0'; const int cn = on && !strcmp(e, "canary");
+                  if (on && llms_kv_half() != 1) { fprintf(stderr, "llms: LLMS_DS4_KV_FP4 ignored: it needs LLMS_DS4_KV_HALF=1\n"); on = 0; }
+                  if (on && !(src && llms_srckey(src, "llms15") != NULL)) { llms_strict_after(fprintf(stderr, "llms: LLMS_DS4_KV_FP4 ignored: DS4_METAL_DSV4_MISC_SOURCE does not name an *llms15* source\n"), LLMS_G_NAME); on = 0; }
+                  if (on) { fprintf(stderr, cn ? "llms: compressed cache in FP4 -- CANARY: each block's first value sign-flipped\n" : "llms: compressed cache in FP4 (288 bytes per row)\n"); ds4_gpu_llms_set_kv_fp4(cn ? -1 : 1); } }
+    return on;
+}
+static ds4_gpu_tensor *llms_comp_half(ds41_gpu_graph *g, uint32_t owner, uint32_t n_comp) {   /* llms KV_FP4: the owner's live rows as half, in a shared temporary */
+    if (!llms_kv_fp4()) return g->compressed[owner];
+    static ds4_gpu_tensor *tmp; static uint64_t tmp_bytes;
+    const uint64_t need = (uint64_t)(n_comp ? n_comp : 1u) * 512u * sizeof(uint16_t);
+    if (tmp_bytes < need) { if (tmp) ds4_gpu_tensor_free(tmp); tmp_bytes = need + need / 4u + (1u << 20); tmp = ds4_gpu_tensor_alloc(tmp_bytes); if (!tmp) { tmp_bytes = 0; return NULL; } }
+    if (n_comp && !ds4_gpu_llms_fp4_rows_to_half(tmp, g->compressed[owner], n_comp)) return NULL;
+    {
+        static int pc = -1; static uint64_t calls, rows, dups;
+        if (pc < 0) { const char *e = getenv("LLMS_DS4_PRICE_C2H"); pc = e && *e && *e != '0';
+                      atexit_b(^{ fprintf(stderr, "llms c2h: %llu conversions, %llu rows (mean %.1f), %llu duplicated\n", (unsigned long long)calls, (unsigned long long)rows, calls ? (double)rows / (double)calls : 0.0, (unsigned long long)dups); }); }
+        calls++; rows += n_comp;
+        { static FILE *cl = (FILE *)1; if (cl == (FILE *)1) { const char *e = getenv("LLMS_DS4_C2H_LOG"); cl = e && *e ? fopen(e, "w") : NULL; }
+          if (cl) fprintf(cl, "%u %u %u\n", (unsigned)g->pos, owner, n_comp); }   /* llms C2H_LOG */
+        if (pc && n_comp && !ds4_gpu_llms_alt_off("c2h")) { dups++; if (!ds4_gpu_llms_fp4_rows_to_half(tmp, g->compressed[owner], n_comp)) return NULL; }
+    }
+    return tmp;
+}
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
                                               const ds4_weights *w, const char *path,
                                               uint32_t ctx, bool streaming) {
@@ -41115,11 +41660,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->allocation_bytes = ds41_graph_bytes(ctx);
     g->streaming = streaming;
     g->tp_world = 1;
+    const ds41_gpu_graph *llms_own = (llms_share_ws_on() && g_llms_ws_owner && g_llms_ws_owner->ctx == ctx &&
+        g_llms_ws_owner->prefill_cap == g->prefill_cap && g_llms_ws_owner->carry_cap == g->carry_cap) ? g_llms_ws_owner : NULL;
+    g->llms_ws_shared = llms_own != NULL;
+    if (llms_own) g->allocation_bytes -= llms_ds41_shared_bytes(ctx);
     g->token_map = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
-    g->prefill_ids = malloc((size_t)(g->carry_cap ? g->carry_cap : g->prefill_cap) *
+    g->prefill_ids = llms_own ? llms_own->prefill_ids : malloc((size_t)(g->carry_cap ? g->carry_cap : g->prefill_cap) *
                             sizeof(*g->prefill_ids));
-    g->rows_view = calloc(g->prefill_cap, sizeof(*g->rows_view));
-    g->prefill_tokens = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
+    g->rows_view = llms_own ? llms_own->rows_view : calloc(g->prefill_cap, sizeof(*g->rows_view));
+    g->prefill_tokens = llms_own ? llms_own->prefill_tokens : ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
     if (!g->token_map || !g->prefill_ids || !g->rows_view || !g->prefill_tokens) goto fail;
     g->engram.token_map = g->token_map;
     g->engram.vocab_size = DS4_N_VOCAB;
@@ -41155,19 +41704,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
-        g->compressed[i] = ds4_gpu_tensor_alloc(cap * 512u * sizeof(float));
-        g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(float));
+        g->compressed[i] = ds4_gpu_tensor_alloc(llms_kv_fp4() ? cap * 288u : cap * 512u * (llms_kv_half() ? sizeof(uint16_t) : sizeof(float)));   /* llms KV_HALF / KV_FP4 */
+        g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * (llms_idx_half() ? sizeof(uint16_t) : sizeof(float)));   /* llms IDX_HALF */
         g->previous_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         g->previous_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
         if (!g->compressed[i] || !g->index_cache[i] || !g->previous_kv[i] || !g->previous_score[i]) goto fail;
     }
 #define DS41_ALLOC(name, count) \
+    if (llms_own && (!strcmp(#name, "engram_prefetch") || (llms_share_scratch() && (!strcmp(#name, "index_packed") || !strcmp(#name, "raw_prefill") || !strcmp(#name, "index_scores") || !strcmp(#name, "selected_kv"))))) g->name = llms_own->name; else   /* llms SHARE_SCRATCH */ \
     if (!(g->name = (!strcmp(#name, "engram_prefetch") || !strcmp(#name, "image_text_mask") ? \
             ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
                 (uint64_t)((count) != 0 ? (count) : 1u) * sizeof(float)))) goto fail;
     DS41_SCRATCH(DS41_ALLOC)
 #undef DS41_ALLOC
 #define DS41_BATCH_ALLOC(name, count) \
+    if (llms_own) g->batch.name = llms_own->batch.name; else \
     if (!(g->batch.name = (!strcmp(#name, "engram_rows") || !strcmp(#name, "selected_comp") ? \
             ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
                 (uint64_t)(count) * g->prefill_cap * 4u))) goto fail;
@@ -41177,7 +41728,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
      * produced only after attention has consumed Q. The attention output
      * projection consumes heads/low before FFN; FFN normalization consumes x
      * before shared-down, and the routed sum may replace the old block. */
-    if (g->prefill_alias) {
+    if (llms_own) {
+        /* llms SHARE_WS: aliases and views come from the owner */
+#define DS41_OWN_ALIAS(name, count) g->batch.name = llms_own->batch.name;
+        DS41_PREFILL_ALIASES(DS41_OWN_ALIAS)
+#undef DS41_OWN_ALIAS
+    } else if (g->prefill_alias) {
 #define DS41_BATCH_ALIAS(name, count, parent, offset) \
         if (!(g->batch.name = ds4_gpu_tensor_view(g->batch.parent, \
             (uint64_t)(offset) * g->prefill_cap * 4u, \
@@ -41197,14 +41753,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     } else { DS41_PREFILL_ALIASES(DS41_BATCH_ALLOC) }
 #undef DS41_BATCH_ALLOC
 #define DS41_BATCH_VIEW(name, count) \
-    for (uint32_t i = 0; i < g->prefill_cap; i++) \
+    for (uint32_t i = 0; !llms_own && i < g->prefill_cap; i++) \
         if (!(g->rows_view[i].name = ds4_gpu_tensor_view(g->batch.name, \
                 (uint64_t)i * (count) * 4u, (uint64_t)(count) * 4u))) goto fail;
     DS41_PREFILL_ROWS(DS41_BATCH_VIEW)
 #undef DS41_BATCH_VIEW
-    if (!ds4_gpu_tensor_fill_f32(g->batch.block_mask, 0,
+    if (!llms_own && !ds4_gpu_tensor_fill_f32(g->batch.block_mask, 0,
         (uint64_t)g->prefill_cap * ((g->ctx + 7u) / 8u))) goto fail;
 #define DS41_CARRY_ALLOC(name, count, format) \
+    if (llms_own) g->carry.name = llms_own->carry.name; else \
     if (g->carry_cap && !(g->carry.name = ds4_gpu_tensor_alloc( \
             (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * sizeof(float)))) goto fail;
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
@@ -41213,8 +41770,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->engram_reader = ds4_engram_reader_create();
 #endif
     ds41_graph_reset(g);
-    fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
-            (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
+    if (llms_share_ws_on() && !llms_own && !g_llms_ws_owner) g_llms_ws_owner = g;   /* llms SHARE_WS */
+    fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only%s\n",
+            (double)g->allocation_bytes / 1048576.0, ctx, llms_own ? " (llms: prefill workspace shared)" : "");
     return true;
 fail:
     ds41_graph_free(g);
@@ -41222,34 +41780,97 @@ fail:
 }
 #undef DS41_SCRATCH
 
-static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
+static bool ds41_bf16_impl(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
+static uint64_t g_llms_bf16_site[100000];   /* llms BF16_SITES: calls per source line (LLMS_DS4_BF16_SITES=1 prints the top at exit) */
+static bool ds41_bf16_at(ds4_gpu_tensor *x, uint32_t width, int line) {
+    static int on = -1; if (on < 0) { on = getenv("LLMS_DS4_BF16_SITES") != NULL;
+        if (on) atexit_b(^{ fprintf(stderr, "llms bf16 sites:"); for (int k = 0; k < 12; k++) { int bi = -1; uint64_t bv = 0;
+            for (int i = 0; i < 100000; i++) if (g_llms_bf16_site[i] > bv) { bv = g_llms_bf16_site[i]; bi = i; }
+            if (bi < 0) break; fprintf(stderr, " L%d:%llu", bi, (unsigned long long)bv); g_llms_bf16_site[bi] = 0; } fprintf(stderr, "\n"); }); }
+    if (on && line > 0 && line < 100000) g_llms_bf16_site[line]++;
+    return ds41_bf16_impl(x, width);
+}
+#define ds41_bf16(x, w) ds41_bf16_at((x), (w), __LINE__)
 
-static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
-                        const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
-    return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
-           (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
+
+static int llms_q4l_dual(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_Q4L_DUAL"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                  if (on) fprintf(stderr, on == 2 ? "llms: q4l dual -- CANARY: the deferred split's Sinkhorn iterations halved\n" : "llms: q4l dual (q_a + kv, shared gate + up, each with its sublayer's HC split, in one dispatch)\n"); }
+    return on;
+}
+static struct { ds4_gpu_tensor *split; const ds4_gpu_tensor *mix; const ds4_model *m; uint64_t scale_off, base_off; int on; } g_llms_psplit[2];
+static uint64_t g_llms_psplit_flushed;
+static bool llms_psplit_flush(int w) {   /* the deferred split as its own kernel (its first consumer is here and no dual took it) */
+    if (!g_llms_psplit[w].on) return true;
+    g_llms_psplit[w].on = 0; g_llms_psplit_flushed++;
+    static int once; if (!once++) atexit_b(^{ fprintf(stderr, "llms q4l dual: %llu deferred splits flushed as their own kernel\n", (unsigned long long)g_llms_psplit_flushed); });
+    return ds4_gpu_hc_split_sinkhorn_tensor(g_llms_psplit[w].split, g_llms_psplit[w].mix, g_llms_psplit[w].m->map, g_llms_psplit[w].m->size,
+               g_llms_psplit[w].scale_off, g_llms_psplit[w].base_off, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) != 0;
+}
+static bool llms_dual_run(ds4_gpu_tensor *oa, const ds4_tensor *wa, ds4_gpu_tensor *ob, const ds4_tensor *wb, const ds4_gpu_tensor *x, const ds4_model *m, int w) {
+    if (!llms_q4l_dual() || ds4_gpu_llms_alt_off("dual") || wa->dim[0] != wb->dim[0]) return false;
+    const int sp = g_llms_psplit[w].on;
+    if (!ds4_gpu_llms_q4l_dual(oa, wa->abs_offset, (uint32_t)wa->dim[1], ob, wb->abs_offset, (uint32_t)wb->dim[1], x, (uint32_t)wa->dim[0],
+            sp ? g_llms_psplit[w].split : NULL, sp ? g_llms_psplit[w].mix : NULL, m->map, m->size, g_llms_psplit[w].scale_off, g_llms_psplit[w].base_off,
+            DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, llms_q4l_dual() == 2)) return false;
+    g_llms_psplit[w].on = 0;
+    return true;
 }
 
+static int llms_conc_skip_mask(void) {
+    static int k = -1;
+    if (k < 0) { const char *e = getenv("LLMS_DS4_CONC_SKIP"); k = e && *e ? atoi(e) : 0; if (k) fprintf(stderr, "llms: conc skip mask %d\n", k); }
+    return k;
+}
+static uint64_t g_llms_split_mark = UINT64_MAX;
+static bool llms_conc_after_split(void) { return g_llms_split_mark == ds4_gpu_llms_conc_count(); }
+static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
+                        const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+    ds4_gpu_llms_t32_round(round);   /* llms MVB16: the one-token Q8_0 matvec may fold the rounding (apply_mvb16.py) */
+    const bool ok = metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1);
+    const int folded = ds4_gpu_llms_t32_rounded(); ds4_gpu_llms_t32_round(0);
+    return ok && (!round || folded || ds41_bf16(out, (uint32_t)weight->dim[1]));
+}
+
+/* llms LLMS_DS4_F32_ROWS (apply_ds4_f32_rows.py): F32 batch matvecs in one exact-rows dispatch. 1 on, 2 canary. */
+static uint64_t g_llms_f32_rows_calls;
+static void llms_f32_rows_report(void) { fprintf(stderr, "llms f32 rows: %llu dispatches\n", (unsigned long long)g_llms_f32_rows_calls); }
+static int llms_f32_rows(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_F32_ROWS"); on = e && *e && *e != '0' ? (!strcmp(e, "canary") ? 2 : 1) : 0;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: F32 rows matvec -- CANARY: the last row of each group left out\n"
+                                                    : "llms: F32 rows matvec (one exact-rows dispatch per group)\n"); atexit(llms_f32_rows_report); } }
+    return on;
+}
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
-    bool ok;
+    bool ok; int llms_folded = 0;   /* llms T32_BF16 */
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch. */
-    if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
+    static int llms_mvext = -1; if (llms_mvext < 0) llms_mvext = getenv("LLMS_DS4_BATCH_MVEXT") != NULL;   /* llms BATCH_MVEXT */
+    static int llms_mvext2 = -1; if (llms_mvext2 < 0) llms_mvext2 = getenv("LLMS_DS4_BATCH_MVEXT2") != NULL;   /* llms BATCH_MVEXT2 */
+    if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && !llms_mvext &&
 #ifdef __APPLE__
         outputs != DS4_N_VOCAB &&
 #endif
         weight->type == DS4_TENSOR_Q8_0) {
+        ds4_gpu_llms_t32_round(round);   /* llms T32_BF16: the t32y path may fold the rounding */
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
-    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
+        llms_folded = ds4_gpu_llms_t32_rounded(); ds4_gpu_llms_t32_round(0);
+    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16 && !llms_mvext2) {
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
-    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
+    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && count <= ds4_gpu_llms_rows_max_public() && weight->type == DS4_TENSOR_F32 && !llms_mvext2 && llms_f32_rows()) {   /* llms F32ROWS_CAP */
+        /* llms F32_ROWS: one dispatch for the group, each row with its single-row bits; the canary leaves the last row out */
+        ok = ds4_gpu_llms_matmul_f32_rows(out, m->map, m->size, weight->abs_offset, width, outputs, in, llms_f32_rows() == 2 ? count - 1u : count) != 0;
+        g_llms_f32_rows_calls++;
+    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && count <= ds4_gpu_llms_rows_max_public() && weight->type == DS4_TENSOR_F32 && !llms_mvext2) {   /* llms F32ROWS_CAP */
         ok = true;
         for (uint32_t i = 0; ok && i < count; i++) {
             ds4_gpu_tensor *x = ds4_gpu_tensor_view((ds4_gpu_tensor *)in,
@@ -41260,9 +41881,18 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(y);
         }
     } else {
+        ds4_gpu_llms_t32_round(round);   /* llms T32_BF16 (13:3x): the BATCH_MVEXT path -- production's -- reaches the t32y kernels here */
         ok = metal_graph_matmul_plain_tensor(out, m, weight, width, outputs, in, count);
+        llms_folded = ds4_gpu_llms_t32_rounded(); ds4_gpu_llms_t32_round(0);
     }
-    return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
+    if (!ok) fprintf(stderr, "llms mmb fail: count %u type %d width %u outputs %u (Q8_0 rows %d, F16 rows %d, F32 rows %d, per-row F32 %d, plain %d)\n",
+                     count, (int)weight->type, width, outputs,
+                     count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_Q8_0,
+                     count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16,
+                     count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32 && llms_f32_rows(),
+                     count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32,
+                     !(count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS));   /* llms MMB_DBG (apply_mmb_dbg.py) */
+    return ok && (!round || llms_folded || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));   /* llms T32_BF16 */
 }
 
 static bool ds41_matmul_rows_batch(ds4_gpu_tensor *out, const ds4_model *m,
@@ -41331,9 +41961,29 @@ static bool ds41_hash_tokens(ds41_gpu_graph *g, ds4_engram_history *history,
     return ok;
 }
 
+/* llms LLMS_DS4_EMBD_CPU (apply_ds4_embd_cpu.py): the embedding rows gathered on the CPU, the table left unlocked. 1 on, 2 canary */
+static uint64_t g_llms_embd_rows;
+static void llms_embd_report(void) { fprintf(stderr, "llms embd cpu: %llu rows\n", (unsigned long long)g_llms_embd_rows); }
+static int llms_embd_cpu(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_EMBD_CPU"); on = e && *e && *e != '0' ? (!strcmp(e, "canary") ? 2 : 1) : 0;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: embedding rows on the CPU -- CANARY: token + 1\n" : "llms: embedding rows on the CPU, token_embd not locked\n"); atexit(llms_embd_report); } }
+    return on;
+}
+static bool llms_embd_cpu_row(ds4_gpu_tensor *out, const ds4_model *m, const ds4_weights *w, int token) {
+    if (token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    uint32_t tk = (uint32_t)token; if (llms_embd_cpu() == 2) tk = (tk + 1u) % DS4_N_VOCAB;   /* canary */
+    const _Float16 *row = (const _Float16 *)(m->map + w->token_embd->abs_offset + (uint64_t)tk * DS4_N_EMBD * sizeof(uint16_t));
+    static float *buf; if (!buf) buf = malloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    for (uint32_t e = 0; e < DS4_N_EMBD; e++) buf[e] = (float)row[e];   /* half -> float: exact, as the GPU's get_rows_f16 */
+    for (uint32_t h = 1; h < DS4_N_HC; h++) memcpy(buf + (size_t)h * DS4_N_EMBD, buf, (size_t)DS4_N_EMBD * sizeof(float));   /* kernel_repeat over the streams */
+    g_llms_embd_rows++;
+    return ds4_gpu_tensor_write(out, 0, buf, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) != 0;
+}
 static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                         ds4_gpu_tensor *out, ds4_gpu_tensor *scratch, int token, uint32_t pos) {
     const ds4_vision_span *image = ds41_image_at(g, pos);
+    if (!image && llms_embd_cpu()) return llms_embd_cpu_row(out, m, w, token);   /* llms EMBD_CPU */
     if (!image) return ds4_gpu_embed_token_hc_tensor(out, m->map, m->size,
         w->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token, DS4_N_EMBD, DS4_N_HC);
     const float *data = image->embedding.data + (uint64_t)(pos - image->token_start) * DS4_N_EMBD;
@@ -41359,9 +42009,11 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], 1, DS4_RMS_EPS);
 #endif
-    return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
-        weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
-        ds41_bf16(out, (uint32_t)weight->dim[0]);
+    ds4_gpu_llms_t32_round(1);   /* llms MVB16: the norm may fold the rounding (apply_mvb16.py) */
+    const bool ok = ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
+        weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS);
+    const int folded = ds4_gpu_llms_t32_rounded(); ds4_gpu_llms_t32_round(0);
+    return ok && (folded || ds41_bf16(out, (uint32_t)weight->dim[0]));
 }
 
 static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
@@ -41438,6 +42090,11 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
             4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
 
+/* llms BF16_FOLD (apply_bf16_fold.py): on one GPU, output_b rounds in its own store and the separate BF16 dispatch is skipped */
+static bool llms_bf16_fold(const ds41_gpu_graph *g) {
+    static int on = -1; if (on < 0) { const char *e = getenv("LLMS_DS4_BF16_FOLD"); on = e && *e && *e != '0'; if (on) fprintf(stderr, "llms: bf16 fold (output_b rounds in its store; ALT bff)\n"); }
+    return on && g->tp_world != 2 && !ds4_gpu_llms_alt_off("bff");
+}
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
@@ -41446,20 +42103,42 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
             (uint64_t)groups * 1024u, DS4_N_EMBD, g->low, 0) :
-        ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
+        ds41_matmul(g->block, m, l->attn_output_b, g->low, llms_bf16_fold(g));   /* llms BF16_FOLD: the rounding in the store */
 }
 
+static int g_llms_comp_rows_pre;   /* llms COMP_ROWS (apply_ds4_comp_rows.py): set only around the pipeline's per-row loop */
+static uint64_t g_llms_comp_rows_calls;
+static void llms_comp_rows_report(void) { fprintf(stderr, "llms comp rows: %llu group compressor projections\n", (unsigned long long)g_llms_comp_rows_calls); }
+static int llms_comp_rows(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_COMP_ROWS"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: compressor projections per group -- CANARY: the last row of each group left out\n"
+                                                    : "llms: compressor projections per group (exact-rows F16 dispatches)\n"); atexit(llms_comp_rows_report); } }
+    return on;
+}
+
+enum { LLMS_RB_ROWS = 8 };
+enum { LLMS_DSP_CAPR = 9 };   /* llms LOOKUP: rows the DSpark capture buffer holds (anchor + 8 lookup rows) */
+static int g_llms_rb_force;   /* llms LOOKUP: DEEPRB's save for this verify even when LLMS_DS4_DEEPRB is unset */
+static ds4_gpu_tensor *g_llms_rb_pool, *g_llms_rb_prev; static int g_llms_rb_snap; static uint32_t g_llms_rb_snap_pos0;
+static bool llms_rb_snap_row(const ds41_gpu_graph *g, uint32_t owner, uint32_t pos) {   /* after pool2, inside the open batch */
+    if (!g_llms_rb_snap || owner >= 3u || pos < g_llms_rb_snap_pos0 || pos - g_llms_rb_snap_pos0 > LLMS_RB_ROWS) return true;
+    const uint64_t r = pos - g_llms_rb_snap_pos0;
+    return ds4_gpu_tensor_copy(g_llms_rb_pool, (((uint64_t)owner * 2u + 0u) * (LLMS_RB_ROWS + 1u) + r) * 512u * 4u, g->pool_kv, 0, 512u * 4u) &&
+           ds4_gpu_tensor_copy(g_llms_rb_pool, (((uint64_t)owner * 2u + 1u) * (LLMS_RB_ROWS + 1u) + r) * 512u * 4u, g->pool_score, 0, 512u * 4u);
+}
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (ds41_kv_source(il)) {
-        if (!ds41_matmul(g->pool_kv, m, l->attn_compressor_kv, g->norm, ratio == 1)) return false;
+        if (!g_llms_comp_rows_pre && !ds41_matmul(g->pool_kv, m, l->attn_compressor_kv, g->norm, ratio == 1)) return false;   /* llms COMP_ROWS */
         if (ratio == 2) {
-            if (!ds41_matmul(g->pool_score, m, l->attn_compressor_gate, g->norm, false) ||
+            if ((!g_llms_comp_rows_pre && !ds41_matmul(g->pool_score, m, l->attn_compressor_gate, g->norm, false)) ||   /* llms COMP_ROWS */
                 !ds4_gpu_dsv41_pool2(g->latent, g->pool_kv, g->pool_score,
-                    g->previous_kv[owner], g->previous_score[owner], 512, 1, pos)) return false;
+                    g->previous_kv[owner], g->previous_score[owner], 512, 1, pos) ||
+                !llms_rb_snap_row(g, owner, pos)) return false;   /* llms DEEPRB2 */
         } else if (!ds4_gpu_tensor_copy(g->latent, 0, g->pool_kv, 0, 512u * 4u)) return false;
         if (g->verify_prefix &&
             (!ds4_gpu_tensor_copy(g->verify_previous_kv[owner], 0, g->previous_kv[owner], 0, 512u * 4u) ||
@@ -41472,20 +42151,55 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                 !ds41_norm(g->index_k, g->index_k, m, l->indexer_k_norm) ||
                 !ds41_rope(g->index_k, 1, DS4_N_INDEXER_HEAD_DIM, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0) ||
-                !ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
-                                     g->index_k, 0, 128u * 4u) ||
+                !(llms_idx_half() ? ds4_gpu_llms_copy_f32_f16(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 2u, g->index_k, 0, 128u) :   /* llms IDX_HALF */
+                  ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
+                                     g->index_k, 0, 128u * 4u)) ||
                 !ds41_rope(g->latent, 1, 512, il, rope_pos, false) ||
-                !ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
-                !ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
-                                     g->latent, 0, 512u * 4u)) return false;
+                (llms_kv_fp4() ? !ds4_gpu_llms_kv_fp4_pack(g->latent, 1, g->compressed[owner], n_comp - 1u) :   /* llms KV_FP4: mode 3 + the packed row in one kernel */
+                (!ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
+                !(llms_kv_half() ? (g_llms_kvh_copies++, ds4_gpu_llms_copy_f32_f16(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 2u, g->latent, 0, 512u)) :   /* llms KV_HALF */
+                  ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
+                                     g->latent, 0, 512u * 4u))))) return false;
         }
     }
     return true;
 }
 
+/* ASTRA_INDEX_ALL: ranking is unconsumed when the selected set is all rows. */
+static int g_llms_sp_active; /* tentative declaration; the existing owner is below */
+static uint64_t g_astra_index_all_calls, g_astra_block_all_writes, g_astra_block_all_filters;
+static void llms_astra_index_all_report(void) {
+    fprintf(stderr, "astra index all: %llu query-side indexer calls elided\n", (unsigned long long)g_astra_index_all_calls);
+    fprintf(stderr, "astra block all: %llu zero masks, %llu filters elided\n", (unsigned long long)g_astra_block_all_writes, (unsigned long long)g_astra_block_all_filters);
+}
+static int llms_astra_index_all_on(void) {
+    static int on=-1;
+    if(on<0) { const char *e=getenv("LLMS_DS4_ASTRA_INDEX_ALL"); on=(!e || !*e || *e=='0') ? 0 : *e=='2' ? 2 : 1;
+               if(on) atexit(llms_astra_index_all_report); }
+    return ds4_gpu_llms_alt_off("iall") ? 0 : on;
+}
+static bool llms_astra_index_identity(ds4_gpu_tensor *dst, uint32_t n) {
+    static ds4_gpu_tensor *seed; static int ready;
+    if(!seed) { seed=ds4_gpu_tensor_alloc_managed(DS4_N_INDEXER_TOP_K*sizeof(int32_t)); if(!seed) return false; }
+    if(!ready) {
+        int32_t ids[DS4_N_INDEXER_TOP_K]; for(uint32_t i=0;i<DS4_N_INDEXER_TOP_K;i++) ids[i]=(int32_t)i;
+        if(!ds4_gpu_tensor_write(seed,0,ids,sizeof(ids))) return false;
+        ready=1;
+    }
+    if(!ds4_gpu_tensor_copy(dst,0,seed,0,(uint64_t)n*sizeof(int32_t))) return false;
+    g_astra_index_all_calls++; return true;
+}
+
 static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    if (g_llms_sp_active && n_comp && n_comp <= 8u * 2048u && il >= 20u && ds41_index_source(il) && llms_astra_index_all_on()) {
+        if (il == 20u) {
+            if (!ds4_gpu_tensor_fill_f32(g->block_mask, 0.0f, (n_comp + 7u) / 8u)) return false;
+            g_astra_block_all_writes++;
+        } else g_astra_block_all_filters++;
+        return true;
+    }
     if (n_comp && ds41_index_source(il)) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
@@ -41501,27 +42215,65 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     return true;
 }
 
+/* llms TOPK_ROWS (apply_ds4_topk_rows.py): one top-512 call per group instead of one per row. 1 on, 2 canary */
+static int g_llms_tk_defer;   /* set by the pipeline's per-row loop: the row's top-k runs in the group call */
+static uint64_t g_llms_tk_calls;
+static void llms_tk_report(void) { fprintf(stderr, "llms topk rows: %llu group calls\n", (unsigned long long)g_llms_tk_calls); }
+static int llms_topk_rows(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_TOPK_ROWS"); on = e && *e && *e != '0' ? (!strcmp(e, "canary") ? 2 : 1) : 0;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: topk rows -- CANARY: the last row of each group left out\n" : "llms: topk rows (one top-512 call per group)\n"); atexit(llms_tk_report); } }
+    return on;
+}
 static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (g->pos + 1u) / ratio : 0;
     const uint32_t top = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+    if (g_llms_tk_defer && n_comp && ds41_index_source(il)) return ds41_attention_candidates(g, il);   /* llms TOPK_ROWS: selected by the group call */
     return ds41_attention_candidates(g, il) && (!n_comp || !ds41_index_source(il) ||
         ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
 }
 
+/* llms LLMS_DS4_IDX_ROWS (apply_ds4_idx_rows.py): the indexer's q_b and proj for a group's rows in one exact-rows dispatch each.
+ * g_llms_idx_rows_pre is 1 only inside the pipeline's per-row attention loop of an indexer layer whose projections ran. */
+static int g_llms_idx_rows_pre;
+static int g_llms_rope_pre, g_llms_idx_rope_pre;   /* llms ROWS_ROPE (apply_ds4_rows_rope.py): set only around the pipeline's per-row loop */
+static int g_llms_win_pre;   /* llms ROWS_WIN (apply_ds4_rows_win.py): the group's window rows are written; set only around the per-row loop */
+static uint64_t g_llms_win_calls;
+static void llms_win_report(void) { fprintf(stderr, "llms rows win: %llu group window writes\n", (unsigned long long)g_llms_win_calls); }
+static int llms_rows_win(void) {
+    static int on = -2;
+    if (on < -1) { const char *e = getenv("LLMS_DS4_ROWS_WIN"), *src = getenv("DS4_METAL_DSV4_MISC_SOURCE"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? -1 : 1;
+                   if (on && !(src && llms_srckey(src, "llms11") != NULL)) { llms_strict_after(fprintf(stderr, "llms: LLMS_DS4_ROWS_WIN ignored: DS4_METAL_DSV4_MISC_SOURCE does not name an *llms11* source\n"), LLMS_G_NAME); on = 0; }
+                   if (on) { fprintf(stderr, on < 0 ? "llms: rows win -- CANARY: each row's last four words left out\n" : "llms: rows win (the group's raw-window writes in one dispatch)\n"); atexit(llms_win_report); } }
+    return on;
+}
+static uint64_t g_llms_idx_rows_calls;
+static void llms_idx_rows_report(void) { fprintf(stderr, "llms idx rows: %llu group calls\n", (unsigned long long)g_llms_idx_rows_calls); }
+static int llms_idx_rows(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_IDX_ROWS"); on = e && *e && *e != '0' ? (!strcmp(e, "canary") ? 2 : 1) : 0;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: indexer projections per group -- CANARY: the last row of each group left out\n"
+                                                    : "llms: indexer projections per group (exact-rows dispatches)\n"); atexit(llms_idx_rows_report); } }
+    return on;
+}
+static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *weight, const ds4_gpu_tensor *in,
+                              uint32_t count, bool bf16);
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
                                             const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    if (g_llms_sp_active && n_comp && n_comp <= DS4_N_INDEXER_TOP_K && ds41_index_source(il) && !g_llms_tk_defer && llms_astra_index_all_on() == 1)
+        return llms_astra_index_identity(g->selected_comp, n_comp);
     if (n_comp && ds41_index_source(il)) {
-        if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
-            !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
-            !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
+        if ((!g_llms_idx_rows_pre && !ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true)) ||   /* llms IDX_ROWS: done for the group */
+            (!g_llms_idx_rope_pre && (!ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||   /* llms ROWS_ROPE */
+            !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0))) ||
+            (!g_llms_idx_rows_pre && !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) ||
 #ifdef __APPLE__
             !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
+                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, llms_idx_half() != 0)) return false;
 #else
             !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
@@ -41539,43 +42291,385 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l) {
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
-    return ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
-        ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
-        ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
-                         g->tp_rank * q_dim, q_dim) &&
-        ds41_matmul(g->kv, m, l->attn_kv, g->norm, true) &&
-        ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+    if (g->tp_world == 1 && llms_dual_run(g->qr, l->attn_q_a, g->kv, l->attn_kv, g->norm, m, 0))   /* llms Q4L_DUAL: q_a + kv (+ the attention split) */
+        return ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+            ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, g->tp_rank * q_dim, q_dim) &&
+            ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+    const int llms_ck = llms_conc_skip_mask();   /* llms CONC_SKIP */
+    if ((llms_ck & 1) && llms_conc_after_split()) ds4_gpu_llms_conc_skip(1);
+    bool ok = ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true);
+    ds4_gpu_llms_conc_skip(0);
+    if (llms_ck & 32) ds4_gpu_llms_conc_skip(1);   /* llms CONC_SKIP bit 32: the CANARY -- the q_a norm's barrier dropped (it reads q_a's output: a race) */
+    ok = ok && ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm);
+    ds4_gpu_llms_conc_skip(0);
+    ok = ok && ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
+                         g->tp_rank * q_dim, q_dim);
+    if (llms_ck & 2) ds4_gpu_llms_conc_skip(1);
+    ok = ok && ds41_matmul(g->kv, m, l->attn_kv, g->norm, true);
+    ds4_gpu_llms_conc_skip(0);
+    return ok && ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
 
+
+static void llms_stage(const ds41_gpu_graph *g, const char *name, uint32_t il) {
+    static long at = -2;
+    if (at == -2) { const char *e = getenv("LLMS_DS4_STAGE_SPLIT"); at = (e && *e) ? atol(e) : -1; }
+    if (at < 0 || (long)g->pos != at) return;
+    fprintf(stderr, "llms stage %s layer %u pos %u\n", name, il, g->pos);
+    (void)ds4_gpu_end_commands(); (void)ds4_gpu_begin_commands();
+}
+
+static int g_llms_rows_defer;
+static uint32_t g_llms_rows_n, g_llms_rows_ratio, g_llms_rows_heads, g_llms_rows_il;
+static uint64_t g_llms_rows_sinks;
+static ds4_gpu_tensor *g_llms_rows_t[5][128];   /* llms ROWS128 */   /* q, raw, comp, topk, heads */
+static uint32_t g_llms_rows_pos[128], g_llms_rows_ncomp[128];
+static uint32_t g_llms_rows_topk = 0xFFFFFFFFu;   /* llms ROWS_ATTN0: the flush's top_k (0 for the uncompressed layers) */
+static uint64_t g_llms_ra0_rows;
+static void llms_ra0_report(void) { fprintf(stderr, "llms rows attn0: %llu rows of the uncompressed layers through the rows attention\n", (unsigned long long)g_llms_ra0_rows); }
+static int llms_rows_attn0(void) {   /* llms ROWS_ATTN0 (apply_ds4_rows_attn0.py) */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ROWS_ATTN0"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: rows attn0 -- CANARY: the last raw row of every row left out\n" : "llms: rows attn0 (layers without compression through the rows attention)\n");
+                            ds4_gpu_llms_set_ra0_canary(on == 2); atexit(llms_ra0_report); } }
+    return on;
+}
+static uint64_t g_llms_tkpad_calls, g_llms_tkpad_padded;
+static void llms_tkpad_report(void) { fprintf(stderr, "llms topk pad: %llu group selections at unequal counts (%llu rows padded)\n", (unsigned long long)g_llms_tkpad_calls, (unsigned long long)g_llms_tkpad_padded); }
+static int llms_topk_pad(void) {   /* llms TOPK_PAD (apply_ds4_topk_pad.py) */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_TOPK_PAD"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: topk pad -- CANARY: +inf padding (padded slots get selected)\n" : "llms: topk pad (one top-k call per group at unequal compressed-row counts, -inf tails)\n");
+                            atexit(llms_tkpad_report); } }
+    return on;
+}
+static int llms_rows_attn_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_V41_ROWS_ATTN"); on = e && *e && *e != '0'; }
+    return on;
+}
+static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width, uint32_t il, uint32_t pos, bool inverse);
+/* llms LLMS_DS4_ROWS_ROPE (apply_ds4_rows_rope.py): group-wide rope / quantize; flags set only around the pipeline's per-row loop */
+static uint64_t g_llms_rows_rope_calls;
+static void llms_rows_rope_report(void) { fprintf(stderr, "llms rows rope: %llu dispatches\n", (unsigned long long)g_llms_rows_rope_calls); }
+static int llms_rows_rope(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ROWS_ROPE"); on = e && *e && *e != '0' ? (!strcmp(e, "canary") ? 2 : 1) : 0;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: rows rope -- CANARY: the last row's position shifted by one\n"
+                                                    : "llms: rows rope (one dispatch per group for rope, kv / index quantization, flush BF16 + inverse rope)\n");
+                            atexit(llms_rows_rope_report); } }
+    return on;
+}
+static uint32_t llms_rows_cap_c(void) {   /* llms ROWS128 part 2 (apply_rows128b.py): ds4.c's per-row caps; 128 with LLMS_DS4_ROWS128=1 */
+    static uint32_t c = 0; if (!c) { const char *e = getenv("LLMS_DS4_ROWS128"); c = e && *e && *e != '0' ? 128u : 64u; } return c;
+}
+static bool llms_rope_rows(ds4_gpu_tensor *const *x, const uint32_t *pos, uint32_t n, uint32_t width, uint32_t heads, uint32_t il,
+                           bool inverse, bool bf16_first) {
+    uint32_t p[128];   /* llms ROWS128 part 2: was 64 */
+    for (uint32_t r = 0; r < n && r < 128; r++) p[r] = pos[r] + (llms_rows_rope() == 2 && r + 1 == n ? 1u : 0u);   /* canary */
+    g_llms_rows_rope_calls++;
+    return ds4_gpu_llms_dsv41_rope_rows(x, p, n, width, heads, ds4_layer_compress_ratio(il) != 0, inverse, bf16_first) != 0;
+}
+static uint64_t g_llms_rows_flushes, g_llms_rows_rows;
+static void llms_rows_report(void) { fprintf(stderr, "llms rows attention: %llu flushes, %llu rows\n", (unsigned long long)g_llms_rows_flushes, (unsigned long long)g_llms_rows_rows); }
+
+static uint32_t g_llms_ced_end;                 /* the append's end position (exclusive), set by the session-sync loop */
+static int g_llms_ced_lmax = 39;                /* the last layer this batched step runs (39 = all) */
+static unsigned long long g_llms_ced_steps, g_llms_ced_enc_only, g_llms_ced_layers_skipped, g_llms_ced_rows;
+static uint32_t g_llms_ced_brs;                 /* bounded replay: the replay start s (decoder windows begin at s); 0 = off */
+
+
+
+
+static uint32_t g_llms_ced_brlen = 128;         /* replay length R (LLMS_DS4_CED_SP=br or br:R; DeepSeek uses 128) */
+static int llms_ced_sp(void) {   /* 1 = exact suffix; 2 = 'br': DeepSeek's decoder SWA bounded replay (last 128 rows, approximate) */
+    static int v = -1;
+
+
+
+
+    if (v < 0) { const char *e = getenv("LLMS_DS4_CED_SP"); v = !(e && *e && *e != '0') ? 0 : !strncmp(e, "br", 2) ? 2 : 1; if (v == 2 && e[2] == ':' && atoi(e + 3) >= 1) g_llms_ced_brlen = (uint32_t)atoi(e + 3);
+        if (v == 2) fprintf(stderr, "llms: ced sp BOUNDED REPLAY (decoder layers only for the append's last %u rows, decoder windows truncated to them; DeepSeek uses 128; APPROXIMATE)\n", g_llms_ced_brlen);
+        if (v) { fprintf(stderr, "llms: ced sp (short-prefill rows outside the decoder's exact dependency suffix skip decoder layers; exact)\n");
+                 atexit_b(^{ fprintf(stderr, "llms ced sp: %llu steps, %llu encoder-only, %llu row-layers skipped of %llu rows\n",
+                     g_llms_ced_steps, g_llms_ced_enc_only, g_llms_ced_layers_skipped, g_llms_ced_rows); }); } }
+    return v;
+}
+static bool llms_rows_flush(const ds4_model *m) {
+    const uint32_t n = g_llms_rows_n;
+    g_llms_rows_n = 0;
+    if (!n) return true;
+    if (!g_llms_rows_flushes++) atexit(llms_rows_report);   /* execution counter */
+    g_llms_rows_rows += n;
+    if (!ds4_gpu_llms_v41_rows_attention(m->map, m->size, g_llms_rows_sinks, n, g_llms_rows_t[0], g_llms_rows_t[1],
+            g_llms_rows_t[2], g_llms_rows_t[3], g_llms_rows_t[4], g_llms_rows_pos, g_llms_rows_ncomp,
+            g_llms_rows_topk == 0xFFFFFFFFu ? DS4_N_INDEXER_TOP_K : g_llms_rows_topk,   /* llms ROWS_ATTN0 */
+            g_llms_rows_ratio, g_llms_rows_heads, DS4_N_HEAD_DIM)) {
+        fprintf(stderr, "llms rows attention failed (layer %u, %u rows)\n", g_llms_rows_il, n);
+        return false;
+    }
+    if (llms_rows_rope())   /* llms ROWS_ROPE: BF16 pass + inverse rope of every row's heads in one dispatch */
+        return llms_rope_rows(g_llms_rows_t[4], g_llms_rows_pos, n, DS4_N_HEAD_DIM, g_llms_rows_heads, g_llms_rows_il, true, true);
+    for (uint32_t i = 0; i < n; i++)
+        if (!ds41_bf16(g_llms_rows_t[4][i], g_llms_rows_heads * DS4_N_HEAD_DIM) ||
+            !ds41_rope(g_llms_rows_t[4][i], g_llms_rows_heads, DS4_N_HEAD_DIM, g_llms_rows_il, g_llms_rows_pos[i], true)) return false;
+    return true;
+}
+
+static int llms_price_dup(int bit) {   /* llms LLMS_DS4_PRICE_DUP: a class computed twice (idempotent calls; outputs keep their bits) */
+    static int mask = -1;
+    if (mask < 0) { const char *e = getenv("LLMS_DS4_PRICE_DUP"); mask = (e && *e) ? atoi(e) : 0;
+                    if (mask) fprintf(stderr, "llms: PRICE_DUP mask %d -- these classes are computed twice (pricing instrument)\n", mask); }
+    static uint64_t asked, yes; static int reg; if (mask && !reg) { reg = 1; atexit_b(^{ fprintf(stderr, "llms pdup: %llu asks for the mask's classes, %llu duplicated\n", (unsigned long long)asked, (unsigned long long)yes); }); }
+    if (!(mask & bit)) return 0;
+    asked++; const int r = !ds4_gpu_llms_alt_off("pdup"); yes += (uint64_t)r;
+    return r;
+}
+static int llms_price_dup_bf16(void) {   /* llms LLMS_DS4_PRICE_DUP_BF16: extra small dispatches per row and layer */
+    static int k = -1;
+    if (k < 0) { const char *e = getenv("LLMS_DS4_PRICE_DUP_BF16"); k = (e && *e) ? atoi(e) : 0;
+                 if (k) fprintf(stderr, "llms: PRICE_DUP_BF16 %d extra BF16 roundings of the heads per row and layer (pricing instrument)\n", k); }
+    return k;
+}
+static bool llms_price_dup_bf16_run(ds4_gpu_tensor *x, uint32_t width) {   /* llms PRICE_DUP_BF16: k extra roundings before the row's own (idempotent) */
+    for (int i = 0, k = llms_price_dup_bf16(); i < k; i++) if (!ds41_bf16(x, width)) return false;
+    return true;
+}
+
+static int llms_qkv_rope(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_QKV_ROPE"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                  if (on) fprintf(stderr, on == 2 ? "llms: qkv rope -- CANARY: the kv FP8 pass skipped\n" : "llms: qkv rope (q / kv rope, kv FP8, window copy in one dispatch)\n"); }
+    return on;
+}
+static uint64_t g_llms_att_tail_calls;
+static int llms_att_tail(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ATT_TAIL"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: att tail -- CANARY: the heads' BF16 pass skipped\n" : "llms: att tail (the heads' BF16 pass + inverse rope in one dispatch)\n");
+                            atexit_b(^{ fprintf(stderr, "llms att tail: %llu fused tails\n", (unsigned long long)g_llms_att_tail_calls); }); } }
+    return on;
+}
+static bool llms_att_tail_run(ds4_gpu_tensor *heads_t, uint32_t heads, uint32_t il, uint32_t pos) {   /* bf16 + inverse rope, one dispatch */
+    ds4_gpu_tensor *x[1] = { heads_t }; const uint32_t p[1] = { pos };
+    g_llms_att_tail_calls++;
+    return ds4_gpu_llms_dsv41_rope_rows(x, p, 1, DS4_N_HEAD_DIM, heads, ds4_layer_compress_ratio(il) != 0, true, llms_att_tail() != 2) != 0;
+}
+static int g_llms_astra_wdefer;   /* llms ASTRA_TAIL: the per-row window writes deferred to astra_sp_attn_finish */
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
-                           const ds4_layer_weights *l, uint32_t il, bool projected) {
+                           const ds4_layer_weights *l, uint32_t il, bool projected, bool defer_indexed) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
     if (!projected && !ds41_attention_project(g, m, l)) return false;
-    if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
+    llms_stage(g, "proj", il);
+    if (!g_llms_rope_pre && !g_llms_win_pre && llms_qkv_rope() && !ds4_gpu_llms_alt_off("qkv")) {   /* llms ATT_FUSE: QKV_ROPE */
+        if (!ds4_gpu_llms_qkv_rope(g->q, g->kv, g->window[il], (uint64_t)(pos % 128u) * 512u * 4u, DS4_N_HEAD_DIM, heads, pos,
+                                   ratio != 0, llms_qkv_rope() == 2)) return false;
+    } else
+    if (((!g_llms_rope_pre && (!((llms_conc_skip_mask() & 4) ? (ds4_gpu_llms_conc_skip(1), ({ const bool r_ = ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false); ds4_gpu_llms_conc_skip(0); r_; }))
+                                                        : ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false)) ||   /* llms ROWS_ROPE; llms CONC_SKIP bit 4 */
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
-        !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                             g->kv, 0, 512u * 4u) ||
-        !ds41_attention_select(g, m, l, il)) return false;
+        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0))) ||
+        (!g_llms_win_pre && !g_llms_astra_wdefer && !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,   /* llms ROWS_WIN: done for the group; llms ASTRA_TAIL: deferred */
+                             g->kv, 0, 512u * 4u)))) return false;
+    static int llms_abl = -1; if (llms_abl < 0) { const char *e = getenv("LLMS_DS4_ABL"); llms_abl = e && *e ? atoi(e) : 0; if (llms_abl) fprintf(stderr, "llms: ABL mask %d -- families SKIPPED on ALT 'abl' on-steps (timing instrument, wrong outputs)\n", llms_abl); }   /* llms ABL */
+    const int llms_abl_now = llms_abl && !ds4_gpu_llms_alt_off("abl") ? llms_abl : 0;
+    if (!(llms_abl_now & 1) && !ds41_attention_select(g, m, l, il)) return false;
+    if (llms_price_dup(1024) && !ds41_attention_select_published(g, m, l, il)) return false;   /* llms PRICE_DUP */
+    if (n_comp && ds41_index_source(il)) {   /* llms PRICE_DUP 2048 / 4096 / 8192: the parts of the selection again */
+        if (llms_price_dup(2048) && (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
+            !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
+            !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
+            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true))) return false;
+        if (llms_price_dup(4096) && (!ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, llms_idx_half() != 0) ||
+            (il > 20 && !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio)))) return false;
+        if (llms_price_dup(8192) && !ds41_attention_pick(g, il)) return false;
+    }
+    llms_stage(g, "select", il);
+    /* Per-row Q/KV and selected_comp are stable; caller owns deferred heads. */
+    if (defer_indexed) return true;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+    const uint32_t n_raw = (g_llms_ced_brs && il >= 20u) ? (pos + 1u > g_llms_ced_brs ? (pos + 1u - g_llms_ced_brs < 128u ? pos + 1u - g_llms_ced_brs : 128u) : 1u)   /* llms CED_SP br */
+                                                          : (pos + 1u < 128u ? pos + 1u : 128u);
+    const bool llms_ra0 = ratio == 0 && llms_rows_attn0() && !ds4_gpu_llms_alt_off("ra0");   /* llms ROWS_ATTN0 */
+    if (g_llms_rows_defer && projected && (n_comp >= DS4_N_INDEXER_TOP_K || llms_ra0) && g_llms_rows_n < ({ static uint32_t llms_rc = 0; if (!llms_rc) { const char *e = getenv("LLMS_DS4_ROWS128"); llms_rc = e && *e && *e != '0' ? 128u : 64u; } llms_rc; })) {   /* llms ROWS_ATTN: defer; ROWS128 */
+        const uint32_t r = g_llms_rows_n++;
+        g_llms_rows_topk = llms_ra0 ? 0u : DS4_N_INDEXER_TOP_K; if (llms_ra0) g_llms_ra0_rows++;
+        g_llms_rows_t[0][r] = g->q; g_llms_rows_t[1][r] = g->window[il]; g_llms_rows_t[2][r] = g->compressed[owner];
+        g_llms_rows_t[3][r] = g->selected_comp; g_llms_rows_t[4][r] = g->heads;
+        g_llms_rows_pos[r] = pos; g_llms_rows_ncomp[r] = n_comp;
+        g_llms_rows_sinks = l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float);
+        g_llms_rows_ratio = ratio ? ratio : 1u; g_llms_rows_heads = heads; g_llms_rows_il = il;   /* llms ROWS_ATTN0: a dummy ratio 1 */
+        (void)n_raw;
+        return true;
+    }
+    {   /* llms LLMS_DS4_V41_IDX_DECODE: indexed mixed attention, as V4.1 prefill does for n_comp >= top_k */
+        static int llms_idx = -1;
+        if (llms_idx < 0) { const char *e = getenv("LLMS_DS4_V41_IDX_DECODE"); llms_idx = e && *e && *e != '0'; }
+        static int llms_m4i = -1; static uint64_t llms_m4i_n;
+        if (llms_m4i < 0) { const char *e = getenv("LLMS_DS4_MQA4_IDX"); llms_m4i = e && *e && *e != '0';
+                            if (llms_m4i) atexit_b(^{ fprintf(stderr, "llms mqa4 idx: %llu indexed decode attentions on MQA4\n", (unsigned long long)llms_m4i_n); }); }
+        const bool llms_m4i_now = llms_m4i && n_comp >= DS4_N_INDEXER_TOP_K && (llms_kv_half() || llms_kv_fp4()) && getenv("LLMS_DS4_MQA4") && !ds4_gpu_llms_alt_off("mq4i");
+        if (llms_m4i_now) llms_m4i_n++;
+        if (llms_idx && n_comp >= DS4_N_INDEXER_TOP_K && !llms_m4i_now) {
+            static uint64_t llms_idx_calls; if (!llms_idx_calls++) fprintf(stderr, "llms idx decode: first call at pos %u layer %u\n", pos, il);
+            const ds4_gpu_tensor *llms_cs_kv = NULL, *llms_cs_ids = g->selected_comp; uint32_t llms_cs_n = n_comp;
+            {
+                static int cs = -1; static uint64_t cs_calls, cs_rows_saved; static ds4_gpu_tensor *cs_buf, *cs_ids;
+                if (cs < 0) { const char *e = getenv("LLMS_DS4_C2H_SEL"); cs = e && *e && *e != '0';
+                              if (cs) atexit_b(^{ fprintf(stderr, "llms c2h sel: %llu indexed attentions on the selected-only pack, %llu row conversions avoided\n", (unsigned long long)cs_calls, (unsigned long long)cs_rows_saved); }); }
+                const uint32_t tk = DS4_N_INDEXER_TOP_K;
+                if (cs && ratio && llms_kv_fp4() && (pos + 1u) / ratio >= tk && n_comp >= tk && !ds4_gpu_llms_alt_off("c2hs")) {
+                    if (!cs_buf) { cs_buf = ds4_gpu_tensor_alloc((uint64_t)tk * 1024u); cs_ids = ds4_gpu_tensor_alloc((uint64_t)tk * 4u); if (!cs_buf || !cs_ids) return false; }
+                    const uint32_t vis = (pos + 1u) / ratio < n_comp ? (pos + 1u) / ratio : n_comp;
+                    if (!ds4_gpu_llms_fp4_pack_selected(cs_buf, cs_ids, g->compressed[owner], g->selected_comp, tk, vis)) return false;
+                    llms_cs_kv = cs_buf; llms_cs_ids = cs_ids; llms_cs_n = tk; cs_calls++; cs_rows_saved += n_comp - tk;
+                }
+            }
+            {
+                static int ck = -1; static uint64_t ck_calls, ck_words, ck_diff, ck_bad; static ds4_gpu_tensor *hA, *hB, *pk, *pi; static float *bA, *bB;
+                if (ck < 0) { const char *e = getenv("LLMS_DS4_C2H_SEL"); ck = e && !strcmp(e, "check");
+                              if (ck) atexit_b(^{ fprintf(stderr, "llms c2h check: %llu calls, %llu words compared, %llu differ, %llu calls with a difference\n", (unsigned long long)ck_calls, (unsigned long long)ck_words, (unsigned long long)ck_diff, (unsigned long long)ck_bad); }); }
+                const uint32_t tk = DS4_N_INDEXER_TOP_K;
+                if (ck && ratio && llms_kv_fp4() && (pos + 1u) / ratio >= tk && n_comp >= tk) {
+                    const uint64_t hw = (uint64_t)heads * DS4_N_HEAD_DIM;
+                    if (!hA) { hA = ds4_gpu_tensor_alloc(hw * 4u * 2u); hB = ds4_gpu_tensor_alloc(hw * 4u * 2u); pk = ds4_gpu_tensor_alloc((uint64_t)tk * 1024u); pi = ds4_gpu_tensor_alloc((uint64_t)tk * 4u);
+                               bA = malloc(hw * 4u * 2u); bB = malloc(hw * 4u * 2u); if (!hA || !hB || !pk || !pi || !bA || !bB) return false; }
+                    const uint32_t vis = (pos + 1u) / ratio < n_comp ? (pos + 1u) / ratio : n_comp;
+                    const uint64_t sink = l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float);
+                    if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(hA, m->map, m->size, sink, g->q, g->window[il], llms_comp_half(g, owner, n_comp),
+                            llms_kv_half() == 1 ? 1u : 0u, g->selected_comp, 1, pos, n_raw, 128, (pos + 1u - n_raw) % 128u, n_comp, tk, 128, ratio, heads, DS4_N_HEAD_DIM)) return false;
+                    if (!ds4_gpu_llms_fp4_pack_selected(pk, pi, g->compressed[owner], g->selected_comp, tk, vis)) return false;
+                    if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(hB, m->map, m->size, sink, g->q, g->window[il], pk,
+                            llms_kv_half() == 1 ? 1u : 0u, pi, 1, pos, n_raw, 128, (pos + 1u - n_raw) % 128u, tk, tk, 128, ratio, heads, DS4_N_HEAD_DIM)) return false;
+                    if (!ds4_gpu_end_commands()) return false;
+                    if (!ds4_gpu_tensor_read(hA, 0, bA, hw * 4u) || !ds4_gpu_tensor_read(hB, 0, bB, hw * 4u)) return false;
+                    uint64_t nd = 0; for (uint64_t i = 0; i < hw; i++) { uint32_t a, b; memcpy(&a, &bA[i], 4); memcpy(&b, &bB[i], 4); nd += a != b; }
+                    ck_calls++; ck_words += hw; ck_diff += nd; ck_bad += nd != 0;
+                    if (!ds4_gpu_begin_commands()) return false;
+                }
+            }
+            if (!llms_cs_kv) llms_cs_kv = llms_comp_half(g, owner, n_comp);
+            if ((!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->heads, m->map, m->size,
+                    l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
+                    g->q, g->window[il], llms_cs_kv, llms_kv_half() == 1 ? 1u : 0u, llms_cs_ids,   /* llms KV_HALF / KV_FP4; C2H_SEL */
+                    1, pos, n_raw, 128, (pos + 1u - n_raw) % 128u, llms_cs_n,
+                    DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM)) ||
+                (llms_price_dup(4) && !ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->heads, m->map, m->size,   /* llms PRICE_DUP: the kernel again */
+                    l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
+                    g->q, g->window[il], llms_comp_half(g, owner, n_comp), llms_kv_half() == 1 ? 1u : 0u, g->selected_comp,   /* llms KV_HALF / KV_FP4 */
+                    1, pos, n_raw, 128, (pos + 1u - n_raw) % 128u, n_comp,
+                    DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM)) ||
+                !llms_price_dup_bf16_run(g->heads, heads * DS4_N_HEAD_DIM) ||
+                ((!ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
+                !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)))) return false;
+            goto llms_attended;
+        }
+    }
+    {
+        static int mq4 = -1; if (mq4 < 0) { const char *e = getenv("LLMS_DS4_MQA4"); mq4 = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                                            if (mq4) fprintf(stderr, mq4 == 2 ? "llms: mqa4 -- CANARY: the last selected row dropped\n" : "llms: mqa4 (decode attention reads the compressed half rows by index)\n"); }
+        if (llms_abl_now & 2) goto llms_attended;   /* llms ABL bit 2: no attention core */
+        if (mq4 && n_comp && (llms_kv_half() || llms_kv_fp4()) && !ds4_gpu_llms_alt_off("mqa4")) {
+            const ds4_gpu_tensor *ch = llms_comp_half(g, owner, n_comp);
+            if (ch && ds4_gpu_llms_mqa4_heads(g->heads, m->map, m->size, l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
+                    g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u, ch, g->selected_comp, attended, heads, DS4_N_HEAD_DIM, mq4 == 2)) {
+                if (((llms_att_tail() && !ds4_gpu_llms_alt_off("att")) ? !llms_att_tail_run(g->heads, heads, il, pos) :
+                    (!ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) || !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)))) return false;
+                goto llms_attended;
+            }
+        }
+    }
+    /* llms KV_HALF: the gather reads half rows through get_rows_f16 (part 3) */   /* llms KV_HALF */
+    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, llms_comp_half(g, owner, n_comp),   /* llms KV_FP4 */
                                          g->selected_comp, n_comp, attended)) return false;
-    const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+    if ((!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+            heads, DS4_N_HEAD_DIM)) ||
+        (((llms_att_tail() && !ds4_gpu_llms_alt_off("att")) ? !llms_att_tail_run(g->heads, heads, il, pos) :   /* llms ATT_FUSE: ATT_TAIL */
+        (!ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
+        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true))))) return false;
+llms_attended:
+    llms_stage(g, "attend", il);
     if (projected) return true;
-    return ds41_attention_output(g, m, l) &&
+    const bool llms_fold = llms_bf16_fold(g);   /* llms BF16_FOLD: decided once for both sites */
+    const bool llms_ok = ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-           ds41_bf16(g->block, DS4_N_EMBD);
+           (llms_fold || ds41_bf16(g->block, DS4_N_EMBD));   /* llms HC_POST2: the fused post rounds the block */
+    llms_stage(g, "out", il);
+    return llms_ok;
+}
+
+
+
+static FILE *g_llms_la_log = NULL;
+static int g_llms_la_state = 0;          /* 0 unchecked, 1 on, -1 off */
+static int g_llms_la_pending = 0;
+static ds4_gpu_tensor *g_llms_la_logits, *g_llms_la_probs, *g_llms_la_weights, *g_llms_la_sel;
+static int g_llms_slot_m = 0, g_llms_slot_step = 1;   /* llms LLMS_DS4_SLOT_PREFETCH=m and its per-step CTL state */
+static int g_llms_ed_la_m = 0;
+static int g_llms_ed_la_cpu = -1;   /* llms ED_LA6: the prediction on the ED server's CPU */
+void ds4_gpu_llms_ela_cpu_note(uint32_t layer, const float *w_next, const ds4_gpu_tensor *norm, uint32_t n_embd);
+void ds4_gpu_llms_ela_note(uint32_t layer, const void *map, uint64_t size, uint32_t n_total, uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+                           uint64_t gate_bytes, uint64_t down_bytes, const ds4_gpu_tensor *sel, const ds4_gpu_tensor *probs, const float *bias, int m);
+static bool llms_la_on(void) {
+    if (g_llms_la_state == 0) {
+        const char *p = getenv("LLMS_DS4_LOOKAHEAD_LOG");
+        { const char *sp = getenv("LLMS_DS4_SLOT_PREFETCH"); g_llms_slot_m = sp ? atoi(sp) : 0; if (g_llms_slot_m > 6) g_llms_slot_m = 6; }
+        { const char *ea = getenv("LLMS_DS4_ED_LA"); g_llms_ed_la_m = ea ? atoi(ea) : 0; if (g_llms_ed_la_m < 0 || g_llms_ed_la_m > 6) g_llms_ed_la_m = 0; }   /* llms ED_LA */
+        g_llms_la_state = -1;
+        if ((p && *p) || g_llms_slot_m > 0 || g_llms_ed_la_m > 0) {   /* llms ED_LA */
+            g_llms_la_log = (p && *p) ? fopen(p, "w") : NULL;
+            g_llms_la_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+            g_llms_la_probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+            g_llms_la_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+            g_llms_la_sel = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+            if ((g_llms_la_log || g_llms_slot_m > 0 || g_llms_ed_la_m > 0) && g_llms_la_logits && g_llms_la_probs && g_llms_la_weights && g_llms_la_sel) {
+                g_llms_la_state = 1;
+                if (g_llms_la_log) fprintf(stderr, "llms: router-lookahead log -> %s\n", p);
+            }
+        }
+    }
+    return g_llms_la_state == 1;
+}
+
+int ds4_gpu_llms_set_swiglu_round(int on);   /* llms SWIGLU_BF16 (apply_swiglu_bf16.py) */
+static bool llms_swiglu_round_run(ds4_gpu_tensor *mid, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up) {   /* SwiGLU, then BF16 rounding: fused when on */
+    static int on = -1; if (on < 0) { const char *e = getenv("LLMS_DS4_SWIGLU_BF16"); on = e && *e && *e != '0'; if (on) fprintf(stderr, "llms: swiglu bf16 (the shared expert's SwiGLU rounds to BF16 in its store)\n"); }
+    if (on && ds4_gpu_llms_set_swiglu_round(1)) {
+        const bool ok = ds4_gpu_swiglu_tensor(mid, gate, up, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+        ds4_gpu_llms_set_swiglu_round(0); return ok;
+    }
+    ds4_gpu_llms_set_swiglu_round(0);
+    return ds4_gpu_swiglu_tensor(mid, gate, up, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) && ds41_bf16(mid, DS4_N_FF_EXP);
+}
+static bool ds41_shared_encode(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l) {
+    if (g->tp_world == 1 && llms_dual_run(g->shared_gate, l->ffn_gate_shexp, g->shared_up, l->ffn_up_shexp, g->norm, m, 1))   /* llms Q4L_DUAL: gate + up (+ the FFN split) */
+        return llms_swiglu_round_run(g->shared_mid, g->shared_gate, g->shared_up) && ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);   /* llms SWIGLU_BF16 */
+    if (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true)) return false;
+    if (llms_conc_skip_mask() & 16) ds4_gpu_llms_conc_skip(1);   /* llms CONC_SKIP bit 16 */
+    const bool llms_up = ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true);
+    ds4_gpu_llms_conc_skip(0);
+    return llms_up &&
+        llms_swiglu_round_run(g->shared_mid, g->shared_gate, g->shared_up) &&   /* llms SWIGLU_BF16 */
+        ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
+}
+/* llms LLMS_DS4_SHARED_AFTER_SYNC state: one layer at a time (decode is single-threaded per graph) */
+static struct { ds41_gpu_graph *g; const ds4_model *m; const ds4_layer_weights *l; int done, ok; } g_llms_sas;
+static unsigned long g_llms_sas_fallbacks, g_llms_sas_hooks;
+static void llms_sas_cb(void *ud) {
+    (void)ud; g_llms_sas.done = 1; g_llms_sas_hooks++;
+    g_llms_sas.ok = ds41_shared_encode(g_llms_sas.g, g_llms_sas.m, g_llms_sas.l);
+}
+static void llms_sas_report(void) {
+    if (g_llms_sas_hooks || g_llms_sas_fallbacks)
+        fprintf(stderr, "llms: SHARED_AFTER_SYNC hooks %lu fallbacks %lu\n", g_llms_sas_hooks, g_llms_sas_fallbacks);
 }
 
 static bool ds41_shared_balance_enabled(void) {
@@ -41606,11 +42700,66 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
-    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
+    if (g->streaming) ds4_gpu_llms_set_route_layer((int)il);   /* llms CACHE_ROUTE (one-shot) */
+    if ((llms_conc_skip_mask() & 8) && llms_conc_after_split()) ds4_gpu_llms_conc_skip(1);   /* llms CONC_SKIP bit 8 */
+    const bool llms_rmv = ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false);
+    ds4_gpu_llms_conc_skip(0);
+    if (!llms_rmv ||
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    llms_stage(g, "router", il);
+    {   /* llms LLMS_DS4_ROUTE_DUMP */
+        static int rd_state = -1; static FILE *rd_f, *rd_b; static unsigned char rd_seen[64];
+        if (rd_state < 0) {
+            const char *p = getenv("LLMS_DS4_ROUTE_DUMP"); rd_state = 0;
+            if (p && *p) { char pb[1100]; snprintf(pb, sizeof pb, "%s.bias", p); rd_f = fopen(p, "wb"); rd_b = fopen(pb, "wb"); rd_state = rd_f && rd_b; }
+        }
+        if (rd_state == 1 && DS4_N_EXPERT <= 512) {
+            float pr[512];
+            if (!ds4_gpu_tensor_read(g->route_probs, 0, pr, (uint64_t)DS4_N_EXPERT * sizeof(float))) return false;
+            const int32_t hdr[2] = {(int32_t)g->pos, (int32_t)il};
+            fwrite(hdr, sizeof hdr, 1, rd_f); fwrite(pr, sizeof(float), DS4_N_EXPERT, rd_f);
+            if (il < 64 && !rd_seen[il]) {
+                rd_seen[il] = 1;
+                const int32_t l32 = (int32_t)il;
+                fwrite(&l32, sizeof l32, 1, rd_b); fwrite(tensor_data(m, bias), sizeof(float), DS4_N_EXPERT, rd_b); fflush(rd_b);
+            }
+            if (il + 1u == DS4_N_LAYER) fflush(rd_f);
+        }
+    }
+    /* llms LLMS_DS4_LOOKAHEAD_LOG: layer il+1's router on layer il's FFN input, into separate tensors */
+    g_llms_la_pending = 0;
+    if (llms_la_on() && il + 1u < DS4_N_LAYER && !ds41_image_at(g, g->pos) &&
+        !(g_llms_ed_la_m > 0 && ds4_gpu_llms_alt_off("elc"))) {   /* llms ED_LA5: ALT 'elc' */
+        const ds4_layer_weights *ln = l + 1;
+        if (g_llms_ed_la_cpu < 0) { const char *e = getenv("LLMS_DS4_ED_LA_CPU"); g_llms_ed_la_cpu = e && *e && *e != '0'; }   /* llms ED_LA6 */
+        if (g_llms_ed_la_m > 0 && g_llms_ed_la_cpu && ln->ffn_gate_inp && ln->ffn_gate_inp->type == DS4_TENSOR_F32)
+            ds4_gpu_llms_ela_cpu_note(il + 1u, (const float *)tensor_data(m, ln->ffn_gate_inp), g->norm, DS4_N_EMBD);
+        if (ln->ffn_gate_inp && ln->ffn_exp_probs_b && g_llms_ed_la_m > 0 && g_llms_ed_la_cpu && ln->ffn_gate_inp->type == DS4_TENSOR_F32) {
+            uint64_t egr = 0, edr = 0;   /* llms ED_LA6: no GPU look-ahead; the table and bias only */
+            if (tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &egr) && tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &edr))
+                ds4_gpu_llms_ela_note(il + 1u, m->map, m->size, DS4_N_EXPERT, ln->ffn_gate_exps->abs_offset, ln->ffn_up_exps->abs_offset,
+                    ln->ffn_down_exps->abs_offset, egr * DS4_N_FF_EXP, edr * DS4_N_EMBD, g_llms_la_sel, g_llms_la_probs,
+                    (const float *)tensor_data(m, ln->ffn_exp_probs_b), g_llms_ed_la_m);
+        } else
+        if (ln->ffn_gate_inp && ln->ffn_exp_probs_b) {
+            if (!ds41_matmul(g_llms_la_logits, m, ln->ffn_gate_inp, g->norm, false) ||
+                !ds4_gpu_router_select_tensor(g_llms_la_sel, g_llms_la_weights, g_llms_la_probs,
+                    m->map, m->size, ln->ffn_exp_probs_b->abs_offset, 0, 0, token,
+                    DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+                    g_llms_la_logits)) return false;
+            g_llms_la_pending = 1;
+            if (g_llms_ed_la_m > 0) {   /* llms ED_LA: the next layer's table and bias for the ED server's prefetch */
+                uint64_t egr = 0, edr = 0;
+                if (tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &egr) && tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &edr))
+                    ds4_gpu_llms_ela_note(il + 1u, m->map, m->size, DS4_N_EXPERT, ln->ffn_gate_exps->abs_offset, ln->ffn_up_exps->abs_offset,
+                        ln->ffn_down_exps->abs_offset, egr * DS4_N_FF_EXP, edr * DS4_N_EMBD, g_llms_la_sel, g_llms_la_probs,
+                        (const float *)tensor_data(m, ln->ffn_exp_probs_b), g_llms_ed_la_m);
+            }
+        }
+    }
 #ifdef DS4_ROCM_BUILD
     if (g->streaming) {
         const ds4_gpu_stream_expert_table table = {
@@ -41647,13 +42796,14 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         if (shared_queued && balance_shared) shared_here = true;
     }
 #endif
-    if (shared_here && !shared_queued &&
-        (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
-        !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
-        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+    static int llms_sas_env = -1;   /* llms LLMS_DS4_SHARED_AFTER_SYNC */
+    if (llms_sas_env < 0) { llms_sas_env = getenv("LLMS_DS4_SHARED_AFTER_SYNC") != NULL; if (llms_sas_env) atexit(llms_sas_report); }
+    const bool llms_sas = llms_sas_env && shared_here && !shared_queued && g->streaming && !ds4_gpu_llms_alt_off("sas");   /* llms ALT1: 'sas' */
+    if (llms_sas) {
+        g_llms_sas.g = g; g_llms_sas.m = m; g_llms_sas.l = l; g_llms_sas.done = 0; g_llms_sas.ok = 1;
+        ds4_gpu_llms_set_after_selected(llms_sas_cb, NULL);
+    } else if (shared_here && !shared_queued && !ds41_shared_encode(g, m, l)) return false;
+    if (!llms_sas) llms_stage(g, "shared", il);
     bool routed_ok;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
@@ -41666,6 +42816,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT / 2u, DS4_SWIGLU_CLAMP_EXP, g->norm, il, 1, NULL);
     } else
 #endif
+    ds4_gpu_llms_set_route_probs(g->route_probs);   /* llms MISS_SKIP_SUB */
+    ds4_gpu_llms_set_route_bias((const float *)tensor_data(m, bias));   /* llms ONE_RPOL: the selection bias this layer used */
     routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
@@ -41676,31 +42828,136 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
+    if (llms_sas) {
+        ds4_gpu_llms_set_after_selected(NULL, NULL);
+        if (!g_llms_sas.done) { g_llms_sas.done = 1; g_llms_sas.ok = ds41_shared_encode(g, m, l); g_llms_sas_fallbacks++; }
+        if (!g_llms_sas.ok) return false;
+    }
     if (!routed_ok) return false;
+    if (g_llms_slot_m > 0 && g_llms_slot_step && g_llms_la_pending && g->streaming && il + 1u < DS4_N_LAYER) {   /* llms SLOT_PREFETCH */
+        static float spr[DS4_MAX_EXPERT];
+        const ds4_layer_weights *ln = l + 1;
+        uint64_t sgr = 0, sdr = 0;
+        if (ds4_gpu_tensor_read(g_llms_la_probs, 0, spr, (uint64_t)DS4_N_EXPERT * sizeof(float)) &&
+            tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &sgr) && tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &sdr)) {
+            int32_t sid[6]; uint32_t sn = 0;
+            for (int r = 0; r < g_llms_slot_m; r++) {
+                int best = -1;
+                for (int e = 0; e < (int)DS4_N_EXPERT; e++) {
+                    bool used = false;
+                    for (uint32_t q = 0; q < sn; q++) if (sid[q] == e) used = true;
+                    if (!used && (best < 0 || spr[e] > spr[best])) best = e;
+                }
+                if (best >= 0) sid[sn++] = best;
+            }
+            if (sn && !ds4_gpu_llms_slot_prefetch(m->map, m->size, il + 1u, DS4_N_EXPERT, ln->ffn_gate_exps->abs_offset,
+                    ln->ffn_up_exps->abs_offset, ln->ffn_down_exps->abs_offset, sgr * DS4_N_FF_EXP, sdr * DS4_N_EMBD, sid, sn)) return false;
+        }
+    }
     /* The balanced path writes zero on the non-owning rank. Keep the shared
      * expert's BF16 boundary, then include it once in the F32 rank reduction. */
     if (shared_owner && shared_here &&
         !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)) return false;
+    {   /* llms DUMP_MID (apply_dump_mid.py): the routed experts' x, g, u, h, y at positions P0..P1-1 */
+        static int dm = -1; static FILE *dmf; static long dm0, dm1; static float *dmb;
+        if (dm < 0) { const char *p = getenv("LLMS_DS4_DUMP_MID"), *r = getenv("LLMS_DS4_DUMP_MID_POS"); dm = 0;
+                      if (p && *p && r && sscanf(r, "%ld:%ld", &dm0, &dm1) == 2) { dmf = fopen(p, "wb"); dm = dmf != NULL;
+                          if (dm) fprintf(stderr, "llms: dump mid (routed x / g / u / h / y at positions %ld..%ld)\n", dm0, dm1 - 1); } }
+        if (dm == 1 && (long)g->pos >= dm0 && (long)g->pos < dm1 && !ds41_image_at(g, g->pos) && !shared_owner) {
+            const uint64_t nf = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP, nt = DS4_N_EXPERT_USED + 2u * DS4_N_EMBD + 3u * nf;
+            if (!dmb) dmb = malloc((size_t)nt * sizeof(float));
+            int32_t hdr[2 + 16] = {(int32_t)g->pos, (int32_t)il};
+            if (dmb && DS4_N_EXPERT_USED <= 16 && ds4_gpu_end_commands()) {
+                float *wp = dmb, *xp = wp + DS4_N_EXPERT_USED, *gp = xp + DS4_N_EMBD, *up = gp + nf, *hp = up + nf, *yp = hp + nf;
+                const bool ok2 = ds4_gpu_tensor_read(g->selected, 0, hdr + 2, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) &&
+                    ds4_gpu_tensor_read(g->route_weights, 0, wp, (uint64_t)DS4_N_EXPERT_USED * sizeof(float)) &&
+                    ds4_gpu_tensor_read(g->norm, 0, xp, (uint64_t)DS4_N_EMBD * sizeof(float)) &&
+                    ds4_gpu_tensor_read(g->gate, 0, gp, nf * sizeof(float)) && ds4_gpu_tensor_read(g->up, 0, up, nf * sizeof(float)) &&
+                    ds4_gpu_tensor_read(g->mid, 0, hp, nf * sizeof(float)) && ds4_gpu_tensor_read(routed, 0, yp, (uint64_t)DS4_N_EMBD * sizeof(float));
+                static int dml = -1; if (dml < 0) dml = getenv("LLMS_DS4_DUMP_MID_LIGHT") != NULL;   /* llms DUMP_MID_LIGHT (apply_dump_h.py) */
+                if (ok2 && dml) { static __fp16 hh[16 * 4096]; for (uint64_t i = 0; i < nf && i < 16u * 4096u; i++) hh[i] = (__fp16)hp[i];
+                                  fwrite(hdr, sizeof(int32_t), 2u + DS4_N_EXPERT_USED, dmf); fwrite(wp, sizeof(float), DS4_N_EXPERT_USED, dmf); fwrite(hh, 2, (size_t)nf, dmf); }
+                else
+                if (ok2) { fwrite(hdr, sizeof(int32_t), 2u + DS4_N_EXPERT_USED, dmf); fwrite(dmb, sizeof(float), (size_t)nt, dmf); fflush(dmf); }
+            }
+            if (!ds4_gpu_begin_commands()) return false;
+        }
+    }
     return true;
 }
 
-static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
+
+int ds4_gpu_llms_lag_cfg(uint32_t n_embd, uint32_t n_ff, uint32_t n_used, int *lo, int *hi, int *d);
+uint64_t ds4_gpu_llms_lag_step_begin(void);
+void ds4_gpu_llms_lag_step_end(void);
+void ds4_gpu_llms_lag_arm(uint32_t layer, uint64_t step);
+void ds4_gpu_llms_lag_arm_src(int src);
+int ds4_gpu_llms_lag_wait(uint32_t L, uint64_t step);
+void ds4_gpu_llms_lag_nowait(int on);
+ds4_gpu_tensor *ds4_gpu_llms_lag_tensor(int which, uint32_t layer);
+int ds4_gpu_llms_lag_add(ds4_gpu_tensor *block, uint32_t src, uint32_t rows, uint32_t n_embd);
+static int g_llms_lag_on = -1, g_llms_lag_lo, g_llms_lag_hi, g_llms_lag_d; static uint64_t g_llms_lag_cur;
+static int g_llms_lag_src_armed = -1;   /* v3: the source whose lag call this layer encodes (-1: none) */
+static int llms_lag_on(void) { if (g_llms_lag_on < 0) g_llms_lag_on = ds4_gpu_llms_lag_cfg(DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT_USED, &g_llms_lag_lo, &g_llms_lag_hi, &g_llms_lag_d); return g_llms_lag_on; }
+static void llms_lag_step_begin(uint32_t rows) { g_llms_lag_cur = (rows <= 4u && llms_lag_on()) ? ds4_gpu_llms_lag_step_begin() : 0; }
+static void llms_lag_step_end(void) { if (g_llms_lag_cur) ds4_gpu_llms_lag_step_end(); g_llms_lag_cur = 0; }
+static void llms_lag_arm(uint32_t il) {   /* v3: wait for layer il - d's decision; arm this request with that source only if it lagged */
+    g_llms_lag_src_armed = -1;
+    if (!g_llms_lag_cur) return;
+    const int src = (int)il - g_llms_lag_d;
+    int need = 0;
+    if (src >= g_llms_lag_lo && src <= g_llms_lag_hi && !ds4_gpu_llms_alt_off("lagenc")) need = ds4_gpu_llms_lag_wait((uint32_t)src, g_llms_lag_cur) > 0;
+    ds4_gpu_llms_lag_arm(il, g_llms_lag_cur);
+    if (need) { ds4_gpu_llms_lag_arm_src(src); g_llms_lag_src_armed = src; }
+}
+static void llms_lag_disarm(void) { if (g_llms_lag_cur) ds4_gpu_llms_lag_arm(0u, 0); }
+static bool llms_lag_save(const ds4_gpu_tensor *x, uint32_t il, uint32_t rows) {
+    if (!g_llms_lag_cur || (int)il < g_llms_lag_lo || (int)il > g_llms_lag_hi || rows > 4u) return true;
+    if (ds4_gpu_llms_alt_off("lagenc")) return true;   /* LAG v2: ALT 'lagenc' -- with mode 4, the per-step price of the encoded lag calls */
+    ds4_gpu_tensor *t = ds4_gpu_llms_lag_tensor(2, il);
+    return t && ds4_gpu_tensor_copy(t, 0, x, 0, (uint64_t)rows * DS4_N_EMBD * sizeof(float)) != 0;
+}
+static bool llms_lag_late(const ds4_model *m, const ds4_layer_weights *l, uint32_t il, uint32_t rows, ds4_gpu_tensor *block) {
+    if (!g_llms_lag_cur || rows > 4u || (int)il < g_llms_lag_d) return true;
+    const int src = (int)il - g_llms_lag_d;
+    if (src < g_llms_lag_lo || src > g_llms_lag_hi) return true;
+    if (src != g_llms_lag_src_armed) return true;   /* v3: encoded only when the source lagged (ALT 'lagenc' off never arms one) */
+    const ds4_layer_weights *ls = l - g_llms_lag_d;
+    const uint64_t gate_row = routed_expert_row_bytes(ls->ffn_gate_exps), down_row = routed_expert_row_bytes(ls->ffn_down_exps);
+    bool mf = false;
+    if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) return false;   /* the one-token ED cadence may have flushed the batch */
+    ds4_gpu_llms_lag_nowait(1);
+    const int ok = ds4_gpu_routed_moe_batch_tensor(ds4_gpu_llms_lag_tensor(3, 0), ds4_gpu_llms_lag_tensor(4, 0), ds4_gpu_llms_lag_tensor(5, 0), ds4_gpu_llms_lag_tensor(6, 0),
+        ds4_gpu_llms_lag_tensor(7, 0), m->map, m->size, ls->ffn_gate_exps->abs_offset, ls->ffn_up_exps->abs_offset, ls->ffn_down_exps->abs_offset,
+        ls->ffn_gate_exps->type, ls->ffn_down_exps->type, gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+        DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, ds4_gpu_llms_lag_tensor(0, (uint32_t)src), ds4_gpu_llms_lag_tensor(1, (uint32_t)src),
+        DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, ds4_gpu_llms_lag_tensor(2, (uint32_t)src), (uint32_t)src, rows, &mf, false);
+    ds4_gpu_llms_lag_nowait(0);
+    if (!ok) { fprintf(stderr, "llms lag: the lag call failed (layer %u, source %d, %u rows)\n", il, src, rows); return false; }
+    return ds4_gpu_llms_lag_add(block, (uint32_t)src, rows, DS4_N_EMBD) != 0;
+}
+static bool ds41_moe_finish_lag(ds41_gpu_graph *g, uint32_t il, const ds4_model *lm, const ds4_layer_weights *ll) {   /* llms LAG: lm / ll name the layer for the lag add */
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
+        (!lm || llms_lag_late(lm, ll, il, 1u, g->block)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
 }
+static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) { return ds41_moe_finish_lag(g, il, NULL, NULL); }
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
-    return ds41_moe_partial(g, m, l, il, token) && ds41_moe_finish(g, il);
+    llms_lag_arm(il);   /* llms LAG */
+    const bool ok = ds41_moe_partial(g, m, l, il, token);
+    llms_lag_disarm();
+    return ok && llms_lag_save(g->norm, il, 1u) && ds41_moe_finish_lag(g, il, m, l);
 }
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
-    if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
+    if (!g->valid || !logits || (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands())) return false;   /* llms BOUNDARY: an open batch (HEAD_MERGE) takes the head */
     bool ok = ds41_hc_sum(g->x, g->residual, g->pre, false) &&
               ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
@@ -41710,6 +42967,125 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
 }
 
+
+static FILE *g_llms_ps_file; static int g_llms_ps_state = -1; static float *g_llms_ps_logits;
+static bool llms_ps_on(void) {
+    if (g_llms_ps_state < 0) {
+        const char *p = getenv("LLMS_DS4_PREFILL_SCORE");
+        g_llms_ps_state = 0;
+        if (p && *p) { g_llms_ps_file = fopen(p, "w"); g_llms_ps_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+            g_llms_ps_state = g_llms_ps_file && g_llms_ps_logits; }
+    }
+    return g_llms_ps_state == 1;
+}
+static bool llms_ps_score_row(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                              ds4_gpu_tensor *residual, ds4_gpu_tensor *pre, uint32_t pos, int target) {
+    if (!ds4_gpu_begin_commands()) return false;
+    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, residual, pre, DS4_N_EMBD, DS4_N_HC) &&
+              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+              ds41_output_projection(g, g->logits, m, w, g->norm, 1);
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (!ok || !ds4_gpu_tensor_read(g->logits, 0, g_llms_ps_logits, (uint64_t)DS4_N_VOCAB * sizeof(float))) return false;
+    float mx = g_llms_ps_logits[0]; int am = 0;
+    for (int i = 1; i < DS4_N_VOCAB; i++) if (g_llms_ps_logits[i] > mx) { mx = g_llms_ps_logits[i]; am = i; }
+    double s = 0.0;
+    for (int i = 0; i < DS4_N_VOCAB; i++) s += exp((double)g_llms_ps_logits[i] - mx);
+    fprintf(g_llms_ps_file, "%u %d %.9f %d\n", pos, target, (double)g_llms_ps_logits[target] - mx - log(s), am);
+    return true;
+}
+
+
+static long g_llms_dp = -2; static FILE *g_llms_df;
+static long llms_dump_pos(void) {
+    if (g_llms_dp == -2) {
+        const char *p = getenv("LLMS_DS4_DUMP_POS"), *f = getenv("LLMS_DS4_DUMP_PATH");
+        g_llms_dp = -1;
+        if (p && *p && f && *f) { g_llms_df = fopen(f, "wb"); if (g_llms_df) g_llms_dp = strtol(p, NULL, 10); }
+    }
+    return g_llms_dp;
+}
+static FILE *g_llms_dof; static int g_llms_dof_init;
+static void llms_dump_ops(uint32_t il, ds4_gpu_tensor *qr, ds4_gpu_tensor *q, ds4_gpu_tensor *kv, ds4_gpu_tensor *heads,
+                          ds4_gpu_tensor *low, ds4_gpu_tensor *x, ds4_gpu_tensor *norm) {
+    if (!g_llms_dof_init) { const char *p = getenv("LLMS_DS4_DUMP_OPS_PATH"); g_llms_dof = (p && *p) ? fopen(p, "wb") : NULL; g_llms_dof_init = 1; }
+    if (!g_llms_dof) return;
+    const uint32_t n[7] = {DS4_N_LORA_Q, DS4_N_HEAD * DS4_N_HEAD_DIM, DS4_N_HEAD_DIM, DS4_N_HEAD * DS4_N_HEAD_DIM,
+                           DS4_N_OUT_GROUP * DS4_N_LORA_O, DS4_N_EMBD, DS4_N_EMBD};
+    ds4_gpu_tensor *ts[7] = {qr, q, kv, heads, low, x, norm};
+    float hdr[8] = {(float)il}; for (int i = 0; i < 7; i++) hdr[i + 1] = (float)n[i];
+    fwrite(hdr, 4, 8, g_llms_dof);
+    static float *buf = NULL; if (!buf) buf = malloc((size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float) + 64);
+    for (int i = 0; i < 7; i++) {
+        memset(buf, 0, (size_t)n[i] * 4u);
+        if (ts[i]) ds4_gpu_tensor_read(ts[i], 0, buf, (uint64_t)n[i] * 4u);
+        fwrite(buf, 4, n[i], g_llms_dof);
+    }
+    fflush(g_llms_dof);
+}
+
+static FILE *g_llms_dif; static int g_llms_dif_init;
+static void llms_dump_in(uint32_t il, ds4_gpu_tensor *residual, ds4_gpu_tensor *mix, ds4_gpu_tensor *split, ds4_gpu_tensor *pre,
+                         ds4_gpu_tensor *x, ds4_gpu_tensor *norm) {
+    if (!g_llms_dif_init) { const char *p = getenv("LLMS_DS4_DUMP_IN_PATH"); g_llms_dif = (p && *p) ? fopen(p, "wb") : NULL; g_llms_dif_init = 1; }
+    if (!g_llms_dif) return;
+    const uint32_t n[6] = {DS4_N_HC * DS4_N_EMBD, 24, 24, DS4_N_HC, DS4_N_EMBD, DS4_N_EMBD};
+    ds4_gpu_tensor *ts[6] = {residual, mix, split, pre, x, norm};
+    float hdr[7] = {(float)il}; for (int i = 0; i < 6; i++) hdr[i + 1] = (float)n[i];
+    fwrite(hdr, 4, 7, g_llms_dif);
+    static float *buf = NULL; if (!buf) buf = malloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float) + 64);
+    for (int i = 0; i < 6; i++) { memset(buf, 0, (size_t)n[i] * 4u); if (ts[i]) ds4_gpu_tensor_read(ts[i], 0, buf, (uint64_t)n[i] * 4u); fwrite(buf, 4, n[i], g_llms_dif); }
+    fflush(g_llms_dif);
+}
+static void llms_dump_window(ds4_gpu_tensor *win, uint32_t pos_after) {
+    const char *p = getenv("LLMS_DS4_DUMP_WIN_PATH"); if (!p || !*p || llms_dump_pos() < 0) return;
+    static FILE *wf = NULL; if (!wf) wf = fopen(p, "wb"); if (!wf) return;
+    static float *wb = NULL; if (!wb) wb = malloc(128u * 512u * sizeof(float)); if (!wb) return;
+    const float hp = (float)pos_after; fwrite(&hp, 4, 1, wf);
+    ds4_gpu_tensor_read(win, 0, wb, 128u * 512u * sizeof(float)); fwrite(wb, 4, 128u * 512u, wf); fflush(wf);
+}
+
+static void llms_dump_rec(uint32_t il, ds4_gpu_tensor *residual, ds4_gpu_tensor *after_attn, ds4_gpu_tensor *probs,
+                          ds4_gpu_tensor *selected, uint64_t sel_off, ds4_gpu_tensor *weights, uint64_t w_off) {
+    const uint32_t H = DS4_N_HC * DS4_N_EMBD;
+    static float *buf = NULL;
+    if (!buf) buf = malloc(((size_t)2 * H + DS4_MAX_EXPERT + 16) * sizeof(float));
+    if (!buf) return;
+    int32_t sel[16] = {0}; float wt[16] = {0};
+    memset(buf, 0, ((size_t)2 * H + DS4_MAX_EXPERT + 16) * sizeof(float));
+    ds4_gpu_tensor_read(residual, 0, buf, (uint64_t)H * 4u);
+    ds4_gpu_tensor_read(after_attn, 0, buf + H, (uint64_t)H * 4u);
+    ds4_gpu_tensor_read(probs, 0, buf + 2 * H, (uint64_t)DS4_N_EXPERT * 4u);
+    ds4_gpu_tensor_read(selected, sel_off, sel, (uint64_t)DS4_N_EXPERT_USED * 4u);
+    ds4_gpu_tensor_read(weights, w_off, wt, (uint64_t)DS4_N_EXPERT_USED * 4u);
+    const float lf = (float)il;
+    fwrite(&lf, 4, 1, g_llms_df); fwrite(buf, 4, 2 * H + DS4_N_EXPERT, g_llms_df);
+    for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) { const float s = (float)sel[k]; fwrite(&s, 4, 1, g_llms_df); }
+    fwrite(wt, 4, DS4_N_EXPERT_USED, g_llms_df); fflush(g_llms_df);
+}
+
+int ds4_gpu_llms_hc_pre_fused(ds4_gpu_tensor *split, ds4_gpu_tensor *xo, ds4_gpu_tensor *no, const ds4_gpu_tensor *residual,
+                              const ds4_gpu_tensor *pre, ds4_gpu_tensor *mixo, const void *model_map, uint64_t model_size, uint64_t fn_off, uint64_t scale_off,
+                              uint64_t base_off, uint64_t nw_off, uint32_t n_embd, uint32_t n_hc, uint32_t iters, float rms_eps, float hc_eps, int canary);   /* llms HC_FUSE1 */
+static int llms_hcf1(void) {   /* llms HC_FUSE1 (apply_hc_fuse.py): 1 on, -1 canary */
+    static int on = -2;
+    if (on == -2) { const char *e = getenv("LLMS_DS4_HC_FUSE1"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? -1 : atoi(e) == 2 ? 2 : atoi(e) == 3 ? 3 : 1;   /* 1 exact (fused + the split kernel), 2 one dispatch */
+                    if (on) fprintf(stderr, on < 0 ? "llms: hc fuse1 -- CANARY: the weighted sum's bf16 rounding skipped\n" : "llms: hc fuse1 (the one-token HC pre-sublayer in one dispatch)\n"); }
+    return on;
+}
+static bool llms_hcf1_run(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, bool ffn) {
+    return ds4_gpu_llms_hc_pre_fused(ffn ? g->ffn_split : g->attn_split, g->x, g->norm, ffn ? g->after_attn : g->residual, ffn ? g->attn_split : g->pre, g->mix,
+               m->map, m->size, (ffn ? l->hc_ffn_fn : l->hc_attn_fn)->abs_offset, (ffn ? l->hc_ffn_scale : l->hc_attn_scale)->abs_offset,
+               (ffn ? l->hc_ffn_base : l->hc_attn_base)->abs_offset, (ffn ? l->ffn_norm : l->attn_norm)->abs_offset,
+               DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS, (llms_hcf1() < 0 ? 1 : 0) + (llms_hcf1() == 2 ? 0 : 2) + (llms_hcf1() == 3 ? 4 : 0)) != 0 &&
+        (llms_hcf1() == 2 ||
+         ((llms_q4l_dual() && !ds4_gpu_llms_alt_off("dual") && g->tp_world != 2) ?   /* llms Q4L_DUAL: defer the split into the sublayer's dual dispatch */
+          (g_llms_psplit[ffn ? 1 : 0].split = ffn ? g->ffn_split : g->attn_split, g_llms_psplit[ffn ? 1 : 0].mix = g->mix, g_llms_psplit[ffn ? 1 : 0].m = m,
+           g_llms_psplit[ffn ? 1 : 0].scale_off = (ffn ? l->hc_ffn_scale : l->hc_attn_scale)->abs_offset,
+           g_llms_psplit[ffn ? 1 : 0].base_off = (ffn ? l->hc_ffn_base : l->hc_attn_base)->abs_offset, g_llms_psplit[ffn ? 1 : 0].on = 1, true) :
+         (ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split, g->mix, m->map, m->size,   /* exact mode: the split kernel itself; llms HC_POST2: moved into the expand */
+            (ffn ? l->hc_ffn_scale : l->hc_attn_scale)->abs_offset, (ffn ? l->hc_ffn_base : l->hc_attn_base)->abs_offset, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) &&
+            ((g_llms_split_mark = ds4_gpu_llms_conc_count()), true))));   /* llms CONC_SKIP: the split was the last dispatch */
+}
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
@@ -41719,22 +43095,39 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
     }
-    return ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1) &&
-        ds41_hc_mix(g, m, l, false) &&
+    if (!ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1)) return false;   /* upstream 5379c1c: DSpark capture (no-op unless configured) */
+    if (llms_hcf1() && g->tp_world != 2 && !ds4_gpu_llms_alt_off("hcf1")) return llms_hcf1_run(g, m, l, false);   /* llms HC_FUSE1 */
+    return ds41_hc_mix(g, m, l, false) &&
         ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
+    if (!llms_psplit_flush(0)) return false;   /* llms Q4L_DUAL: the attention split's first consumer */
     return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
-        ds41_hc_mix(g, m, l, true) &&
-        ds41_hc_sum(g->x, g->after_attn, g->attn_split, true) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        ((llms_hcf1() && g->tp_world != 2 && !ds4_gpu_llms_alt_off("hcf1")) ? llms_hcf1_run(g, m, l, true) :   /* llms HC_FUSE1 */
+        (ds41_hc_mix(g, m, l, true) &&
+        ds41_hc_sum(g->x, g->after_attn, g->attn_split, true) && ds41_norm(g->norm, g->x, m, l->ffn_norm)));
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
-    return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
-        ds41_graph_after_attention(g, m, l);
+    {   /* llms DUMP_IN_LAYERS (06:1x): LLMS_DS4_DUMP_IN_LAYERS=N dumps layers < N (default 2), and the FFN side too (record il + 1000) */
+    static int llms_dil = -1; if (llms_dil < 0) { const char *e = getenv("LLMS_DS4_DUMP_IN_LAYERS"); llms_dil = e && atoi(e) > 0 ? atoi(e) : 2; }
+    if ((int)il < llms_dil && llms_dump_pos() == (long)g->pos) {   /* llms LLMS_DS4_DUMP_IN_PATH (decode) */
+        bool ok = ds41_graph_before_attention(g, m, l, il) && ds4_gpu_end_commands();
+        ok = ok && llms_psplit_flush(0) && ds4_gpu_end_commands();   /* llms Q4L_DUAL */
+        if (ok) llms_dump_in(il, g->residual, g->mix, g->attn_split, g->pre, g->x, g->norm);
+        ok = ok && ds4_gpu_begin_commands() && ds41_attention(g, m, l, il, false, false) && ds41_graph_after_attention(g, m, l) && ds4_gpu_end_commands();
+        if (ok && llms_dil > 2) llms_dump_in(il + 1000u, g->after_attn, g->mix, g->ffn_split, g->attn_split, g->x, g->norm);
+        return ok && ds4_gpu_begin_commands();
+    }
+    }
+    if (!ds41_graph_before_attention(g, m, l, il)) return false;
+    llms_stage(g, "hc_pre", il);
+    if (!ds41_attention(g, m, l, il, false, false) || !ds41_graph_after_attention(g, m, l)) return false;
+    llms_stage(g, "after_attn", il);
+    return true;
 }
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
@@ -41755,6 +43148,15 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
     const ds4_gpu_tensor *input = ffn ? b->after_attn : b->residual;
+    static int llms_hcf = -2;   /* llms HC_FUSE (apply_ds4_hc_fuse.py) */
+    if (llms_hcf < -1) { const char *e = getenv("LLMS_DS4_HC_FUSE"), *src = getenv("DS4_METAL_DENSE_SOURCE"); llms_hcf = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? -1 : 1;
+                         if (llms_hcf && !(src && llms_srckey(src, "_sk2") != NULL)) { llms_strict_after(fprintf(stderr, "llms: LLMS_DS4_HC_FUSE ignored: DS4_METAL_DENSE_SOURCE does not name an '_sk2' source\n"), LLMS_G_NAME); llms_hcf = 0; }
+                         if (llms_hcf) fprintf(stderr, llms_hcf < 0 ? "llms: hc fuse -- CANARY: the mix scaled by 1 + 2^-10\n" : "llms: hc fuse (the HC mix with its flat RMS norm in one split-K product)\n"); }
+    if (llms_hcf && count == 32u && fn->type == DS4_TENSOR_F16 && !ds4_gpu_llms_alt_off("hcf") &&
+        ds4_gpu_llms_hc_mix_fused(b->mix, m->map, m->size, fn->abs_offset, DS4_N_HC * DS4_N_EMBD, 24u, input, count, DS4_RMS_EPS, llms_hcf < 0))
+        return ds4_gpu_hc_split_sinkhorn_tensor(ffn ? b->ffn_split : b->attn_split, b->mix,
+            m->map, m->size, scale->abs_offset, base->abs_offset,
+            DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
     const bool projected =
 #ifdef __APPLE__
         fn->type == DS4_TENSOR_F16 && count > DS4_TP_BATCH_MAX_ROWS ?
@@ -41771,17 +43173,70 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
             DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
 
+static uint64_t llms_elide_mask(const char *name) {   /* llms ELIDE: a hex layer mask from the environment, 0 when unset */
+    const char *e = getenv(name); return e && *e ? strtoull(e, NULL, 16) : 0ull;
+}
+static void llms_elide_announce(void) {   /* llms ELIDE: once, the FFN masks and the Sinkhorn override in effect */
+    static int done; if (done++) return;
+    const uint64_t f = llms_elide_mask("LLMS_DS4_ELIDE_FFN"), s = llms_elide_mask("LLMS_DS4_ELIDE_SHARED"), r = llms_elide_mask("LLMS_DS4_ELIDE_ROUTED");
+    if (f | s | r) fprintf(stderr, "llms: ELIDE FFN %llx SHARED %llx ROUTED %llx -- MEASUREMENT: those layers' FFN parts zeroed; NOT the model\n", (unsigned long long)f, (unsigned long long)s, (unsigned long long)r);
+}
+/* llms HCF_ROWS (apply_hcf_rows.py): the k-row HC pre-sublayer (mix + weighted sum + norm) in one dispatch, then the split over the rows */
+static int llms_hcf_rows(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_HCF_ROWS"); on = e && *e && *e != '0'; if (on) fprintf(stderr, "llms: hcf rows (the k-row HC pre-sublayer in one dispatch)\n"); }
+    return on;
+}
+static int llms_hcf1(void);
+
+
+#define LLMS_OWED_CONSTS .map = m->map, .size = m->size, .n_embd = DS4_N_EMBD, .n_hc = DS4_N_HC, .iters = DS4_N_HC_SINKHORN_ITER, .rms_eps = DS4_RMS_EPS, .hc_eps = DS4_HC_EPS
+static int llms_k2split(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_Q4L_K2SPLIT"); on = e && *e && *e != '0' ? (*e == '2' ? 2 : 1) : 0;   /* 2 = CANARY: the carried split at half its Sinkhorn iterations */
+                  if (on) fprintf(stderr, "llms: q4l k2split (the two-row HC split carried by the dual dispatch)\n"); }   /* counts: 'llms hc owed' */
+    return on;
+}
+static int llms_mixdual(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_HC_MIXDUAL"); on = e && *e && *e != '0' ? (*e == '2' ? 2 : 1) : 0;
+                  if (on) fprintf(stderr, "llms: hc mixdual (the HC pre's x / norm alone on the path; its mixer as 192 small threadgroups in the block's dual (v2))%s\n", on == 2 ? " -- CANARY: the carried split at half its Sinkhorn iterations" : ""); }
+    return on;
+}
+static bool llms_hcf_rows_run(ds41_prefill_row *b, const ds4_model *m, const ds4_layer_weights *l, bool ffn, const ds4_gpu_tensor *pre, uint32_t pre_stride, uint32_t count) {
+    if (!ds4_gpu_llms_owed_force(-1)) return false;   /* llms HC_OWED: pre may be an owed split */
+    const int flags = 2 + ((llms_hcf1() == 3) ? 4 : 0);   /* exact mode; 256 threads where HC_FUSE1=3 runs them */
+    const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn, *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale, *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+    const ds4_tensor *nw = ffn ? l->ffn_norm : l->attn_norm;
+    ds4_gpu_tensor *split = ffn ? b->ffn_split : b->attn_split; const ds4_gpu_tensor *hin = ffn ? b->after_attn : b->residual;
+    static int llms_mdx = -1; if (llms_mdx < 0) { const char *e = getenv("LLMS_DS4_HC_MIXDUAL_XS"); llms_mdx = e && *e && *e != '0'; }   /* adopt_a1x.py: the _xs path (+1.1 ms alone) only on request */
+    const int owe = count == 2u && llms_k2split() && !ds4_gpu_llms_alt_off("k2split") ?                       /* llms Q4L_K2SPLIT: 1 = the split owed */
+        (llms_mdx && llms_mixdual() && !ds4_gpu_llms_alt_off("mixdual") ? 2 : 1) : 0;                        /* llms HC_MIXDUAL_XS: 2 = the mixer too */
+    if (ds4_gpu_llms_hc_pre_fused_rows(split, b->x, b->norm, hin, pre, pre_stride, b->mix, m->map, m->size, fn->abs_offset, scale->abs_offset, base->abs_offset,
+            nw->abs_offset, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS, flags | (owe == 2 ? DS4_GPU_LLMS_HCFR_XS : 0), count) == 0) return false;
+    if (owe) {
+        ds4_gpu_llms_owe(ffn ? 1 : 0, &(ds4_gpu_llms_owed){ .kind = owe, .split = split, .mix = b->mix, .xo = b->x, .no = b->norm, .hin = hin, .pre = pre,
+            .pre_stride = pre_stride, .rows = count, .flags = flags, .fn_off = fn->abs_offset, .scale_off = scale->abs_offset, .base_off = base->abs_offset,
+            .nw_off = nw->abs_offset, .take_iters = owe == 1 ? DS4_N_HC_SINKHORN_ITER / (llms_k2split() == 2 ? 2 : 1) : DS4_N_HC_SINKHORN_ITER, LLMS_OWED_CONSTS });
+        return true;
+    }
+    return ds4_gpu_hc_split_sinkhorn_tensor(split, b->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
+            DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) != 0;
+}
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
                                          uint32_t il, uint32_t count) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
-            !ds4_gpu_dsv41_engram_add(b->residual, b->engram_kv,
+        ds4_gpu_tensor *llms_kv = b->engram_kv;   /* llms ANE_ENGRAM: the Neural Engine's projection when present */
+        if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true)) return false;
+        if (!ds4_gpu_dsv41_engram_add(b->residual, llms_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], g->image_count ? g->image_text_mask : NULL,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
             return false;
     }
+    if (count >= 2u && count <= 4u && llms_hcf_rows() && l->hc_attn_fn->type == DS4_TENSOR_F16 && !ds4_gpu_llms_alt_off("hcfr"))   /* llms HCF_ROWS */
+        return llms_hcf_rows_run(b, m, l, false, il ? b->ffn_split : b->pre, il ? 24u : 4u, count);
     if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
     const bool mixed = il ?
@@ -41791,9 +43246,39 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
 }
 
+extern int ds4_gpu_llms_hcq(ds4_gpu_tensor *hout, const ds4_gpu_tensor *block, const ds4_gpu_tensor *residual, const ds4_gpu_tensor *cur, const ds4_gpu_tensor *pre,
+                            ds4_gpu_tensor *xo, ds4_gpu_tensor *no, ds4_gpu_tensor *mixo, const void *model_map, uint64_t model_size, uint64_t nw_off,
+                            uint32_t n_embd, float rms_eps, int canary, uint32_t rows);   /* llms HC_FUSEQ */
+static int llms_hcq(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_HC_FUSEQ"); on = e && *e && *e != '0' ? (*e == '2' ? 2 : 1) : 0;
+                  if (on) fprintf(stderr, "llms: hc fuseq (the two-row FFN-side HC transition fused: expand + x + both norms, the mixer carried by the dual)%s\n", on == 2 ? " -- CANARY: the norm scale x (1 + 2^-10)" : ""); }
+    return on;
+}
+static int llms_hcqa(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_HC_FUSEQA"); on = e && *e && *e != '0' ? (*e == '2' ? 2 : 1) : 0;
+                  if (on) fprintf(stderr, "llms: hc fuseqa (the two-row attention-side HC transition fused across the layer boundary)%s\n", on == 2 ? " -- CANARY: the norm scale x (1 + 2^-10)" : ""); }
+    return on;
+}
+static uint64_t g_llms_hcqa_n, g_llms_hcqa_plain;
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count) {
-    return ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
+    if (count == 2u && llms_hcq() && llms_mixdual() && llms_k2split() && llms_hcf_rows() && l->hc_ffn_fn->type == DS4_TENSOR_F16 &&
+        !ds4_gpu_llms_alt_off("hcq") && !ds4_gpu_llms_alt_off("mixdual") && !ds4_gpu_llms_alt_off("k2split") && !ds4_gpu_llms_alt_off("hcfr")) {   /* llms HC_FUSEQ */
+        if (!ds4_gpu_llms_owed_force(-1)) return false;
+        if (!ds4_gpu_llms_hcq(b->after_attn, b->block, b->residual, b->attn_split, b->attn_split, b->x, b->norm, b->mix, m->map, m->size,
+                              l->ffn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS, llms_hcq() == 2, count)) return false;
+        ds4_gpu_llms_owe(1, &(ds4_gpu_llms_owed){ .kind = 2, .split = b->ffn_split, .mix = b->mix, .xo = b->x, .no = b->norm, .hin = b->after_attn, .pre = b->attn_split,
+            .pre_stride = 24u, .rows = count, .flags = 2 + ((llms_hcf1() == 3) ? 4 : 0), .fn_off = l->hc_ffn_fn->abs_offset, .scale_off = l->hc_ffn_scale->abs_offset,
+            .base_off = l->hc_ffn_base->abs_offset, .nw_off = l->ffn_norm->abs_offset, .take_iters = DS4_N_HC_SINKHORN_ITER, LLMS_OWED_CONSTS });   /* llms HC_OWED */
+        return true;
+    }
+    if (count >= 2u && count <= 4u && llms_hcf_rows() && l->hc_ffn_fn->type == DS4_TENSOR_F16 && !ds4_gpu_llms_alt_off("hcfr"))   /* llms HCF_ROWS */
+        return ds4_gpu_llms_owed_force(0) && ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual, b->attn_split, DS4_N_EMBD, DS4_N_HC) &&   /* llms HC_OWED: force first */
+            ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16) &&
+            llms_hcf_rows_run(b, m, l, true, b->attn_split, 24u, count);
+    return ds4_gpu_llms_owed_force(0) && ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,   /* llms HC_OWED: force first */
         b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16) &&
         ds41_hc_mix_batch(b, m, l, true, count) &&
@@ -41802,10 +43287,33 @@ static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
         ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count);
 }
 
+
+
+extern int ds4_gpu_llms_q4l_k2_dual(ds4_gpu_tensor *out_a, uint64_t woff_a, uint64_t n_a, ds4_gpu_tensor *out_b, uint64_t woff_b, uint64_t n_b,
+                                    const ds4_gpu_tensor *x, uint64_t in_dim, int side);   /* llms HC_OWED: the side's owed HC tail rides the dispatch */
+static int llms_k2dual(ds4_gpu_tensor *oa, const ds4_tensor *wa, ds4_gpu_tensor *ob, const ds4_tensor *wb, const ds4_gpu_tensor *x, uint32_t count, int side) {
+    static int mvext = -1; if (mvext < 0) mvext = getenv("LLMS_DS4_BATCH_MVEXT") != NULL;
+    if (count != 2 || !mvext || wa->type != DS4_TENSOR_Q8_0 || wb->type != DS4_TENSOR_Q8_0 || wa->dim[0] != wb->dim[0] ||
+        wa->dim[1] == DS4_N_VOCAB || wb->dim[1] == DS4_N_VOCAB) return 0;
+    ds4_gpu_llms_t32_round(1);
+    const int ok = ds4_gpu_llms_q4l_k2_dual(oa, wa->abs_offset, wa->dim[1], ob, wb->abs_offset, wb->dim[1], x, wa->dim[0], side);
+    const int folded = ds4_gpu_llms_t32_rounded(); ds4_gpu_llms_t32_round(0);
+    return ok && folded;
+}
 static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
                                          const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+    if (llms_k2dual(b->qr, l->attn_q_a, b->kv, l->attn_kv, b->norm, count, 0)) {   /* llms Q4L_K2DUAL: q_a + kv in one dispatch, then the same chain (+ the attention split: K2SPLIT) */
+        return ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
+                l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
+            ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
+            ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
+                                   g->tp_rank * q_dim, q_dim, count) &&
+            ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
+                l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
+            ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16);
+    }
     return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
@@ -41821,7 +43329,8 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool bf16) {
-    if (weight->type == DS4_TENSOR_F16)
+    static int llms_mvext2r = -1; if (llms_mvext2r < 0) llms_mvext2r = getenv("LLMS_DS4_BATCH_MVEXT2") != NULL;   /* llms BATCH_MVEXT2 */
+    if (weight->type == DS4_TENSOR_F16 && !(llms_mvext2r && count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS))
         return ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) &&
             (!bf16 || ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[1], count, DS4_V41_BF16));
@@ -41851,13 +43360,17 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
         ds4_gpu_dsv41_rope_stride(b->index_k, DS4_N_INDEXER_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->index_k, DS4_N_INDEXER_HEAD_DIM, rows, DS4_V41_FP4_E8M0) &&
+        (llms_idx_half() ? ds4_gpu_llms_copy_f32_f16(g->index_cache[owner], (uint64_t)first * DS4_N_INDEXER_HEAD_DIM * sizeof(uint16_t),   /* llms IDX_HALF */
+            b->index_k, 0, rows * DS4_N_INDEXER_HEAD_DIM) :
         ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)first * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-            b->index_k, 0, (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float)) &&
+            b->index_k, 0, (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float))) &&
         ds4_gpu_dsv41_rope_stride(b->latent, DS4_N_HEAD_DIM, 1, rows,
                                   first * ratio, ratio, true, false) &&
+        (llms_kv_fp4() ? ds4_gpu_llms_kv_fp4_pack(b->latent, rows, g->compressed[owner], first) != 0 :   /* llms KV_FP4 */
         ds4_gpu_dsv41_quantize(b->latent, DS4_N_HEAD_DIM, rows, DS4_V41_FP4_E4M3) &&
+        (llms_kv_half() ? (g_llms_kvh_copies++, ds4_gpu_llms_copy_f32_f16(g->compressed[owner], (uint64_t)first * DS4_N_HEAD_DIM * sizeof(uint16_t), b->latent, 0, rows * DS4_N_HEAD_DIM)) :   /* llms KV_HALF */
         ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)first * DS4_N_HEAD_DIM * sizeof(float),
-            b->latent, 0, (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float));
+            b->latent, 0, (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float))));
 }
 
 static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -41882,13 +43395,21 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                    count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
                !ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
         return false;
+    ds4_gpu_tensor *llms_ic = g->index_cache[owner];   /* llms IDX_HALF: the prefill's kernels read float keys -- one shared float copy of the live rows */
+    if (llms_idx_half()) {
+        static ds4_gpu_tensor *llms_icf; static uint64_t llms_icf_bytes;
+        const uint64_t need = (uint64_t)n_comp * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        if (llms_icf_bytes < need) { if (llms_icf) ds4_gpu_tensor_free(llms_icf); llms_icf_bytes = need + need / 4u + (1u << 20); llms_icf = ds4_gpu_tensor_alloc(llms_icf_bytes); if (!llms_icf) { llms_icf_bytes = 0; return false; } }
+        if (!ds4_gpu_llms_copy_f16_f32(llms_icf, 0, g->index_cache[owner], 0, n_comp * DS4_N_INDEXER_HEAD_DIM)) return false;
+        llms_ic = llms_icf;
+    }
     ds41_gpu_graph row = *g;
     /* Only 32 score rows are live. Batched sorting retains the original
      * per-row causal width, including padding and tie order. */
     const bool packed = count >= 8u && ds4_gpu_dsv41_tensor_ops_available() &&
         !getenv("DS4_METAL_DISABLE_V41_PACKED_INDEX");
     if (packed && !ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q,
-        g->index_cache[owner], n_comp, count)) return false;
+        llms_ic, n_comp, count)) return false;   /* llms IDX_HALF */
     for (uint32_t off = 0; off < count; off += DS41_INDEX_BATCH) {
         const uint32_t rows = count - off < DS41_INDEX_BATCH ? count - off : DS41_INDEX_BATCH;
         const uint64_t q_bytes = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
@@ -41897,9 +43418,9 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_tensor *weights = ds4_gpu_tensor_view(b->index_weights, off * w_bytes, rows * w_bytes);
         bool ok = q && weights && (packed ?
             ds4_gpu_dsv41_indexer_scores_packed(g->index_scores, q, weights,
-                g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
+                llms_ic, g->index_packed, n_comp, rows, start + off, ratio, count, off) :   /* llms IDX_HALF */
             ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
-                q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio));
+                q, weights, llms_ic, n_comp, rows, start + off, ratio));
         ds4_gpu_tensor_free(weights);
         ds4_gpu_tensor_free(q);
         const bool batch_topk = (start + off + 1u) / ratio >= 1024u &&
@@ -41991,12 +43512,12 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
         }
     } else if (n_comp < DS4_N_INDEXER_TOP_K) {
         ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(b->heads, m->map, m->size,
-            sinks, b->q, g->raw_prefill, g->compressed[owner], 0, NULL, 0,
+            sinks, b->q, g->raw_prefill, llms_comp_half(g, owner, n_comp), llms_kv_half() == 1 ? 1u : 0u, NULL, 0,   /* llms KV_HALF / KV_FP4 prefill attention */
             count, start, n_raw, g->prefill_cap + 128u, 0, n_comp, 128, ratio,
             heads, DS4_N_HEAD_DIM);
     } else {
         ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(b->heads, m->map, m->size,
-            sinks, b->q, g->raw_prefill, g->compressed[owner], 0,
+            sinks, b->q, g->raw_prefill, llms_comp_half(g, owner, n_comp), llms_kv_half() == 1 ? 1u : 0u,   /* llms KV_HALF / KV_FP4 prefill attention */
             b->selected_comp, count, start, n_raw, g->prefill_cap + 128u, 0, n_comp,
             DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM);
     }
@@ -42013,14 +43534,77 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
+    if (!llms_psplit_flush(1)) return false;   /* llms Q4L_DUAL: the FFN split's first consumer */
     return ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
+
+static int g_llms_st = -1;
+static double g_llms_st_ms[10];
+static uint64_t g_llms_st_steps;
+static FILE *g_llms_st_log;     /* llms LLMS_DS4_STEP_LOG */
+static double g_llms_st_sync0, g_llms_st_bind0;
+static uint64_t g_llms_st_miss0;   /* llms step alt */
+static const char *g_llms_st_name[10] = {"engram_read", "embed_begin", "before_moe", "moe", "after_moe", "drain", "rebegin",
+                                         "tail_logits", "step_total", "unused"};
+static void llms_st_print(void) __attribute__((destructor));
+static void llms_st_print(void) {
+    if (g_llms_st != 1 || !g_llms_st_steps) return;
+    fprintf(stderr, "llms: step timing over %llu decode steps (ms per step):", (unsigned long long)g_llms_st_steps);
+    for (int i = 0; i < 9; i++) fprintf(stderr, " %s=%.3f", g_llms_st_name[i], g_llms_st_ms[i] / (double)g_llms_st_steps);
+    fprintf(stderr, "\n");
+}
+static inline bool llms_st_on(void) {
+    if (g_llms_st < 0) {
+        g_llms_st = getenv("LLMS_DS4_STEP_TIMING") != NULL;
+        const char *p = getenv("LLMS_DS4_STEP_LOG");
+        if (g_llms_st == 1 && p && *p) g_llms_st_log = fopen(p, "w");
+    }
+    return g_llms_st == 1;
+}
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    bool ok;
+    if (llms_st_on()) {
+        double t0 = now_sec(), t1;
+        ok = ds41_graph_before_moe(g, m, l, il);
+        t1 = now_sec(); g_llms_st_ms[2] += (t1 - t0) * 1e3; t0 = t1;
+        ok = ok && ds41_moe(g, m, l, il, (uint32_t)token);
+        t1 = now_sec(); g_llms_st_ms[3] += (t1 - t0) * 1e3; t0 = t1;
+        ok = ok && ds41_graph_after_moe(g);
+        t1 = now_sec(); g_llms_st_ms[4] += (t1 - t0) * 1e3;
+    } else {
+        ok = ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
+            ds41_graph_after_moe(g);
+    }
+    /* llms LLMS_DS4_LOOKAHEAD_LOG: wait for the layer, then log actual ids (layer il) and predicted ids (layer il+1) */
+    if (ok && g_llms_la_state == 1 && g_llms_la_log && !ds41_image_at(g, g->pos)) {
+        int32_t a[16] = {0}, p[16];   /* DS4_N_EXPERT_USED (6 for V4.1) <= 16 */
+        if (DS4_N_EXPERT_USED > 16) return false;
+        for (uint32_t k = 0; k < 16; k++) p[k] = -1;
+        if (!ds4_gpu_end_commands()) return false;
+        ds4_gpu_tensor_read(g->selected, 0, a, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        if (g_llms_la_pending) ds4_gpu_tensor_read(g_llms_la_sel, 0, p, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        fprintf(g_llms_la_log, "%u %u", (unsigned)g->pos, (unsigned)il);
+        for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) fprintf(g_llms_la_log, " %d", (int)a[k]);
+        for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) fprintf(g_llms_la_log, " %d", (int)p[k]);
+        { /* llms top24: lookahead probabilities -> 24 best ids */
+            static float pr[DS4_MAX_EXPERT]; int used[DS4_MAX_EXPERT] = {0};
+            if (g_llms_la_pending && ds4_gpu_tensor_read(g_llms_la_probs, 0, pr, (uint64_t)DS4_N_EXPERT * sizeof(float))) {
+                fprintf(g_llms_la_log, " |");
+                for (int r = 0; r < 24; r++) { int bi = -1; for (uint32_t e = 0; e < DS4_N_EXPERT; e++) if (!used[e] && (bi < 0 || pr[e] > pr[bi])) bi = (int)e;
+                    used[bi] = 1; fprintf(g_llms_la_log, " %d", bi); }
+            }
+        }
+        { float rw[16]; /* llms route weights */
+          if (ds4_gpu_tensor_read(g->route_weights, 0, rw, (uint64_t)DS4_N_EXPERT_USED * sizeof(float))) {
+              fprintf(g_llms_la_log, " #"); for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) fprintf(g_llms_la_log, " %.6g", rw[k]); } }
+        fputc('\n', g_llms_la_log);
+        if (il + 1u == DS4_N_LAYER) fflush(g_llms_la_log);
+        if (!ds4_gpu_begin_commands()) return false;
+    }
+    return ok;
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42057,7 +43641,7 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_decode_graphs_supported())
         return ds41_graph_layer(g, m, l, il, token);
     return ds41_decode_island(g, m, l, il, 0) &&
-        ds41_attention(g, m, l, il, true) && ds41_decode_island(g, m, l, il, 2) &&
+        ds41_attention(g, m, l, il, true, false) && ds41_decode_island(g, m, l, il, 2) &&
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
         ds41_bf16(g->block, DS4_N_EMBD) &&
         ds41_decode_island(g, m, l, il, 1) &&
@@ -42100,6 +43684,220 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+static int g_llms_stream_rows;   /* llms STREAM_ROW_BATCH: set inside ds41_graph_step_batch */
+/* llms LLMS_DS4_BATCH_PREFETCH: lookahead router buffers for up to DS4_TP_BATCH_MAX_ROWS rows */
+static ds4_gpu_tensor *g_llms_bp_logits, *g_llms_bp_probs, *g_llms_bp_weights, *g_llms_bp_sel;
+static int g_llms_bp_m = -1;
+
+
+static bool llms_bp_ready(void) {
+    if (g_llms_bp_m < 0) {
+        const char *e = getenv("LLMS_DS4_BATCH_PREFETCH"); g_llms_bp_m = e ? atoi(e) : 0; if (g_llms_bp_m > 6) g_llms_bp_m = 6;
+        if (g_llms_bp_m > 0) {
+            g_llms_bp_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_TP_BATCH_MAX_ROWS * DS4_N_EXPERT * sizeof(float));
+            g_llms_bp_probs = ds4_gpu_tensor_alloc((uint64_t)DS4_TP_BATCH_MAX_ROWS * DS4_N_EXPERT * sizeof(float));
+            g_llms_bp_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_TP_BATCH_MAX_ROWS * DS4_N_EXPERT_USED * sizeof(float));
+            g_llms_bp_sel = ds4_gpu_tensor_alloc((uint64_t)DS4_TP_BATCH_MAX_ROWS * DS4_N_EXPERT_USED * sizeof(int32_t));
+            if (!g_llms_bp_logits || !g_llms_bp_probs || !g_llms_bp_weights || !g_llms_bp_sel) g_llms_bp_m = 0;
+            else fprintf(stderr, "llms: batch prefetch top-%d per row\n", g_llms_bp_m);
+        }
+    }
+    return g_llms_bp_m > 0;
+}
+int ds4_gpu_llms_prefetch_union(const void *, uint64_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const int32_t *, uint32_t);   /* llms PFU */
+static int g_llms_bp2_in_cb;   /* llms PFU: the ticketed prefetch only from BP2's guarded callback */
+static int g_llms_bp_max = -1; static uint64_t g_llms_bp_issues, g_llms_bp_ids;   /* llms BATCH_PREFETCH_SP (apply_bp_sp.py) */
+static int llms_bp_sp(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_BATCH_PREFETCH_SP"); on = e && *e && *e != '0';
+                  const char *mx = getenv("LLMS_DS4_BATCH_PREFETCH_MAX"); g_llms_bp_max = mx && atoi(mx) > 0 ? atoi(mx) : 8; if (g_llms_bp_max > 384) g_llms_bp_max = 384;
+                  if (on) { fprintf(stderr, "llms: batch prefetch in the short prefill (union of the rows' predicted top-m, up to %d ids per layer)\n", g_llms_bp_max);
+                            atexit_b(^{ fprintf(stderr, "llms batch prefetch: %llu issues, %llu ids\n", (unsigned long long)g_llms_bp_issues, (unsigned long long)g_llms_bp_ids); }); } }
+    return on;
+}
+static bool llms_bp_issue(const ds4_model *m, const ds4_layer_weights *ln, uint32_t layer, uint32_t count) {
+    static float pr[DS4_TP_BATCH_MAX_ROWS * DS4_MAX_EXPERT];
+    { static int dry = -1; if (dry < 0) { const char *e = getenv("LLMS_DS4_BP_DRY"); dry = e && *e && *e != '0'; if (dry) fprintf(stderr, "llms: BP_DRY -- the batch prefetch computes its look-ahead router and issues NO load (a diagnostic: does the side computation alone change the numbers?)\n"); }
+      if (dry) return true; }
+    if (!ds4_gpu_tensor_read(g_llms_bp_probs, 0, pr, (uint64_t)count * DS4_N_EXPERT * sizeof(float))) return false;
+    (void)llms_bp_sp(); const uint32_t cap = (uint32_t)(g_llms_bp_max > 0 ? g_llms_bp_max : 8);
+    static int32_t ids[384]; uint32_t n = 0; static uint8_t seen[DS4_MAX_EXPERT]; memset(seen, 0, sizeof seen);
+    static int bpv = -1; if (bpv < 0) { const char *e = getenv("LLMS_DS4_BP_VOTES"); bpv = e && *e && *e != '0'; if (bpv) fprintf(stderr, "llms: bp votes (the look-ahead union ordered by the number of rows voting for each expert)\n"); }
+    if (bpv) {
+        static uint16_t votes[DS4_MAX_EXPERT]; memset(votes, 0, sizeof votes);
+        for (uint32_t r = 0; r < count; r++) {
+            const float *p = pr + (uint64_t)r * DS4_N_EXPERT; uint8_t mine[DS4_MAX_EXPERT]; memset(mine, 0, sizeof mine);
+            for (int k = 0; k < g_llms_bp_m; k++) {
+                int best = -1;
+                for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (!mine[e] && (best < 0 || p[e] > p[best])) best = e;
+                if (best < 0) break;
+                mine[best] = 1; votes[best]++;
+            }
+        }
+        for (;;) {   /* by votes, descending, up to cap */
+            int best = -1;
+            for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (votes[e] && !seen[e] && (best < 0 || votes[e] > votes[best])) best = e;
+            if (best < 0 || n >= cap) break;
+            seen[best] = 1; ids[n++] = best;
+        }
+    } else
+    for (uint32_t r = 0; r < count && n < cap; r++) {
+        const float *p = pr + (uint64_t)r * DS4_N_EXPERT; uint8_t mine[DS4_MAX_EXPERT]; memset(mine, 0, sizeof mine);
+        for (int k = 0; k < g_llms_bp_m && n < cap; k++) {
+            int best = -1;
+            for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (!mine[e] && (best < 0 || p[e] > p[best])) best = e;
+            if (best < 0) break;
+            mine[best] = 1;
+            if (!seen[best]) { seen[best] = 1; ids[n++] = best; }
+        }
+    }
+    g_llms_bp_issues++; g_llms_bp_ids += n;
+    uint64_t gr = 0, dr = 0;
+    if (!n || !tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &gr) || !tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &dr)) return true;
+    { static int pfu = -1; if (pfu < 0) { const char *e = getenv("LLMS_DS4_PFU"); pfu = e && *e && *e != '0'; if (pfu) fprintf(stderr, "llms: pfu (the prefill look-ahead as one ticketed multi-expert load)\n"); }   /* llms PFU */
+      if (pfu && g_llms_bp2_in_cb) return ds4_gpu_llms_prefetch_union(m->map, m->size, layer, DS4_N_EXPERT, ln->ffn_gate_exps->abs_offset, ln->ffn_up_exps->abs_offset,
+          ln->ffn_down_exps->abs_offset, gr * DS4_N_FF_EXP, dr * DS4_N_EMBD, ids, n) != 0; }
+    return ds4_gpu_llms_slot_prefetch(m->map, m->size, layer, DS4_N_EXPERT, ln->ffn_gate_exps->abs_offset, ln->ffn_up_exps->abs_offset,
+        ln->ffn_down_exps->abs_offset, gr * DS4_N_FF_EXP, dr * DS4_N_EMBD, ids, n) != 0;
+}
+void ds4_gpu_llms_set_postload(void (*cb)(void *), void *ud);   /* llms BP2 */
+int ds4_gpu_llms_prefetch_union(const void *, uint64_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const int32_t *, uint32_t);   /* llms PFU */
+static struct { const ds4_model *m; const ds4_layer_weights *ln; uint32_t layer, count; } g_llms_bp2_ctx; static uint64_t g_llms_bp2_calls, g_llms_bp2_fail;
+static void llms_bp2_cb(void *ud) {
+    (void)ud; g_llms_bp2_calls++;
+    static int rep = 0; if (!rep) { rep = 1; atexit_b(^{ fprintf(stderr, "llms bp2: %llu post-load issues, %llu failed\n", (unsigned long long)g_llms_bp2_calls, (unsigned long long)g_llms_bp2_fail); }); }
+    g_llms_bp2_in_cb = 1; if (!llms_bp_issue(g_llms_bp2_ctx.m, g_llms_bp2_ctx.ln, g_llms_bp2_ctx.layer, g_llms_bp2_ctx.count)) g_llms_bp2_fail++; g_llms_bp2_in_cb = 0;
+}
+static struct { ds41_gpu_graph *g; const ds4_model *m; const ds4_layer_weights *l; uint32_t count; int done, ok; } g_llms_bsas;   /* llms BATCH_SAS */
+static unsigned long g_llms_bsas_hooks, g_llms_bsas_fallbacks;
+static void llms_bsas_report(void) { fprintf(stderr, "llms: BATCH_SAS hooks %lu fallbacks %lu\n", g_llms_bsas_hooks, g_llms_bsas_fallbacks); }
+static bool llms_bsas_encode(void) {
+    ds41_gpu_graph *g = g_llms_bsas.g; const ds4_model *m = g_llms_bsas.m; const ds4_layer_weights *l = g_llms_bsas.l;
+    const uint32_t count = g_llms_bsas.count; ds41_prefill_row *b = &g->batch;
+    return (llms_k2dual(b->shared_gate, l->ffn_gate_shexp, b->shared_up, l->ffn_up_shexp, b->norm, count, 1) ||   /* llms Q4L_K2DUAL (+ the FFN split: K2SPLIT) */
+            (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+             ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true))) &&
+        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up, count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true);
+}
+static void llms_bsas_cb(void *ud) {   /* runs inside the union preparation, batch already ended */
+    (void)ud; static int reg; if (!reg) { reg = 1; atexit(llms_bsas_report); }
+    g_llms_bsas.done = 1; g_llms_bsas_hooks++;
+    g_llms_bsas.ok = ds4_gpu_begin_commands() && llms_bsas_encode() && ds4_gpu_llms_commit_close();
+}
+static bool llms_bsas_finish(void) {
+    ds4_gpu_llms_set_after_union_read(NULL, NULL);
+    if (!g_llms_bsas.done) { g_llms_bsas.done = 1; g_llms_bsas_fallbacks++; g_llms_bsas.ok = llms_bsas_encode(); }
+    return g_llms_bsas.ok;
+}
+/* ASTRA_ED_SAS: only the qualified SP_ED path arms this owner. */
+static uint64_t g_astra_bsas_req[5], g_astra_bsas_hook[5], g_astra_bsas_err[5];
+static void llms_astra_bsas_report(void) {
+    for (unsigned k = 1; k <= 4; k++) if (g_astra_bsas_req[k])
+        fprintf(stderr, "astra ed sas K%u: requested %llu hooks %llu errors %llu\n", k,
+                (unsigned long long)g_astra_bsas_req[k], (unsigned long long)g_astra_bsas_hook[k],
+                (unsigned long long)g_astra_bsas_err[k]);
+}
+static int llms_astra_bsas_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ASTRA_ED_SAS"); on = e && *e && *e != '0';
+                  if (on) atexit(llms_astra_bsas_report); }
+    return on && !ds4_gpu_llms_alt_off("edsas");
+}
+static void llms_astra_bsas_cb(void *unused) {
+    (void)unused;
+    g_llms_bsas.done++;
+    if (g_llms_bsas.done != 1) { g_llms_bsas.ok = 0; return; }
+    g_astra_bsas_hook[g_llms_bsas.count]++;
+    /* Already in llms_ed_defer's command buffer, after post and before wait.
+       Unlike llms_bsas_cb, NEVER begin or commit a command buffer here. */
+    g_llms_bsas.ok = llms_bsas_encode();
+}
+static void llms_astra_bsas_arm(ds41_gpu_graph *g, const ds4_model *m,
+                                const ds4_layer_weights *l, uint32_t count) {
+    g_llms_bsas.g = g; g_llms_bsas.m = m; g_llms_bsas.l = l; g_llms_bsas.count = count;
+    g_llms_bsas.done = 0; g_llms_bsas.ok = 1; g_astra_bsas_req[count]++;
+    ds4_gpu_llms_set_after_selected(llms_astra_bsas_cb, NULL);
+}
+static uint64_t g_llms_sasfb_n; static void llms_sasfb_report(void) { fprintf(stderr, "llms sas fallback: %llu unarmed routed calls encoded their shared expert inline\n", (unsigned long long)g_llms_sasfb_n); }
+static int llms_astra_bsas_finish(int routed_ok) {
+    ds4_gpu_llms_set_after_selected(NULL, NULL); /* also on routed failure */
+    {
+
+
+        static int sf = -1; if (sf < 0) { const char *e = getenv("LLMS_DS4_SAS_FALLBACK"); sf = e && *e && *e != '0'; if (sf) { fprintf(stderr, "llms: sas fallback (an unarmed ED routed call encodes its shared expert inline)\n"); atexit(llms_sasfb_report); } }
+        if (sf && routed_ok && g_llms_bsas.done == 0) { g_llms_bsas.done = 1; g_llms_bsas.ok = llms_bsas_encode(); g_llms_sasfb_n++; }
+    }
+    const int ok = routed_ok && g_llms_bsas.done == 1 && g_llms_bsas.ok;
+    if (!ok) {
+        g_astra_bsas_err[g_llms_bsas.count]++;
+        fprintf(stderr, "astra ed sas failure: K%u routed %d callbacks %d encode %d\n",
+                g_llms_bsas.count, routed_ok, g_llms_bsas.done, g_llms_bsas.ok);
+    }
+    return ok;
+}
+
+static int g_llms_sp_active; static unsigned long long g_llms_prefill_route_short_calls;   /* llms SP_RPOL (apply_sp_rpol.py) */
+static int llms_prefill_route_on(void);
+static bool llms_prefill_route_apply(const ds4_model *model, const ds4_layer_weights *l, uint32_t il, ds41_prefill_row *b, uint32_t h);
+static void llms_prefill_route_short_report(void) { fprintf(stderr, "llms prefill route short: %llu layer calls\n", g_llms_prefill_route_short_calls); }
+static int llms_prefill_route_short(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LLMS_DS4_PREFILL_ROUTE_SHORT"); v = e && *e && *e != '0';
+                 if (v) { fprintf(stderr, "llms: prefill route short (the short prefill's batched steps take the resident bonus; one commit-and-wait per layer)\n"); atexit(llms_prefill_route_short_report); } }
+    return v;
+}
+void ds4_gpu_llms_set_sp_split(int on);   /* llms SP_SPLIT */
+static int llms_sp_split(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LLMS_DS4_SP_SPLIT"); v = e && *e && *e != '0';
+                 if (v) fprintf(stderr, "llms: sp split (the short prefill's batched steps take the split: resident experts first)\n"); }
+    return v;
+}
+static int llms_sp_defer_canary(void) {   /* llms SP_NODEFER canary: the short prefill's rows deferred again (causality broken on purpose) */
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LLMS_DS4_SP_DEFER_CANARY"); v = e && *e && *e != '0';
+                 if (v) fprintf(stderr, "llms: sp defer CANARY (the short prefill's rows deferred into the rows attention)\n"); }
+    return v;
+}
+/* llms SP_ED: the k-row routed call with the ED listener armed (bias host pointer, probabilities and weights for the listener's policy) */
+static bool llms_sped_routed(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, ds41_prefill_row *b, uint32_t il, uint32_t count,
+                             uint64_t gate_row, uint64_t down_row, bool *mid_f16, bool defer_shared) {
+    static int canary = -1; if (canary < 0) { const char *e = getenv("LLMS_DS4_SP_ED"); canary = e && !strcmp(e, "canary"); }
+    ds4_gpu_llms_set_route_bias((const float *)tensor_data(m, l->ffn_exp_probs_b));
+    if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) return false;   /* the ED deferral encodes its post and wait into the open batch */
+    {
+        static int krla = -1; if (krla < 0) { const char *e = getenv("LLMS_DS4_KROW_LA"); krla = e && *e && *e != '0'; if (krla) fprintf(stderr, "llms: krow la (the ED look-ahead prefetch for k-row requests: every row predicted, the union fetched)\n"); }
+        if (krla && count >= 2u && count <= 4u && il + 1u < DS4_N_LAYER && llms_la_on() && g_llms_ed_la_m > 0 && !ds4_gpu_llms_alt_off("krla")) {   /* llms_la_on: the lazy init of ED_LA's state */
+            const ds4_layer_weights *ln = l + 1;
+            if (g_llms_ed_la_cpu < 0) { const char *e = getenv("LLMS_DS4_ED_LA_CPU"); g_llms_ed_la_cpu = e && *e && *e != '0'; }
+            if (g_llms_ed_la_cpu && ln->ffn_gate_inp && ln->ffn_exp_probs_b && ln->ffn_gate_inp->type == DS4_TENSOR_F32) {
+                ds4_gpu_llms_ela_cpu_note(il + 1u, (const float *)tensor_data(m, ln->ffn_gate_inp), b->norm, DS4_N_EMBD);
+                uint64_t egr = 0, edr = 0;
+                if (tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &egr) && tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &edr))
+                    ds4_gpu_llms_ela_note(il + 1u, m->map, m->size, DS4_N_EXPERT, ln->ffn_gate_exps->abs_offset, ln->ffn_up_exps->abs_offset,
+                        ln->ffn_down_exps->abs_offset, egr * DS4_N_FF_EXP, edr * DS4_N_EMBD, g_llms_la_sel, g_llms_la_probs,
+                        (const float *)tensor_data(m, ln->ffn_exp_probs_b), g_llms_ed_la_m);
+                ds4_gpu_llms_krow_la(b->norm, count);
+            }
+        }
+    }
+    const int armed = ds4_gpu_llms_ed_rows_begin(b->route_probs, b->route_weights, il, canary);
+    if (defer_shared) llms_astra_bsas_arm(g, m, l, count);
+    int ok = ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+            il, count, mid_f16, !(g_llms_stream_rows && g->streaming)) != 0;
+    if (defer_shared) ok = llms_astra_bsas_finish(ok);
+    if (armed) ok = ds4_gpu_llms_ed_rows_end(il, ok) != 0;
+    if (!ok) fprintf(stderr, "llms sp ed: routed call failed layer %u (%u rows, armed %d)\n", il, count, armed);
+    (void)g;
+    return ok;
+}
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner) {
@@ -42108,15 +43906,50 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     const bool balance_shared = shared_owner && ds41_balance_shared(g, l, count);
     bool mid_f16 = false;
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
-        ds41_route_batch(g, m, l, count) &&
-        ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
+    if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false)) { fprintf(stderr, "llms moe_batch fail: router matmul layer %u\n", il); return false; }
+    static int llms_bp2 = -1; if (llms_bp2 < 0) { const char *e = getenv("LLMS_DS4_BP2"); llms_bp2 = e && *e && *e != '0'; if (llms_bp2) fprintf(stderr, "llms: bp2 (the short prefill's l+1 router encoded before layer l's routing; its predicted experts loaded after layer l's own)\n"); }   /* llms BP2 */
+    const bool llms_bp2_on = llms_bp2 && g_llms_sp_active && g->streaming && count > 4u && il + 1u < DS4_N_LAYER && !g->image_count && count <= DS4_TP_BATCH_MAX_ROWS &&   /* count > 4: rows <= 4 go through the ED listener (SP_ED), where the post-load hook never fires */
+        llms_bp_ready() && l[1].ffn_gate_inp && l[1].ffn_exp_probs_b;
+    if (llms_bp2_on) {
+        if (!ds41_matmul_batch(g_llms_bp_logits, m, l[1].ffn_gate_inp, b->norm, count, false) ||
+            !ds4_gpu_router_select_batch_tensor(g_llms_bp_sel, g_llms_bp_weights, g_llms_bp_probs, m->map, m->size,
+                l[1].ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false, g_llms_bp_logits, g->prefill_tokens,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, count)) { fprintf(stderr, "llms bp2: lookahead failed layer %u\n", il); return false; }
+        g_llms_bp2_ctx.m = m; g_llms_bp2_ctx.ln = l + 1; g_llms_bp2_ctx.layer = il + 1u; g_llms_bp2_ctx.count = count;
+        ds4_gpu_llms_set_postload(llms_bp2_cb, NULL);
+    }
+    if (g_llms_stream_rows && g->streaming) ds4_gpu_llms_set_route_layer((int)il);   /* llms CACHE_ROUTE: session-batch decode only */
+    if (!ds41_route_batch(g, m, l, count)) { fprintf(stderr, "llms moe_batch fail: route_batch layer %u\n", il); return false; }
+    static int llms_sped = -1;
+    if (llms_sped < 0) { const char *e = getenv("LLMS_DS4_SP_ED"); llms_sped = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                         if (llms_sped) fprintf(stderr, llms_sped == 2 ? "llms: sp ed -- CANARY: rows after the first skip the route policy\n" : "llms: sp ed (k <= 4 short-prefill rows through the ED listener)\n"); }
+    const bool llms_sped_on = llms_sped && g_llms_sp_active && g->streaming && count <= 4u && !shared_owner && g->tp_world != 2 && !ds4_gpu_llms_alt_off("sped");
+    if (g_llms_sp_active && g->streaming && llms_prefill_route_short() && llms_prefill_route_on() && !llms_sped_on) {   /* llms SP_RPOL (llms SP_ED: the listener applies it) */
+        if (!((!ds4_gpu_commands_active() || ds4_gpu_end_commands()) && ds4_gpu_begin_commands() && llms_prefill_route_apply(m, l, il, b, count))) { fprintf(stderr, "llms prefill route short: failed layer %u\n", il); return false; }
+        g_llms_prefill_route_short_calls++;
+    }
+    const bool llms_bp = !llms_bp2 && (g_llms_stream_rows || (g_llms_sp_active && llms_bp_sp())) && g->streaming && il + 1u < DS4_N_LAYER   /* 00:3x: the old after-MoE prefetch is OFF whenever BP2 is set (it ran inside every verify and, with PFU, piled up unguarded tickets -> agent hang) */ && !g->image_count && count <= DS4_TP_BATCH_MAX_ROWS &&
+        llms_bp_ready() && l[1].ffn_gate_inp && l[1].ffn_exp_probs_b;
+    if (llms_bp && (!ds41_matmul_batch(g_llms_bp_logits, m, l[1].ffn_gate_inp, b->norm, count, false) ||
+        !ds4_gpu_router_select_batch_tensor(g_llms_bp_sel, g_llms_bp_weights, g_llms_bp_probs, m->map, m->size,
+            l[1].ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false, g_llms_bp_logits, g->prefill_tokens,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, count))) { fprintf(stderr, "llms batch prefetch: lookahead failed layer %u\n", il); return false; }
+    static int llms_bsas = -1; if (llms_bsas < 0) llms_bsas = getenv("LLMS_DS4_BATCH_SAS") != NULL;   /* llms BATCH_SAS */
+    const bool astra_ed_sas = llms_sped_on && llms_astra_bsas_on();
+    const bool llms_bsas_on = !astra_ed_sas && llms_bsas && g_llms_stream_rows && g->streaming && !shared_owner;
+    if (llms_bsas_on) { g_llms_bsas.g = g; g_llms_bsas.m = m; g_llms_bsas.l = l; g_llms_bsas.count = count; g_llms_bsas.done = 0; g_llms_bsas.ok = 1;
+        ds4_gpu_llms_set_after_union_read(llms_bsas_cb, NULL); }
+    const bool llms_bsas_ok = !llms_bsas_on || true;
+    (void)llms_bsas_ok;
+    return
+        ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) || llms_bsas_on || astra_ed_sas ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
         ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
             count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
-        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
+        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true) ||
+         (fprintf(stderr, "llms moe_batch fail: shared layer %u\n", il), false))) &&
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         (!balance_shared || ds4_gpu_dsv41_shared_mask(b->shared, b->selected,
             DS4_N_EMBD, count, DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank, il & 1u)) &&
@@ -42132,29 +43965,107 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank * (DS4_N_EXPERT / 2u),
             DS4_N_EXPERT / 2u, DS4_SWIGLU_CLAMP_EXP, b->norm, il, count, &mid_f16) :
 #endif
+        (llms_sped_on ? llms_sped_routed(g, m, l, b, il, count, gate_row, down_row, &mid_f16, astra_ed_sas) :   /* llms SP_ED */
         ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
-            il, count, &mid_f16, !g->verify_prefix)) &&
+            il, count, &mid_f16, !((g_llms_stream_rows && g->streaming) || g->verify_prefix)) || (fprintf(stderr, "llms moe_batch fail: routed_moe_batch_tensor layer %u\n", il), false))) &&
+        (!llms_bp || llms_bp_issue(m, l + 1, il + 1u, count)) &&
+        (!llms_bsas_on || llms_bsas_finish()) &&
         (!shared_owner || (!balance_shared && g->tp_rank != (il & 1u)) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
 }
 
+static double g_llms_alt1_acc[2]; static uint32_t g_llms_alt1_cnt[2];   /* llms ALT1 (apply_alt1.py) */
+static void llms_alt1_report(void) {
+    const double e = g_llms_alt1_cnt[0] ? g_llms_alt1_acc[0] * 1e3 / g_llms_alt1_cnt[0] : 0.0, o = g_llms_alt1_cnt[1] ? g_llms_alt1_acc[1] * 1e3 / g_llms_alt1_cnt[1] : 0.0;
+    fprintf(stderr, "llms alt1: even steps (ALT names on) %u, mean %.3f ms; odd steps (ALT names off) %u, mean %.3f ms; odd / even %.4f\n",
+            g_llms_alt1_cnt[0], e, g_llms_alt1_cnt[1], o, e > 0.0 ? o / e : 0.0);
+}
+int ds4_gpu_llms_commit_close(void);   /* llms EARLY_COMMIT */
+uint64_t ds4_gpu_llms_eng_gate(void); void ds4_gpu_llms_eng_release(uint64_t v);   /* llms ENG_SPLIT */
+uint64_t ds4_gpu_llms_eng_reserve(void); int ds4_gpu_llms_eng_gate_v(uint64_t v);   /* llms BOUNDARY */
+#include <dispatch/dispatch.h>
+static uint64_t g_llms_eas_race, g_llms_eas_fail;   /* llms EAS_FIX: dispatches that met the layer-14 swap; failed reads / uploads */
+static int g_llms_eas_delay_us = -1, g_llms_eas_old;   /* llms EAS_FIX canaries: LLMS_DS4_EAS_DELAY_US, LLMS_DS4_EAS_OLD */
+static int g_llms_dsp_one_cap;   /* llms DSP41_ADAPT: this one-token step captures its layer 37-39 streams into the prompt-capture ring */
+static bool llms_dsp_pc_rows(const ds4_gpu_tensor *res, uint32_t il, uint32_t row0, uint32_t n, uint32_t pos0);
+void ds4_gpu_llms_q8_guard(int on);   /* llms Q8_FORBID */
+void ds4_gpu_llms_set_step(uint32_t step);   /* llms MDUP */
+static DS4_MAYBE_UNUSED bool ds41_graph_step_q8inner(ds41_gpu_graph *g, const ds4_model *m,
+                                             const ds4_weights *w, int token, float *logits);
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
+                                             const ds4_weights *w, int token, float *logits) {   /* llms Q8_FORBID: the guard around the one-token step */
+    ds4_gpu_llms_q8_guard(1); llms_lag_step_begin(1u); const bool ok = ds41_graph_step_q8inner(g, m, w, token, logits); llms_lag_step_end(); ds4_gpu_llms_q8_guard(0); return ok; }   /* llms LAG */
+static DS4_MAYBE_UNUSED bool ds41_graph_step_q8inner(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    {   /* llms ALT1: the one-token step advances ALT's counter; entry-to-entry wall time summed by parity */
+        static int a1 = -1; static uint32_t s1; static double tp;
+        if (a1 < 0) { const char *e = getenv("LLMS_DS4_ALT1"); a1 = e && *e && *e != '0'; if (a1) { fprintf(stderr, "llms: alt1 (ALT alternates per one-token step; per-parity step times at exit)\n"); atexit(llms_alt1_report); } }
+        if (a1) { const double now = now_sec(); if (tp > 0.0) { g_llms_alt1_acc[s1 & 1u] += now - tp; g_llms_alt1_cnt[s1 & 1u]++; } tp = now; ds4_gpu_llms_set_step(++s1); }
+    }
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
+    const bool llms_st = llms_st_on();   /* llms LLMS_DS4_STEP_TIMING */
+    double llms_t0 = llms_st ? now_sec() : 0.0, llms_ts = llms_t0, llms_t1;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
+    static int llms_ecm_k = -1; static uint64_t llms_ecm_steps, llms_ecm_commits;   /* llms EARLY_COMMIT (apply_early_commit.py) */
+    if (llms_ecm_k < 0) { const char *e = getenv("LLMS_DS4_EARLY_COMMIT"); llms_ecm_k = e && atoi(e) > 0 ? atoi(e) : 0;
+                          if (llms_ecm_k) { fprintf(stderr, "llms: early commit (layer 0, then every %d layers; Engram rows read while layer 0 runs)\n", llms_ecm_k);
+                                            atexit_b(^{ fprintf(stderr, "llms early commit: %llu steps, %llu commits\n", (unsigned long long)llms_ecm_steps, (unsigned long long)llms_ecm_commits); }); } }
+    const bool llms_ecm = llms_ecm_k > 0 && !ds4_gpu_llms_alt_off("ecm") && g->tp_world != 2 && !(g->streaming && g->quality) && !g->imatrix;
+    static int llms_esp_s = -1; static uint64_t llms_esp_steps;   /* llms ENG_SPLIT (apply_eng_split.py) */
+    if (llms_esp_s < 0) { const char *e = getenv("LLMS_DS4_ENG_SPLIT"); llms_esp_s = e && atoi(e) >= 1 && atoi(e) <= 13 ? atoi(e) : 0;
+                          if (llms_esp_s) { fprintf(stderr, "llms: eng split (one early commit after layer %d; the Engram read behind an event)\n", llms_esp_s);
+                                            atexit_b(^{ fprintf(stderr, "llms eng split: %llu steps\n", (unsigned long long)llms_esp_steps); }); } }
+    const bool llms_esp = llms_esp_s > 0 && !llms_ecm && !ds4_gpu_llms_alt_off("esp") && g->tp_world != 2 && !(g->streaming && g->quality) && !g->imatrix && !ds41_image_at(g, g->pos);
+    uint64_t llms_esp_v = 0;
+    if (llms_esp) llms_esp_steps++;
+    static int llms_eas_on = -1; static dispatch_queue_t llms_eas_q; static dispatch_group_t llms_eas_g; static uint64_t llms_eas_steps;   /* llms BOUNDARY: ENG_ASYNC */
+    static ds4_gpu_tensor *llms_eas_t14;
+    if (llms_eas_on < 0) { llms_eas_on = getenv("LLMS_DS4_ENG_ASYNC") != NULL && getenv("LLMS_DS4_ENG2") != NULL;
+                           if (llms_eas_on) { llms_eas_q = dispatch_queue_create("llms.eng", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+                                              llms_eas_g = dispatch_group_create(); fprintf(stderr, "llms: eng async (Engram rows read off the host thread, gated per layer)\n");
+                                              atexit_b(^{ fprintf(stderr, "llms eng async: %llu steps; %llu met the layer-14 pointer swap (the old code's stale-row race), %llu failed reads / uploads (EAS_FIX)\n", (unsigned long long)llms_eas_steps, (unsigned long long)g_llms_eas_race, (unsigned long long)g_llms_eas_fail); }); } }
+    if (llms_eas_on > 0) dispatch_group_wait(llms_eas_g, DISPATCH_TIME_FOREVER);   /* the previous step's block (rows reused) */
+    const bool llms_eas = llms_eas_on > 0 && !llms_ecm && !llms_esp && !ds4_gpu_llms_alt_off("eas") && g->tp_world != 2 && !(g->streaming && g->quality) && !g->imatrix && !ds41_image_at(g, g->pos);
+    uint64_t llms_eas_v1 = 0, llms_eas_v2 = 0;
+    if (llms_eas) {
+        if (!llms_eas_t14) llms_eas_t14 = ds4_gpu_tensor_alloc(sizeof(g->rows[1]));
+        llms_eas_v1 = ds4_gpu_llms_eng_reserve(); llms_eas_v2 = ds4_gpu_llms_eng_reserve();
+        if (!llms_eas_t14 || !llms_eas_v1 || !llms_eas_v2) return false;
+        llms_eas_steps++;
+        ds41_gpu_graph *eg = g; ds4_gpu_tensor *et14 = llms_eas_t14; const uint64_t ev1 = llms_eas_v1, ev2 = llms_eas_v2;
+        /* llms EAS_FIX (apply_eas_fix.py): the destination captured now (the host swaps g->engram_rows at layer 14), the ids copied */
+        ds4_gpu_tensor *er0 = g->engram_rows;
+        if (g_llms_eas_delay_us < 0) { const char *dl = getenv("LLMS_DS4_EAS_DELAY_US"), *od = getenv("LLMS_DS4_EAS_OLD"); g_llms_eas_delay_us = dl ? atoi(dl) : 0; g_llms_eas_old = od && *od && *od != '0'; }
+        struct { uint32_t v[2][DS4_ENGRAM_COLS]; } eids; memcpy(eids.v, ids, sizeof eids.v);
+        dispatch_group_async(llms_eas_g, llms_eas_q, ^{
+#ifdef __APPLE__
+            bool good = ds4_engram_read_batch(&eg->table[0], eids.v[0], 1, DS4_ENGRAM_COLS, eg->rows[0]);
+            if (g_llms_eas_delay_us > 0) usleep((useconds_t)g_llms_eas_delay_us);   /* canary: a late block (LLMS_DS4_EAS_DELAY_US) */
+            if (eg->engram_rows != er0) __atomic_add_fetch(&g_llms_eas_race, 1, __ATOMIC_RELAXED);   /* the old code wrote into layer 14's buffer here */
+            good = ds4_gpu_tensor_write(g_llms_eas_old ? eg->engram_rows : er0, 0, eg->rows[0], sizeof(eg->rows[0])) && good;   /* LLMS_DS4_EAS_OLD=1: the old destination (canary) */
+            ds4_gpu_llms_eng_release(ev1);
+            good = ds4_engram_read_batch(&eg->table[1], eids.v[1], 1, DS4_ENGRAM_COLS, eg->rows[1]) && good;
+            good = ds4_gpu_tensor_write(et14, 0, eg->rows[1], sizeof(eg->rows[1])) && good;
+            if (!good) __atomic_add_fetch(&g_llms_eas_fail, 1, __ATOMIC_RELAXED);
+#endif
+            ds4_gpu_llms_eng_release(ev2);
+        });
+    }
+    bool llms_ecm_rows = false;   /* the Engram rows of this step are read */
+    if (llms_ecm) llms_ecm_steps++;
     const bool overlap_engram = g->engram_reader && !ds41_image_at(g, g->pos) &&
         !getenv("DS4_DISABLE_V41_ENGRAM_OVERLAP");
     if (overlap_engram && !ds4_engram_reader_start(g->engram_reader,
             g->table, ids, &g->rows[0][0])) return false;
-    for (uint32_t i = 0; !overlap_engram && !ds41_image_at(g, g->pos) && i < 2; i++) {
+    for (uint32_t i = 0; !overlap_engram && !llms_ecm && !llms_esp && !llms_eas && !ds41_image_at(g, g->pos) && i < 2; i++) {   /* llms ENG_SPLIT / BOUNDARY: read later */
 #ifdef __APPLE__
         if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]))
             return false;
@@ -42162,36 +44073,90 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
 #endif
     }
+    if (llms_st) { llms_t1 = now_sec(); g_llms_st_ms[0] += (llms_t1 - llms_t0) * 1e3; llms_t0 = llms_t1; }
     const float initial_pre[] = {1, 0, 0, 0};
     bool ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
         ds4_gpu_begin_commands() && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
+    if (llms_st) { llms_t1 = now_sec(); g_llms_st_ms[1] += (llms_t1 - llms_t0) * 1e3; llms_t0 = llms_t1; }
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
+    static int llms_ql_env = -1; if (llms_ql_env < 0) llms_ql_env = getenv("LLMS_DS4_QUEUE_LAYERS") != NULL;   /* llms QUEUE_LAYERS: read once */
+    const bool llms_ql = llms_ql_env;
+    const bool queue_layers = (g->tp_world == 2 || llms_ql) && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        { static int llms_lta = -1; if (llms_lta < 0) { llms_lta = getenv("LLMS_DS4_LEDGER_LAYER") != NULL; if (llms_lta) fprintf(stderr, "llms: ledger layer tag (decode buffers tagged by the layer being encoded)\n"); } if (llms_lta) ds4_gpu_llms_set_ledger_tag(2, 0, il); }   /* llms LEDGER_LAYER: the plain decode loop's layer il */
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
+        static int llms_eng2 = -1; static ds4_gpu_tensor *llms_eng2_t; ds4_gpu_tensor *llms_eng_save = NULL;   /* llms ENG2 (apply_ed5.py) */
+        if (llms_eng2 < 0) { llms_eng2 = getenv("LLMS_DS4_ENG2") != NULL; if (llms_eng2) fprintf(stderr, "llms: eng2 (layer 14's Engram rows in their own buffer; no layer-13 drain)\n"); }
+        if (ok && llms_ecm && !llms_ecm_rows && il >= 1u) {   /* llms EARLY_COMMIT: layer 0 is committed and running; read the rows now */
+            llms_ecm_rows = true;
+            for (uint32_t i = 0; ok && !ds41_image_at(g, g->pos) && i < 2; i++) {
+#ifdef __APPLE__
+                if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i])) ok = false;
+#else
+                if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) ok = false;
+#endif
+            }
+        }
+        if (ok && llms_eas && ds41_engram_layer(il)) {   /* llms BOUNDARY: ENG_ASYNC gates; the block writes the rows */
+            if (il == 1u) { if (!ds4_gpu_llms_eng_gate_v(llms_eas_v1)) ok = false; }
+            else { if (!ds4_gpu_llms_eng_gate_v(llms_eas_v2)) ok = false; llms_eng_save = g->engram_rows; g->engram_rows = llms_eas_t14; }
+        } else
+        if (ok && llms_esp && il == 1u) {   /* llms ENG_SPLIT: gate layer 1's Engram kernel; its rows come after the commit */
+            llms_esp_v = ds4_gpu_llms_eng_gate(); if (!llms_esp_v) ok = false;
+        } else
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
+            if (llms_eng2 && i == 1) {
+                if (!llms_eng2_t) llms_eng2_t = ds4_gpu_tensor_alloc(sizeof(g->rows[1]));
+                if (llms_eng2_t) { llms_eng_save = g->engram_rows; g->engram_rows = llms_eng2_t; }
+            }
             ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i)) &&
                 ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
-        if (ok) {
+        if (ok) {   /* llms NOP_PROBE: dependent tiny dispatches first (an instrument; off unless set) */
+            extern int ds4_gpu_llms_nop_probe(void); (void)ds4_gpu_llms_nop_probe();
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             ok = ds41_graph_decode_layer(g, m, l, il, token);
 #else
-            ok = ds41_graph_layer(g, m, l, il, token);
+            if (ok && g_llms_dsp_one_cap && il >= 37u && il <= 39u && ds4_gpu_commands_active())   /* llms DSP41_ADAPT */
+                ok = llms_dsp_pc_rows(g->residual, il, 0, 1, g->pos);
+            ok = ok && ds41_graph_layer(g, m, l, il, token);
 #endif
         }
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        if (llms_eng_save) { g->engram_rows = llms_eng_save; llms_eng_save = NULL; }   /* llms ENG2: the layer is encoded */
+        static int llms_hmg_on = -1; if (llms_hmg_on < 0) { llms_hmg_on = getenv("LLMS_DS4_HEAD_MERGE") != NULL; if (llms_hmg_on) fprintf(stderr, "llms: head merge (the head in the last chunk's buffer)\n"); }   /* llms BOUNDARY */
+        const bool llms_hmg = llms_hmg_on > 0 && logits && !layer_resident && g->tp_world != 2 && !g->imatrix && !ds4_gpu_llms_alt_off("hmg");
+        const bool drain = !queue_layers || (il == 13 && !(llms_eng2 > 0 && llms_eng2_t) && !llms_eas) || (il + 1u == DS4_N_LAYER && !llms_hmg);   /* llms ENG2: no layer-13 drain; llms BOUNDARY: HEAD_MERGE; ENG_ASYNC owns layer 14's rows (no drain) */
+        if (ok && llms_esp && il == (uint32_t)llms_esp_s) {   /* llms ENG_SPLIT: commit layers 0..S, then read the rows and open the gate */
+            if (!ds4_gpu_llms_commit_close() || !ds4_gpu_begin_commands()) ok = false;
+            for (uint32_t i = 0; ok && i < 2; i++) {
+#ifdef __APPLE__
+                if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i])) ok = false;
+#else
+                if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) ok = false;
+#endif
+            }
+            if (ok) ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[0], sizeof(g->rows[0]));
+            ds4_gpu_llms_eng_release(llms_esp_v);   /* released even on failure: the GPU must not wait forever */
+        }
+        if (ok && llms_ecm && !drain && (il == 0u || ((il + 1u) % (uint32_t)llms_ecm_k) == 0u)) {   /* llms EARLY_COMMIT: commit, no wait */
+            if (!ds4_gpu_llms_commit_close() || !ds4_gpu_begin_commands()) ok = false; else llms_ecm_commits++;
+        }
+        if (llms_st) llms_t0 = now_sec();
         if (drain && !ds4_gpu_end_commands()) ok = false;
+        if (llms_st) { llms_t1 = now_sec(); g_llms_st_ms[5] += (llms_t1 - llms_t0) * 1e3; llms_t0 = llms_t1; }
+        if (ok && drain && llms_dump_pos() == (long)g->pos)   /* llms LLMS_DS4_DUMP_POS (decode) */
+            llms_dump_rec(il, g->residual, g->after_attn, g->route_probs, g->selected, 0, g->route_weights, 0);
+        if (ok && drain && llms_dump_pos() == (long)g->pos) llms_dump_ops(il, g->qr, g->q, g->kv, g->heads, g->low, g->x, g->norm);
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
@@ -42199,17 +44164,35 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
+        if (llms_st) { llms_t1 = now_sec(); g_llms_st_ms[6] += (llms_t1 - llms_t0) * 1e3; llms_t0 = llms_t1; }
     }
-    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    { static int llms_ltb = -1; if (llms_ltb < 0) { llms_ltb = getenv("LLMS_DS4_LEDGER_LAYER") != NULL;  } if (llms_ltb) ds4_gpu_llms_set_ledger_tag(2, 0, 40); }   /* llms LEDGER_LAYER: after the plain loop: the head */
+    {   /* llms BOUNDARY: HEAD_MERGE keeps the batch open for the head */
+        const bool llms_hmg_now = getenv("LLMS_DS4_HEAD_MERGE") != NULL && logits && !layer_resident && g->tp_world != 2 && !g->imatrix && !ds4_gpu_llms_alt_off("hmg");
+        if (!llms_hmg_now && ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    }
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
+    const uint64_t llms_eas_fail0 = __atomic_load_n(&g_llms_eas_fail, __ATOMIC_RELAXED);   /* llms EAS_FIX */
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    { static int llms_ltc = -1; if (llms_ltc < 0) { llms_ltc = getenv("LLMS_DS4_LEDGER_LAYER") != NULL;  } if (llms_ltc) ds4_gpu_llms_set_ledger_tag(2, 2, 42); }   /* llms LEDGER_LAYER: after the head: readback, sampling, accept */
+    if (ok && llms_eas && logits && __atomic_load_n(&g_llms_eas_fail, __ATOMIC_RELAXED) != llms_eas_fail0) ok = false;   /* llms EAS_FIX: the block's read or upload failed */
+    if (llms_st) { llms_t1 = now_sec(); g_llms_st_ms[7] += (llms_t1 - llms_t0) * 1e3; g_llms_st_ms[8] += (llms_t1 - llms_ts) * 1e3; g_llms_st_steps++;
+        if (g_llms_st_log) { double s, b; ds4_gpu_llms_stream_timing(&s, &b);
+            const uint64_t mi = ds4_gpu_llms_stream_misses();
+            static const char *llms_altcol = (const char *)1; if (llms_altcol == (const char *)1) { llms_altcol = getenv("LLMS_DS4_STEP_ALTCOL"); if (llms_altcol && !*llms_altcol) llms_altcol = NULL; }   /* llms ED_LA5 */
+            fprintf(g_llms_st_log, "%.6f %.3f %.3f %.3f %llu %u %d\n", llms_t1, (llms_t1 - llms_ts) * 1e3, s - g_llms_st_sync0, b - g_llms_st_bind0,
+                    (unsigned long long)(mi - g_llms_st_miss0), (unsigned)g->pos, llms_altcol ? !ds4_gpu_llms_alt_off(llms_altcol) : -1);
+            fflush(g_llms_st_log); g_llms_st_sync0 = s; g_llms_st_bind0 = b; g_llms_st_miss0 = mi; } }
     /* Even a failed GPU layer must finish the reader before this graph (or
      * a borrowed row graph) can leave scope or reuse its host output rows. */
     if (overlap_engram && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
     if (!ok) {
         g->valid = false;
         return false;
+    }
+    {   /* llms KB_AUTO: the step's wall time to the filler controller (off unless set) */
+        extern void ds4_gpu_llms_kb_auto_step(double step_ms); ds4_gpu_llms_kb_auto_step((now_sec() - llms_ts) * 1e3);
     }
     g->history = next_history;
     g->pos++;
@@ -42218,6 +44201,26 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
  * routes take precedence over the rest of the prompt's popular experts. */
+/* llms PREFILL_DONTNEED (apply_prefill_dontneed.py): advise a finished prefill layer's spans away */
+static uint64_t g_llms_pdn_bytes, g_llms_pdn_calls; static double g_llms_pdn_ms;
+static void llms_pdn_report(void) { fprintf(stderr, "llms prefill dontneed: %llu layers, %.2f GiB advised, %.1f ms\n", (unsigned long long)g_llms_pdn_calls, (double)g_llms_pdn_bytes / 1073741824.0, g_llms_pdn_ms); }
+static int llms_prefill_dontneed(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_PREFILL_DONTNEED"); on = e && *e && *e != '0';
+                  if (on) { fprintf(stderr, "llms: prefill DONTNEED -- each finished layer's model spans advised away\n"); atexit(llms_pdn_report); } }
+    return on;
+}
+static void llms_prefill_dontneed_layer(const ds4_model *m, const ds4_weights *w, uint32_t il) {
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_spans(w, il, il, false, &spans)) return;
+    const double t0 = now_sec(); const uint64_t page = (uint64_t)getpagesize();
+    for (uint32_t i = 0; i < spans.len; i++) {
+        const uint64_t lo = spans.v[i].off & ~(page - 1u), hi = spans.v[i].end;
+        if (hi <= lo || hi > m->size) continue;
+        if (posix_madvise((void *)((const uint8_t *)m->map + lo), (size_t)(hi - lo), POSIX_MADV_DONTNEED) == 0) g_llms_pdn_bytes += hi - lo;
+    }
+    free(spans.v); g_llms_pdn_calls++; g_llms_pdn_ms += (now_sec() - t0) * 1000.0;
+}
 static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -42548,7 +44551,37 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
  * frontiers, so the caller must rebuild from its retained token history. */
-static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
+/* llms DSP41_PROMPT (apply_dsp41_prompt.py): prefill rows' HC streams entering layers 37-39, by position % 128 */
+static ds4_gpu_tensor *g_llms_dsp_pc; static uint32_t g_llms_dsp_pc_lo, g_llms_dsp_pc_hi; static uint64_t g_llms_dsp_pc_rows, g_llms_dsp_pc_fills;
+static int llms_dsp_pc_wanted(void) {
+    static int w = -1;
+    if (w < 0) { const char *p = getenv("LLMS_DS4_DSP41"); w = p && *p && strcmp(p, "0") != 0 && !getenv("LLMS_DS4_DSP41_NOPROMPT"); }
+    return w;
+}
+static bool llms_dsp_pc_rows(const ds4_gpu_tensor *res, uint32_t il, uint32_t row0, uint32_t n, uint32_t pos0) {   /* inside an open batch */
+    if (!g_llms_dsp_pc) { g_llms_dsp_pc = ds4_gpu_tensor_alloc(3ull * 128u * DS4_N_HC * DS4_N_EMBD * sizeof(float)); if (!g_llms_dsp_pc) return false; }
+    const uint64_t rb = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < n;) {
+        const uint32_t slot = (pos0 + i) % 128u, run = n - i < 128u - slot ? n - i : 128u - slot;
+        ok = ds4_gpu_tensor_copy(g_llms_dsp_pc, ((uint64_t)(il - 37u) * 128u + slot) * rb, res, (uint64_t)(row0 + i) * rb, (uint64_t)run * rb) != 0;
+        i += run;
+    }
+    if (ok && il == 39u) {   /* all three layers of these positions are in: extend or restart the contiguous range */
+        if (pos0 != g_llms_dsp_pc_hi || g_llms_dsp_pc_hi == 0) g_llms_dsp_pc_lo = pos0;
+        g_llms_dsp_pc_hi = pos0 + n;
+        if (g_llms_dsp_pc_hi - g_llms_dsp_pc_lo > 128u) g_llms_dsp_pc_lo = g_llms_dsp_pc_hi - 128u;
+        g_llms_dsp_pc_rows += n;
+    }
+    return ok;
+}
+static bool ds41_graph_prefill_sweep_tlimpl(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t total_count, ds4_session_progress_fn progress, void *progress_ud, int total, ds4_session_cancel_fn cancel, void *cancel_ud, bool encoder_only, bool resume_encoder);
+void ds4_gpu_llms_tl_phase(uint32_t phase, uint32_t pos, uint32_t rows); uint32_t ds4_gpu_llms_tl_phase_get(uint32_t *pos, uint32_t *rows);   /* llms TL_PHASE (apply_tl_phase.py) */
+static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t total_count, ds4_session_progress_fn progress, void *progress_ud, int total, ds4_session_cancel_fn cancel, void *cancel_ud, bool encoder_only, bool resume_encoder) {   /* llms TL_PHASE wrapper: phase 3 */
+    uint32_t tl_pos, tl_rows; const uint32_t tl_ph = ds4_gpu_llms_tl_phase_get(&tl_pos, &tl_rows); ds4_gpu_llms_tl_phase(3u, (uint32_t)(g->pos), (uint32_t)(total_count));
+    const bool tl_ok = ds41_graph_prefill_sweep_tlimpl(g, m, w, tokens, total_count, progress, progress_ud, total, cancel, cancel_ud, encoder_only, resume_encoder); ds4_gpu_llms_tl_phase(tl_ph, tl_pos, tl_rows); return tl_ok;
+}
+static bool ds41_graph_prefill_sweep_tlimpl(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t total_count,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
@@ -42750,9 +44783,23 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds4_gpu_tensor_copy(g->batch.engram_rows, 0, g->engram_prefetch,
                                          off * bytes, count * bytes) != 0;
             }
+            {   /* llms DSP41_PROMPT: the last 128 positions' streams entering layers 37-39 (before this layer runs; batch_hc keeps them in batch.residual) */
+                const uint32_t w0 = initial_start + total_count > 128u ? initial_start + total_count - 128u : 0u;
+                if (ok && batch_hc && il >= 37u && il <= 39u && llms_dsp_pc_wanted() && start + count > w0) {
+                    const uint32_t r0 = w0 > start ? w0 - start : 0u;
+                    ok = llms_dsp_pc_rows(g->batch.residual, il, r0, count - r0, start + r0);
+                }
+            }
             if (ok && batch_hc)
                 ok = ds41_dspark_capture(g->dspark, il, start, active.residual, count) &&
                     ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+                if (ok && il <= 1u && llms_dump_pos() >= (long)start && llms_dump_pos() < (long)(start + count)) {   /* llms DUMP_IN (prefill) */
+                    const uint32_t tt = (uint32_t)(llms_dump_pos() - (long)start);
+                    ok = ds4_gpu_end_commands() != 0;
+                    if (ok) llms_dump_in(il, g->rows_view[tt].residual, g->rows_view[tt].mix, g->rows_view[tt].attn_split, g->rows_view[tt].pre,
+                                         g->rows_view[tt].x, g->rows_view[tt].norm);
+                    if (ok) ok = ds4_gpu_begin_commands() != 0;
+                }
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -42773,7 +44820,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_USE_ATTN_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_ATTN_ROW)
 #undef DS41_USE_ATTN_ROW
-                    ok = ds41_attention(&row, m, l, il, true);
+                    ok = ds41_attention(&row, m, l, il, true, false);
                 }
                 DS41_STAGE("attention core/index");
                 if (ok && g->tp_world == 2) {
@@ -42813,7 +44860,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
-                    ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
+                    ok = ds4_gpu_llms_owed_force(-1) &&   /* llms HC_OWED: the FFN split's layer-end consumer */
+                        ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                             active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
@@ -42836,10 +44884,29 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
+            if (ok && llms_dump_pos() >= (long)start && llms_dump_pos() < (long)(start + count)) {   /* llms LLMS_DS4_DUMP_POS (prefill) */
+                const uint32_t t = (uint32_t)(llms_dump_pos() - (long)start);
+                llms_dump_rec(il, g->rows_view[t].residual, g->rows_view[t].after_attn, g->rows_view[t].route_probs,
+                              g->batch.selected, (uint64_t)t * DS4_N_EXPERT_USED * 4u, g->batch.route_weights, (uint64_t)t * DS4_N_EXPERT_USED * 4u);
+                llms_dump_ops(il, g->rows_view[t].qr, g->rows_view[t].q, g->rows_view[t].kv, g->rows_view[t].heads, g->rows_view[t].low,
+                              g->rows_view[t].x, g->rows_view[t].norm);
+            }
+            if (ok && !encoder_only && il + 1u == DS4_N_LAYER && llms_ps_on()) {   /* llms LLMS_DS4_PREFILL_SCORE */
+                /* the output head / norm are static decode tensors, mapped by ds4 only after the sweep: map them now (same call) */
+                if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
+                for (uint32_t t = 0; ok && t < count; t++) {
+                    if (off + t + 1u >= total_count) continue;
+                    ok = llms_ps_score_row(g, m, w, g->rows_view[t].residual, g->rows_view[t].ffn_split, start + t, tokens[off + t + 1u]);
+                }
+                fflush(g_llms_ps_file);
+                /* restore this layer's prefill mapping (the seed below reads its expert ranges; 'model range 151.45 GiB not covered') */
+                if (ok && g->streaming && !metal_graph_stream_map_layer(m, w, il)) ok = false;
+            }
             if (ok && !encoder_only && off + count == total_count)
                 ok = ds41_prefill_seed(g, m, &w->layer[il], il, count);
             if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
                 !ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
+            if (ok && g->streaming && off + count == total_count && llms_prefill_dontneed()) llms_prefill_dontneed_layer(m, w, il);   /* llms PREFILL_DONTNEED */
             if (profile)
                 fprintf(stderr, "ds4: V4.1 prefill layer=%u pos=%u rows=%u encoder_resident=%u "
                         "map=%.3f engram=%.3f encode=%.3f drain=%.3f seed=%.3f ms\n",
@@ -42880,6 +44947,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     }
     g->pos = initial_start;
     if (ok) { g->pos += total_count; g->history = next_history; g->valid = !encoder_only; }
+    if (ok) llms_dump_window(g->window[0], g->pos);   /* llms LLMS_DS4_DUMP_WIN_PATH */
     return ok;
 }
 
@@ -42890,8 +44958,14 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
                                    total, cancel, cancel_ud, false, false);
 }
+static int llms_verify_one(void) {
+    static int v = -1; if (v < 0) { const char *e = getenv("LLMS_DS4_VERIFY_ONE"); v = e && *e && *e != '0';
+                                   { const char *d = getenv("LLMS_DS4_DSP41"); if (d && *d && strcmp(d, "0")) v = 1; }   /* llms DSP41: 1-row captured steps */
+                                   if (v) fprintf(stderr, "llms: verify one (PRICING: the batched step admits one row)\n"); }
+    return v;
+}
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
-    if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
+    if (!graphs || count < (llms_verify_one() ? 1 : 2) || count > DS4_TP_BATCH_MAX_ROWS) return NULL;   /* llms VERIFY_ONE */
     ds41_gpu_graph *largest = NULL;
     for (int i = 0; i < count; i++) {
         ds41_gpu_graph *g = graphs[i];
@@ -42922,8 +44996,39 @@ static bool ds41_cuda_row_batch_supported(const ds41_gpu_graph *g, const ds4_wei
 #endif
 }
 
+static unsigned long long g_llms_sp_calls, g_llms_sp_rows;   /* llms SHORT_PREFILL */
+static void llms_sp_report(void) { fprintf(stderr, "llms short prefill: %llu calls, %llu rows\n", g_llms_sp_calls, g_llms_sp_rows); }
+static unsigned long long g_llms_ced_aligned;   /* llms CED_ALIGN: short-prefill calls ended at the bounded replay's start */
+static void llms_ced_align_report(void) { fprintf(stderr, "llms ced align: %llu calls ended at the replay start\n", g_llms_ced_aligned); }
 static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weights *w,
                                         uint32_t remaining) {
+    {
+        static int sp = -1;   /* LLMS_DS4_SHORT_PREFILL=1 -> N 256; =N (N > 2) -> appends under N tokens */
+        if (sp < 0) { const char *e = getenv("LLMS_DS4_SHORT_PREFILL"); sp = e && *e && *e != '0' ? (atoi(e) > 2 ? atoi(e) : 256) : 0;
+                      if (sp) { fprintf(stderr, "llms: short prefill (appends of 2-%d tokens as causal rows of batched steps, <= %u rows)\n", sp - 1, ds4_gpu_llms_rows_max_public()); atexit(llms_sp_report); } }
+        static long sp_maxpos = -1;   /* llms SHORT_PREFILL_MAXPOS: the short path only while pos + remaining <= P (0 / unset: no cap) */
+        if (sp_maxpos < 0) { const char *e = getenv("LLMS_DS4_SHORT_PREFILL_MAXPOS"); sp_maxpos = e && *e ? atol(e) : 0; if (sp_maxpos > 0) fprintf(stderr, "llms: short prefill only up to position %ld\n", sp_maxpos); }
+        if (sp && g->tp_world == 1 && remaining >= 2u && remaining < (uint32_t)sp && !getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL") &&
+            (sp_maxpos <= 0 || (long)g->pos + (long)remaining <= sp_maxpos)) {
+            static int sp_rows = -1;   /* llms SP_ROWS: rows per short-prefill step (an instrument: the k-row step's cost; 0 = the runtime cap) */
+            if (sp_rows < 0) { const char *e = getenv("LLMS_DS4_SP_ROWS"); sp_rows = e && *e ? atoi(e) : 0; if (sp_rows > 0) fprintf(stderr, "llms: short prefill steps of %d rows\n", sp_rows); }
+            uint32_t cap = ds4_gpu_llms_rows_max_public(); if (sp_rows >= 2 && (uint32_t)sp_rows < cap) cap = (uint32_t)sp_rows;
+            uint32_t n = remaining < cap ? remaining : cap;
+            {
+
+
+
+                static int al = -1;
+                if (al < 0) { const char *e = getenv("LLMS_DS4_CED_ALIGN"); al = e && *e && *e != '0';
+                              if (al) { fprintf(stderr, "llms: ced align (short-prefill calls end at the bounded replay's start)\n"); atexit(llms_ced_align_report); } }
+                if (al && llms_ced_sp() == 2 && g_llms_ced_end > g_llms_ced_brlen && !ds4_gpu_llms_alt_off("cedal")) {
+                    const uint32_t s = g_llms_ced_end - g_llms_ced_brlen, p = (uint32_t)g->pos;
+                    if (p < s && s < p + n && s - p >= 2u) { n = s - p; g_llms_ced_aligned++; }
+                }
+            }
+            g_llms_sp_calls++; g_llms_sp_rows += n; return n;
+        }
+    }
     if (remaining < 2u || remaining >= 256u ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL") || !ds41_cuda_row_batch_supported(g, w))
         return 0;
@@ -42932,17 +45037,1349 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
 }
 
+
+/* llms LLMS_DS4_ENGRAM_PAR: the batched step's Engram table reads in parallel (see apply_ds4_engram_par.py) */
+static struct {
+    uint32_t ids[DS4_TP_BATCH_MAX_ROWS][2][DS4_ENGRAM_COLS];
+    ds41_gpu_graph *graph[DS4_TP_BATCH_MAX_ROWS];
+    float (*dst[DS4_TP_BATCH_MAX_ROWS])[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
+    int swap, failed; uint64_t steps; double ms;
+} g_llms_epar;
+static void llms_engram_par_report(void) { fprintf(stderr, "llms engram par: %llu steps, %.1f ms in the read phase\n", (unsigned long long)g_llms_epar.steps, g_llms_epar.ms); }
+static int llms_engram_par(void) {   /* 0 off, 1 on, 2 canary (tables swapped) */
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("LLMS_DS4_ENGRAM_PAR");
+        mode = !(e && *e) || *e == '0' ? 0 : (!strcmp(e, "canary") ? 2 : 1);
+        if (mode) { fprintf(stderr, "llms: Engram table reads in parallel%s\n", mode == 2 ? " (CANARY: tables swapped)" : ""); atexit(llms_engram_par_report); }
+    }
+    return mode;
+}
+static void llms_engram_par_job(void *vctx, size_t k) {
+    (void)vctx;
+    const size_t i = k / 2u; const unsigned table = (unsigned)(k % 2u), src = g_llms_epar.swap ? 1u - table : table;
+    if (!ds4_engram_read(&g_llms_epar.graph[i]->table[src], g_llms_epar.ids[i][src], DS4_ENGRAM_COLS, g_llms_epar.dst[i][table]))
+        __atomic_store_n(&g_llms_epar.failed, 1, __ATOMIC_RELEASE);
+}
+/* llms ENGRAM_ASYNC (apply_ds4_engram_async.py): the decode step's Engram reads are queued and the step goes on; a table is joined where it is used */
+static struct { dispatch_group_t grp[2]; dispatch_queue_t q; int pending[2]; uint64_t steps, blocked; double join_ms; } g_llms_easync;
+static void llms_engram_async_report(void) { fprintf(stderr, "llms engram async: %llu steps, %llu joins that had to wait, %.1f ms blocked in them\n",
+    (unsigned long long)g_llms_easync.steps, (unsigned long long)g_llms_easync.blocked, g_llms_easync.join_ms); }
+static int llms_engram_async(void) {   /* 0 off, 1 on, 2 canary (tables swapped) */
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("LLMS_DS4_ENGRAM_ASYNC");
+        mode = !(e && *e) || *e == '0' ? 0 : (!strcmp(e, "canary") ? 2 : 1);
+        if (mode) { fprintf(stderr, "llms: Engram table reads beside the step's first layers%s\n", mode == 2 ? " (CANARY: tables swapped)" : ""); atexit(llms_engram_async_report); }
+    }
+    return mode;
+}
+static void llms_engram_async_job(void *ctx) {
+    const size_t k = (size_t)(uintptr_t)ctx, part = k % 3u, it = k / 3u, i = it / 2u, per = DS4_ENGRAM_COLS / 3u;
+    const unsigned table = (unsigned)(it % 2u), src = g_llms_epar.swap ? 1u - table : table;
+    if (!ds4_engram_read(&g_llms_epar.graph[i]->table[src], g_llms_epar.ids[i][src] + part * per, per, g_llms_epar.dst[i][table] + part * per * DS4_ENGRAM_DIM))
+        __atomic_store_n(&g_llms_epar.failed, 1, __ATOMIC_RELEASE);
+}
+/* llms ENGRAM_RA (apply_ds4_engram_ra.py): the rows advised (F_RDADVISE on a cached descriptor) at the issue point and copied out of a
+ * read-only mapping at the join -- no reader threads */
+static struct { int fdc[2]; const uint8_t *map[2]; uint64_t moff[2], mlen[2]; int pending[2]; unsigned src[2]; int count;
+                uint64_t steps, advised, rows_copied, failed; double advise_ms, copy_ms; } g_llms_era = {{-1, -1}};
+static void llms_engram_ra_report(void) { fprintf(stderr, "llms engram ra: %llu steps, %llu rows advised in %.1f ms, %llu rows copied in %.1f ms, %llu failures\n",
+    (unsigned long long)g_llms_era.steps, (unsigned long long)g_llms_era.advised, g_llms_era.advise_ms, (unsigned long long)g_llms_era.rows_copied, g_llms_era.copy_ms, (unsigned long long)g_llms_era.failed); }
+
+static struct { dispatch_queue_t q; dispatch_group_t grp[2]; int async[2]; uint64_t steps, waits; double bg_ms, wait_ms; } g_llms_era2;
+static void llms_engram_ra2_report(void) { fprintf(stderr, "llms engram ra2: %llu steps advised in the background (%.1f ms there), %llu joins that had to wait, %.1f ms blocked in them\n",
+    (unsigned long long)g_llms_era2.steps, g_llms_era2.bg_ms, (unsigned long long)g_llms_era2.waits, g_llms_era2.wait_ms); }
+static int llms_engram_ra2(void) {
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("LLMS_DS4_ENGRAM_RA2"); mode = e && *e && *e != '0';
+                    if (mode) { g_llms_era2.q = dispatch_queue_create("llms.engram.ra2", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+                                g_llms_era2.grp[0] = dispatch_group_create(); g_llms_era2.grp[1] = dispatch_group_create();
+                                fprintf(stderr, "llms: Engram advisories on a background queue (exact; ALT era2)\n"); atexit(llms_engram_ra2_report); } }
+    return mode;
+}
+static int llms_engram_ra(void) {   /* 0 off, 1 on, 2 canary (tables swapped) */
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("LLMS_DS4_ENGRAM_RA");
+        mode = !(e && *e) || *e == '0' ? 0 : (!strcmp(e, "canary") ? 2 : 1);
+        if (mode) { fprintf(stderr, "llms: Engram rows advised and copied from a mapping, no reader threads%s\n", mode == 2 ? " (CANARY: tables swapped)" : ""); atexit(llms_engram_ra_report); }
+    }
+    return mode;
+}
+static bool llms_engram_ra_map(const ds4_engram_table *t, unsigned k) {   /* table k mapped once; every session's table k is this file region */
+    if (g_llms_era.map[k]) return true;
+    char path[PATH_MAX];
+    if (t->fd < 0 || fcntl(t->fd, F_GETPATH, path) != 0) return false;
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    (void)fcntl(fd, F_RDAHEAD, 0);
+    const uint64_t pg = 16384u, m0 = t->offset & ~(pg - 1u), m1 = (t->offset + (uint64_t)t->rows * DS4_ENGRAM_ROW_BYTES + pg - 1u) & ~(pg - 1u);
+    void *mp = mmap(NULL, (size_t)(m1 - m0), PROT_READ, MAP_SHARED, fd, (off_t)m0);
+    if (mp == MAP_FAILED) { close(fd); return false; }
+    (void)madvise(mp, (size_t)(m1 - m0), MADV_RANDOM);
+    g_llms_era.fdc[k] = fd; g_llms_era.map[k] = (const uint8_t *)mp; g_llms_era.moff[k] = m0; g_llms_era.mlen[k] = m1 - m0;
+    return true;
+}
+static bool llms_engram_join(unsigned table) {   /* true when the table's rows are in place */
+    if (table <= 1u && g_llms_era.pending[table]) {   /* llms ENGRAM_RA: copy and decode out of the mapping */
+        if (g_llms_era2.async[table]) {   /* llms ENGRAM_RA2: the background advisories of this table first */
+            if (dispatch_group_wait(g_llms_era2.grp[table], DISPATCH_TIME_NOW) != 0) { const double tw = now_sec(); dispatch_group_wait(g_llms_era2.grp[table], DISPATCH_TIME_FOREVER);
+                g_llms_era2.wait_ms += (now_sec() - tw) * 1e3; g_llms_era2.waits++; }
+            g_llms_era2.async[table] = 0; }
+        const double t0 = now_sec(); const unsigned src = g_llms_era.src[table]; bool ok = true;
+        for (int i = 0; ok && i < g_llms_era.count; i++)
+            ok = ds4_engram_read_mapped(&g_llms_epar.graph[i]->table[src], g_llms_era.map[src], g_llms_era.moff[src], g_llms_epar.ids[i][src], DS4_ENGRAM_COLS, g_llms_epar.dst[i][table]);
+        g_llms_era.copy_ms += (now_sec() - t0) * 1e3; g_llms_era.rows_copied += (uint64_t)g_llms_era.count * DS4_ENGRAM_COLS;
+        g_llms_era.pending[table] = 0;
+        if (!ok) g_llms_era.failed++;
+        return ok;
+    }
+    if (table > 1u || !g_llms_easync.pending[table]) return true;
+    if (dispatch_group_wait(g_llms_easync.grp[table], DISPATCH_TIME_NOW) != 0) {
+        const double t0 = now_sec();
+        dispatch_group_wait(g_llms_easync.grp[table], DISPATCH_TIME_FOREVER);
+        g_llms_easync.join_ms += (now_sec() - t0) * 1e3; g_llms_easync.blocked++;
+    }
+    g_llms_easync.pending[table] = 0;
+    return !__atomic_load_n(&g_llms_epar.failed, __ATOMIC_ACQUIRE);
+}
+static int g_llms_pipe_grp;                            /* which pipeline group P2 is working for (set by the driver) */
+static int g_llms_pipe_ng = 2;                         /* llms PIPE_GROUPS: groups of the running pipeline (set by the driver) */
+#define LLMS_CX_MID_CHUNK 96u
+#define LLMS_CX_DOWN_CHUNK 128u
+static float silu(float x);
+/* Called by P2 before the GPU routed-MoE call: pick the pairs and start the CPU job. Returns the number of pairs (0: nothing to do). */
+/* After the GPU call (its cache preparation has read the real ids): the routed kernels skip slots whose id is negative. */
+/* Before the group's buffer is committed: wait for the job and add its rows into the group's 'shared' rows. */
+static int llms_price_skip(int bit) {   /* llms LLMS_DS4_PRICE_SKIP: pricing instrument, wrong outputs */
+    static int mask = -1;
+    if (mask < 0) { const char *e = getenv("LLMS_DS4_PRICE_SKIP"); mask = (e && *e) ? atoi(e) : 0;
+                    if (mask) fprintf(stderr, "llms: PRICE_SKIP mask %d -- these classes of the pipelined step are NOT computed (pricing instrument)\n", mask); }
+    return (mask & bit) != 0;
+}
+static uint32_t llms_moe_rows_skip(uint32_t h) {   /* llms LLMS_DS4_MOE_ROWS_SKIP: pricing instrument, wrong outputs for the skipped rows */
+    static int k = -1;
+    if (k < 0) { const char *e = getenv("LLMS_DS4_MOE_ROWS_SKIP"); k = (e && *e) ? atoi(e) : 0; if (k < 0) k = 0;
+                 if (k) fprintf(stderr, "llms: routed MoE NOT computed for the last %d rows of each group (pricing instrument)\n", k); }
+    return (uint32_t)k < h ? (uint32_t)k : h - 1u;
+}
+static void **g_llms_hd;   /* the driver's two buffer handles while a pipelined step runs (ASYNC=2) */
+static bool llms_try_commit_all(void);
+static void llms_flush_pending(void);
+static int g_llms_async_step = -1, g_llms_async2_serial;   /* llms ASYNC2_SERIAL (apply_ds4_async2_serial.py): the mode of the running step; -1 outside a step */
+static int llms_pipe_async_env(void) {   /* llms LLMS_DS4_BATCH_ASYNC: 0 off, 1 commit at the end of each turn, 2 deferred commits */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_BATCH_ASYNC"); on = e && *e ? atoi(e) : 0; if (on < 0 || on > 2) on = 0;
+                  const char *sv = getenv("LLMS_DS4_ASYNC2_SERIAL"); g_llms_async2_serial = on == 2 && sv && *sv && *sv != '0';
+                  if (on) fprintf(stderr, "llms: batch pipe asynchronous loads on%s\n", on != 2 ? "" : g_llms_async2_serial ? " (deferred commits, serial tickets)" : " (deferred commits, concurrent loads)");
+                  if (on == 2) { ds4_gpu_llms_set_load_concurrent(g_llms_async2_serial ? 0 : 1); ds4_gpu_llms_set_flush_hook(llms_flush_pending); } }
+    return on;
+}
+static int llms_pipe_async(void) { return g_llms_async_step >= 0 ? g_llms_async_step : llms_pipe_async_env(); }
+static bool llms_try_commit_all(void) {   /* ASYNC=2: commit closed buffers whose tickets are complete, oldest first; never blocks */
+    void **hd = g_llms_hd;
+    if (!hd) return true;
+    int order[2] = {0, 1};
+    if (hd[0] && hd[1] && ds4_gpu_llms_pending_seq(hd[1]) < ds4_gpu_llms_pending_seq(hd[0])) { order[0] = 1; order[1] = 0; }
+    for (int k = 0; k < 2; k++) {
+        if (!hd[order[k]]) continue;
+        const int r = ds4_gpu_llms_try_commit_pending(hd[order[k]]);
+        if (r < 0) return false;
+        if (r == 0) break;
+    }
+    return true;
+}
+static void llms_flush_pending(void) {    /* ASYNC=2: commit everything pending, oldest first, waiting for tickets */
+    void **hd = g_llms_hd;
+    if (!hd) return;
+    int order[2] = {0, 1};
+    if (hd[0] && hd[1] && ds4_gpu_llms_pending_seq(hd[1]) < ds4_gpu_llms_pending_seq(hd[0])) { order[0] = 1; order[1] = 0; }
+    for (int k = 0; k < 2; k++) if (hd[order[k]]) (void)ds4_gpu_llms_commit_pending(hd[order[k]]);
+}
+static bool llms_commit_older(int grp) {  /* ASYNC=2: before waiting on this group's buffer, the other group's older pending one goes first */
+    void **hd = g_llms_hd;
+    if (!hd || !hd[grp] || !hd[1 - grp]) return true;
+    if (ds4_gpu_llms_pending_seq(hd[1 - grp]) < ds4_gpu_llms_pending_seq(hd[grp])) return ds4_gpu_llms_commit_pending(hd[1 - grp]) != 0;
+    return true;
+}
+/* llms LLMS_DS4_ROUTER_FIRST (apply_ds4_router_first.py): the shared expert in its own buffer after the router's. 1 on, 2 canary */
+static uint64_t g_llms_rf_bufs;
+static void llms_rf_report(void) { fprintf(stderr, "llms router first: %llu shared-expert buffers\n", (unsigned long long)g_llms_rf_bufs); }
+static int llms_router_first_env(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ROUTER_FIRST"); on = e && *e && *e != '0' ? (!strcmp(e, "canary") ? 2 : !strcmp(e, "one") ? 3 : 1) : 0;   /* llms PIPE_AUTO: 3 = only in a one-group step */
+                  if (on) { fprintf(stderr, on == 2 ? "llms: router first -- CANARY: the shared expert is not computed\n"
+                                                    : "llms: router first (the shared expert in its own buffer after the router's)\n"); atexit(llms_rf_report); } }
+    return on;
+}
+static int llms_router_first(void) { const int m = llms_router_first_env(); return m == 3 ? (g_llms_pipe_ng == 1) : m; }   /* llms PIPE_AUTO (apply_ds4_pipe_auto.py) */
+static int llms_shexp_pair(void) {   /* llms SHEXP_PAIR (apply_ds4_shexp_pair.py): 1 on, -1 canary */
+    static int on = -2;
+    if (on < -1) { const char *e = getenv("LLMS_DS4_SHEXP_PAIR"), *src = getenv("DS4_METAL_DENSE_SOURCE"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? -1 : 1;
+                   if (on && !(src && (llms_srckey(src, "dense_llms2p") != NULL || llms_srckey(src, "dense_llms2q") != NULL || llms_srckey(src, "dense_llms2r") != NULL))) { llms_strict_after(fprintf(stderr, "llms: LLMS_DS4_SHEXP_PAIR ignored: DS4_METAL_DENSE_SOURCE does not name dense_llms2p / 2q.metal\n"), LLMS_G_NAME); on = 0; }   /* 2q = 2p + the 32-token kernels */
+                   if (on) fprintf(stderr, on < 0 ? "llms: shexp pair -- CANARY: the shared mid halved (alpha 0.5)\n" : "llms: shexp pair (shared gate + up + SwiGLU in one dispatch)\n"); }
+    return on;
+}
+
+static uint64_t g_llms_shx_mask, g_llms_shx_skips; static uint32_t g_llms_shx_il = 64u;
+static bool llms_shared_expert_batch(ds41_prefill_row *b, const ds4_model *model, const ds4_layer_weights *l, uint32_t h) {
+    if (g_llms_shx_il < 64u && ((g_llms_shx_mask >> g_llms_shx_il) & 1ull)) { g_llms_shx_skips++; return ds4_gpu_tensor_fill_f32(b->shared, 0.0f, (uint64_t)h * DS4_N_EMBD) != 0; }   /* llms SHX */
+    if (llms_shexp_pair() && !ds4_gpu_llms_alt_off("shp") && h == 16u && l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0) {
+        if (ds4_gpu_llms_shexp_pair(b->shared_mid, model->map, model->size, l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                    DS4_N_EMBD, DS4_N_FF_EXP, b->norm, h, llms_shexp_pair() < 0 ? -DS4_SWIGLU_CLAMP_EXP : DS4_SWIGLU_CLAMP_EXP))
+            return ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, h, DS4_V41_BF16) &&
+                   ds41_matmul_batch(b->shared, model, l->ffn_down_shexp, b->shared_mid, h, true);
+    }
+    return ds41_matmul_batch(b->shared_gate, model, l->ffn_gate_shexp, b->norm, h, true) &&
+        ds41_matmul_batch(b->shared_up, model, l->ffn_up_shexp, b->norm, h, true) &&
+        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up, h * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, h, DS4_V41_BF16) &&
+        ds41_matmul_batch(b->shared, model, l->ffn_down_shexp, b->shared_mid, h, true);
+}
+/* llms ROUTE_PREDICT (apply_ds4_route_predict.py): instrument -- next-layer router on this layer's FFN input against the real selection */
+static ds4_gpu_tensor *g_llms_rp_t[2][2]; static FILE *g_llms_rp_f; static int g_llms_rp_on = -1; static int g_llms_rp_have[2][2];
+static uint64_t g_llms_rp_hist[7], g_llms_rp_step;
+static void llms_rp_report(void) {
+    uint64_t n = 0, s = 0; for (int k = 0; k <= 6; k++) { n += g_llms_rp_hist[k]; s += (uint64_t)k * g_llms_rp_hist[k]; }
+    fprintf(stderr, "llms route predict: %llu row-layers, mean overlap %.3f of 6; histogram 0..6: %llu %llu %llu %llu %llu %llu %llu\n",
+            (unsigned long long)n, n ? (double)s / n : 0.0, (unsigned long long)g_llms_rp_hist[0], (unsigned long long)g_llms_rp_hist[1],
+            (unsigned long long)g_llms_rp_hist[2], (unsigned long long)g_llms_rp_hist[3], (unsigned long long)g_llms_rp_hist[4],
+            (unsigned long long)g_llms_rp_hist[5], (unsigned long long)g_llms_rp_hist[6]);
+    if (g_llms_rp_f) fclose(g_llms_rp_f);
+}
+static int llms_rp_on(void) {
+    if (g_llms_rp_on < 0) { const char *e = getenv("LLMS_DS4_ROUTE_PREDICT"); g_llms_rp_on = e && *e;
+        if (g_llms_rp_on) { g_llms_rp_f = fopen(e, "wb"); fprintf(stderr, "llms: route predict instrument -> %s\n", e); atexit(llms_rp_report); } }
+    return g_llms_rp_on;
+}
+static void llms_rp_compare(const ds4_model *model, const ds4_layer_weights *l, uint32_t il, int grp, ds41_prefill_row *b, uint32_t h) {
+    const int par = (int)(il & 1u);
+    if (grp > 1 || !g_llms_rp_have[grp][par] || h > 16) return;
+    g_llms_rp_have[grp][par] = 0;
+    float lg[16 * DS4_N_EXPERT]; int32_t sel[16 * DS4_N_EXPERT_USED];
+    if (!ds4_gpu_tensor_read(g_llms_rp_t[grp][par], 0, lg, (uint64_t)h * DS4_N_EXPERT * sizeof(float)) ||
+        !ds4_gpu_tensor_read(b->selected, 0, sel, (uint64_t)h * DS4_N_EXPERT_USED * sizeof(int32_t))) return;
+    const float *bias = (const float *)((const char *)model->map + l->ffn_exp_probs_b->abs_offset);
+    for (uint32_t r = 0; r < h; r++) {
+        float sc[DS4_N_EXPERT]; int32_t pr[DS4_N_EXPERT_USED];
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) { const float x = lg[r * DS4_N_EXPERT + e]; const float sp = x > 20.0f ? x : log1pf(expf(x)); sc[e] = sqrtf(sp) + bias[e]; }
+        for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) { int best = -1; for (uint32_t e = 0; e < DS4_N_EXPERT; e++) if (best < 0 || sc[e] > sc[best]) best = (int)e; pr[k] = best; sc[best] = -1e30f; }
+        int ov = 0; for (uint32_t a = 0; a < DS4_N_EXPERT_USED; a++) for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) if (pr[k] == sel[r * DS4_N_EXPERT_USED + a]) { ov++; break; }
+        g_llms_rp_hist[ov]++;
+        if (g_llms_rp_f) { int32_t rec[16] = {(int32_t)g_llms_rp_step, (int32_t)il, grp, (int32_t)r};
+            for (uint32_t k = 0; k < 6; k++) { rec[4 + k] = pr[k]; rec[10 + k] = sel[r * DS4_N_EXPERT_USED + k]; } fwrite(rec, sizeof(rec), 1, g_llms_rp_f); }
+    }
+}
+/* llms LLMS_DS4_BATCH_PIPE: two-group software pipeline over the layers of one batched streaming step */
+/* llms ROW_SCRATCH (apply_ds4_row_scratch.py): a session graph copied into a static scratch in two spans, skipping the ~400 KB engram
+ * rows -- the per-row 'ds41_gpu_graph row = *graphs[i]' on the stack overflowed the server's 512 KB decode worker thread */
+static void llms_row_copy(ds41_gpu_graph *dst, const ds41_gpu_graph *src) {
+    memcpy(dst, src, offsetof(ds41_gpu_graph, rows));
+    memcpy((char *)dst + offsetof(ds41_gpu_graph, window), (const char *)src + offsetof(ds41_gpu_graph, window), sizeof(ds41_gpu_graph) - offsetof(ds41_gpu_graph, window));
+}
+/* llms INDEX_REPLAY (apply_index_replay.py): the indexer's top-512 per row group, recorded / replayed in call order with ROUTE_REPLAY */
+static int g_llms_ir_mode; static uint32_t g_llms_ir_k, g_llms_ir_n, g_llms_ir_cap;
+typedef struct { uint32_t nr; int32_t *ids; } llms_ir_ent;
+static llms_ir_ent *g_llms_ir;
+static uint64_t g_llms_ir_calls, g_llms_ir_missing;
+static void llms_ir_report(void) { fprintf(stderr, "llms index replay (gpu copies): %llu calls replayed, %llu calls without a record or over the slots\n", (unsigned long long)g_llms_ir_calls, (unsigned long long)g_llms_ir_missing); }
+static void llms_index_replay_mode(int mode) {
+    static int reported; if (!reported) { reported = 1; atexit(llms_ir_report); }
+    g_llms_ir_mode = mode; g_llms_ir_k = 0;
+    if (mode == 1) g_llms_ir_n = 0;
+}
+static ds4_gpu_tensor *g_llms_ir_buf;   /* llms INDEX_REPLAY gpu (apply_index_replay2.py): 1,024 slots of 64 KiB */
+static bool llms_index_replay(ds4_gpu_tensor *sel, uint32_t nr) {
+    const uint64_t bytes = (uint64_t)nr * DS4_N_INDEXER_TOP_K * sizeof(int32_t), slot = 65536u; const uint32_t k = g_llms_ir_k++;
+    if (bytes > slot || k >= 1024u) { g_llms_ir_missing++; return true; }
+    if (!g_llms_ir_buf && !(g_llms_ir_buf = ds4_gpu_tensor_alloc(1024u * slot))) return false;
+    if (g_llms_ir_mode == 1) {
+        if (k >= g_llms_ir_cap) { const uint32_t nc = 1024u; llms_ir_ent *ne = realloc(g_llms_ir, sizeof(*ne) * nc); if (!ne) return false; g_llms_ir = ne; g_llms_ir_cap = nc; }
+        g_llms_ir[k] = (llms_ir_ent){ nr, NULL }; if (k + 1u > g_llms_ir_n) g_llms_ir_n = k + 1u;
+        return ds4_gpu_tensor_copy(g_llms_ir_buf, (uint64_t)k * slot, sel, 0, bytes) != 0;
+    }
+    if (k >= g_llms_ir_n || g_llms_ir[k].nr != nr) { g_llms_ir_missing++; return true; }
+    g_llms_ir_calls++;
+    return ds4_gpu_tensor_copy(sel, 0, g_llms_ir_buf, (uint64_t)k * slot, bytes) != 0;
+}
+static bool llms_pipe_p1(ds41_gpu_graph *g, ds41_gpu_graph *gk, ds41_prefill_row *ak, uint32_t off, uint32_t h,
+                         ds41_gpu_graph *const *graphs, const uint32_t *positions, ds4_gpu_tensor **queries, ds4_gpu_tensor **heads,
+                         const ds4_model *model, const ds4_weights *weights, uint32_t il, void **handle) {
+    const ds4_layer_weights *l = &weights->layer[il];
+    bool ok = true;
+    ds4_gpu_llms_set_unit((int)il - 1, (int)(off / (h ? h : 1u)));   /* llms ALT2D: P1 of layer il belongs to the unit of routed layer il - 1 */
+    if (ds41_engram_layer(il)) {
+        const unsigned table = il == 1 ? 0 : 1;
+        if (!llms_engram_join(table)) { fprintf(stderr, "llms engram async: a table read failed (layer %u)\n", il); return false; }   /* llms ENGRAM_ASYNC */
+        for (uint32_t i = off; ok && i < off + h; i++)
+            ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0, graphs[i]->rows[table], sizeof(graphs[i]->rows[table]));
+    }
+    ok = ok && (llms_price_skip(1) || ds41_before_attention_batch(gk, ak, model, l, il, h)) && (llms_price_skip(2) || ds41_attention_project_batch(gk, model, l, h)) &&
+        (!llms_price_dup(1) || ds41_before_attention_batch(gk, ak, model, l, il, h)) && (!llms_price_dup(2) || ds41_attention_project_batch(gk, model, l, h));   /* llms PRICE_DUP */
+    const bool bao = g->tp_world == 1 && l->attn_output_b->type == DS4_TENSOR_Q8_0;
+    if (ok && llms_idx_rows() && ds41_index_source(il) && !llms_price_skip(4)) {   /* llms IDX_ROWS */
+        const uint32_t nr = llms_idx_rows() == 2 ? h - 1u : h;
+        ok = ds41_project_rows(gk->batch.index_q, model, l->indexer_attn_q_b, gk->batch.qr, nr, true) &&
+             ds41_project_rows(gk->batch.index_weights, model, l->indexer_proj, gk->batch.norm, nr, true);
+        g_llms_idx_rows_pre = ok; g_llms_idx_rows_calls++;
+    }
+    if (ok && llms_comp_rows() && ds41_kv_source(il) && !llms_price_skip(4) && !ds4_gpu_llms_alt_off("crows")) {   /* llms COMP_ROWS; ALT */
+        const uint32_t cr = ds4_layer_compress_ratio(il), nr = llms_comp_rows() == 2 ? h - 1u : h;
+        ok = ds41_project_rows(gk->batch.pool_kv, model, l->attn_compressor_kv, gk->batch.norm, nr, cr == 1) &&
+             (cr != 2 || ds41_project_rows(gk->batch.pool_score, model, l->attn_compressor_gate, gk->batch.norm, nr, false));
+        g_llms_comp_rows_pre = ok; g_llms_comp_rows_calls++;
+    }
+    if (ok && llms_rows_rope() && !llms_price_skip(4) && h <= llms_rows_cap_c()) {   /* llms ROWS_ROPE; ROWS128 part 2 */
+        ds4_gpu_tensor *qs[128], *kvs[128]; uint32_t ps[128];
+        for (uint32_t i = 0; i < h; i++) { qs[i] = queries[off + i]; kvs[i] = g->rows_view[off + i].kv; ps[i] = positions[off + i]; }
+        const uint32_t heads_l = DS4_N_HEAD / g->tp_world;
+        ok = llms_rope_rows(qs, ps, h, DS4_N_HEAD_DIM, heads_l, il, false, false) &&
+             llms_rope_rows(kvs, ps, h, DS4_N_HEAD_DIM, 1, il, false, false) &&
+             ds4_gpu_dsv41_quantize(gk->batch.kv, DS4_N_HEAD_DIM, h, DS4_V41_FP8_E8M0);
+        g_llms_rope_pre = ok;
+        if (ok && llms_rows_win() && !ds4_gpu_llms_alt_off("rwin") && g->tp_world == 1) {   /* llms ROWS_WIN */
+            ds4_gpu_tensor *wd[128], *ws[128]; uint64_t wdo[128], wso[128];
+            for (uint32_t i = 0; i < h; i++) { wd[i] = graphs[off + i]->window[il]; wdo[i] = (uint64_t)(positions[off + i] % 128u) * 512u * 4u; ws[i] = g->rows_view[off + i].kv; wso[i] = 0; }
+            g_llms_win_pre = ds4_gpu_llms_rows_copy(wd, wdo, ws, wso, h, 512u * 4u, llms_rows_win() < 0) != 0;
+            if (g_llms_win_pre) g_llms_win_calls++;
+        }
+        if (ok && g_llms_idx_rows_pre && llms_idx_rows() == 1) {   /* the group's indexer queries exist (not under the IDX_ROWS canary) */
+            ds4_gpu_tensor *iq[128];
+            for (uint32_t i = 0; i < h; i++) iq[i] = g->rows_view[off + i].index_q;
+            ok = llms_rope_rows(iq, ps, h, 128, DS4_N_INDEXER_HEAD, il, false, false) &&
+                 ds4_gpu_dsv41_quantize(gk->batch.index_q, 128, DS4_N_INDEXER_HEAD * h, DS4_V41_FP4_E8M0);
+            g_llms_idx_rope_pre = ok;
+        }
+    }
+    static ds41_gpu_graph llms_rowbuf_p1;   /* llms ROW_SCRATCH */
+    /* llms TOPK_ROWS: the group's rows share one score buffer and one top-512 call when their compressed-row counts are equal */
+    static ds4_gpu_tensor *llms_tk_scores[8]; static uint64_t llms_tk_bytes[8];
+    const uint32_t llms_tk_grp = (uint32_t)(off / (h ? h : 1u));
+    uint32_t llms_tk_ncomp = 0; bool llms_tk = false;
+    if (ok && llms_topk_rows() && !ds4_gpu_llms_alt_off("topk") && bao && llms_rows_attn_on() && ds41_index_source(il) && llms_tk_grp < 8 && h >= 2 && !llms_price_skip(4)) {   /* ALT */
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        llms_tk_ncomp = ratio ? (positions[off] + 1u) / ratio : 0u; llms_tk = llms_tk_ncomp >= DS4_N_INDEXER_TOP_K;
+        uint32_t llms_tk_min = llms_tk_ncomp, llms_tk_max = llms_tk_ncomp;   /* llms TOPK_PAD */
+        for (uint32_t i = off + 1; i < off + h; i++) { const uint32_t nc = ratio ? (positions[i] + 1u) / ratio : 0u; if (nc < llms_tk_min) llms_tk_min = nc; if (nc > llms_tk_max) llms_tk_max = nc; }
+        const bool llms_tk_pad = llms_tk_min != llms_tk_max && llms_topk_pad() && !ds4_gpu_llms_alt_off("tkpad");
+        if (llms_tk_pad) { llms_tk = llms_tk_min >= DS4_N_INDEXER_TOP_K; llms_tk_ncomp = llms_tk_max; }
+        else for (uint32_t i = off + 1; llms_tk && i < off + h; i++) llms_tk = (ratio ? (positions[i] + 1u) / ratio : 0u) == llms_tk_ncomp;
+        const uint64_t need = (uint64_t)h * llms_tk_ncomp * sizeof(float);
+        if (llms_tk && llms_tk_bytes[llms_tk_grp] < need) {
+            if (llms_tk_scores[llms_tk_grp]) ds4_gpu_tensor_free(llms_tk_scores[llms_tk_grp]);
+            llms_tk_bytes[llms_tk_grp] = need + need / 4u + (1u << 16);   /* headroom: the count grows with the position */
+            llms_tk_scores[llms_tk_grp] = ds4_gpu_tensor_alloc(llms_tk_bytes[llms_tk_grp]);
+            if (!llms_tk_scores[llms_tk_grp]) { llms_tk_bytes[llms_tk_grp] = 0; llms_tk = false; }
+        }
+        if (llms_tk && llms_tk_pad) {   /* llms TOPK_PAD: the group buffer starts as -inf (+inf: canary), on the GPU, before the rows' scores */
+            static ds4_gpu_tensor *llms_tk_neg; static uint64_t llms_tk_neg_bytes;
+            if (llms_tk_neg_bytes < need) {
+                if (llms_tk_neg) ds4_gpu_tensor_free(llms_tk_neg);
+                llms_tk_neg_bytes = llms_tk_bytes[llms_tk_grp] > need ? llms_tk_bytes[llms_tk_grp] : need;
+                llms_tk_neg = ds4_gpu_tensor_alloc(llms_tk_neg_bytes);
+                if (!llms_tk_neg || !ds4_gpu_tensor_fill_f32(llms_tk_neg, llms_topk_pad() == 2 ? INFINITY : -INFINITY, llms_tk_neg_bytes / sizeof(float))) {   /* filled before any GPU use */
+                    llms_tk_neg_bytes = 0; llms_tk = false;
+                }
+            }
+            if (llms_tk) {
+                ok = ds4_gpu_tensor_copy(llms_tk_scores[llms_tk_grp], 0, llms_tk_neg, 0, need) != 0;
+                g_llms_tkpad_calls++;
+                for (uint32_t i = off; i < off + h; i++) if ((ratio ? (positions[i] + 1u) / ratio : 0u) < llms_tk_max) g_llms_tkpad_padded++;
+            }
+        }
+    }
+    for (uint32_t i = off; ok && i < off + h && !llms_price_skip(4); i++) {
+        ds41_gpu_graph *const row = &llms_rowbuf_p1; llms_row_copy(row, graphs[i]);
+        row->pos = positions[i];
+#define DS41_PIPE_ROW(name, width) row->name = g->rows_view[i].name;
+        DS41_PREFILL_ROWS(DS41_PIPE_ROW)
+#undef DS41_PIPE_ROW
+        row->q = queries[i]; row->heads = heads[i];
+        ds4_gpu_tensor *llms_tk_view = NULL;
+        if (llms_tk) {   /* llms TOPK_ROWS: this row's scores go to its slice of the group buffer */
+            llms_tk_view = ds4_gpu_tensor_view(llms_tk_scores[llms_tk_grp], (uint64_t)(i - off) * llms_tk_ncomp * sizeof(float), (uint64_t)llms_tk_ncomp * sizeof(float));
+            if (!llms_tk_view) { ok = false; break; }
+            row->index_scores = llms_tk_view; g_llms_tk_defer = 1;
+        }
+        g_llms_rows_defer = bao && llms_rows_attn_on();   /* llms ROWS_ATTN */
+        ok = ds41_attention(row, model, l, il, true, false) && (bao || ds41_attention_output(row, model, l));
+        g_llms_rows_defer = 0; g_llms_tk_defer = 0;
+        if (llms_tk_view) ds4_gpu_tensor_free(llms_tk_view);
+    }
+    if (ok && llms_tk) {   /* llms TOPK_ROWS: one selection for the group's rows, ahead of the deferred attention */
+        const uint32_t nr = llms_topk_rows() == 2 ? h - 1u : h;
+        ok = ds4_gpu_indexer_topk_tensor(gk->batch.selected_comp, llms_tk_scores[llms_tk_grp], llms_tk_ncomp, nr, DS4_N_INDEXER_TOP_K) != 0;
+        g_llms_tk_calls++;
+        if (ok && g_llms_ir_mode) ok = llms_index_replay(gk->batch.selected_comp, nr);   /* llms INDEX_REPLAY */
+    }
+    g_llms_idx_rows_pre = 0;   /* llms IDX_ROWS: only inside the loop above */
+    g_llms_comp_rows_pre = 0;   /* llms COMP_ROWS: likewise */
+    g_llms_rope_pre = 0; g_llms_idx_rope_pre = 0;   /* llms ROWS_ROPE: likewise */
+    g_llms_win_pre = 0;
+    if (ok) ok = llms_rows_flush(model);   /* llms ROWS_ATTN */
+    g_llms_rows_n = 0;
+    if (ok && bao && !llms_price_skip(8)) ok = ds4_gpu_dsv41_attention_output_batch(gk->batch.block, gk->batch.low, model->map, model->size,
+        l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, gk->batch.heads, h);
+    if (ok && bao && llms_price_dup(8)) ok = ds4_gpu_dsv41_attention_output_batch(gk->batch.block, gk->batch.low, model->map, model->size,   /* llms PRICE_DUP */
+        l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, gk->batch.heads, h);
+    ok = ok && (llms_price_skip(16) || (ds4_gpu_dsv41_quantize(ak->block, DS4_N_EMBD, h, DS4_V41_BF16) && ds41_after_attention_batch(ak, model, l, h)));
+    ds41_prefill_row *b = &gk->batch;
+    if (ok && llms_rp_on() && g_llms_pipe_ng == 2 && il + 1u < DS4_N_LAYER && weights->layer[il + 1u].ffn_gate_inp && weights->layer[il + 1u].ffn_exp_probs_b && h <= 16) {   /* llms ROUTE_PREDICT (two-group) */
+        const int grp = off ? 1 : 0, par = (int)((il + 1u) & 1u);
+        if (!g_llms_rp_t[grp][par]) g_llms_rp_t[grp][par] = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_EXPERT * sizeof(float));
+        if (g_llms_rp_t[grp][par]) { ok = ds41_matmul_batch(g_llms_rp_t[grp][par], model, weights->layer[il + 1u].ffn_gate_inp, b->norm, h, false); g_llms_rp_have[grp][par] = ok; }
+    }
+    ok = ok && (llms_price_skip(32) || (ds41_matmul_batch(b->route_logits, model, l->ffn_gate_inp, b->norm, h, false) && (ds4_gpu_llms_set_route_layer((int)il), ds41_route_batch(gk, model, l, h)))) &&
+        (llms_price_skip(64) || (llms_router_first() && llms_pipe_async() == 1) || (g_llms_shx_il = il, llms_shared_expert_batch(b, model, l, h)));   /* llms ANE_FIX: per step */   /* llms SHEXP_PAIR: the shared expert through one function (pair or the three dispatches) */
+    if (ok && llms_price_dup(64)) ok =   /* llms PRICE_DUP: the shared expert again */
+        ds41_matmul_batch(b->shared_gate, model, l->ffn_gate_shexp, b->norm, h, true) &&
+        ds41_matmul_batch(b->shared_up, model, l->ffn_up_shexp, b->norm, h, true) &&
+        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up, h * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, h, DS4_V41_BF16) &&
+        ds41_matmul_batch(b->shared, model, l->ffn_down_shexp, b->shared_mid, h, true);
+    if (!ok) { fprintf(stderr, "llms pipe: P1 failed layer %u group off %u\n", il, off); return false; }
+    ds4_gpu_llms_set_ledger_tag(0, (uint32_t)(off / (h ? h : 1u)), il);   /* llms LEDGER_TAGS: this group's main buffer of layer il */
+    *handle = llms_pipe_async() ? ds4_gpu_llms_close_nocommit() : ds4_gpu_llms_commit_close_handle();
+    /* llms ASYNC=1, order 'b': commit this group's buffer now, after its own load ticket (the encode above overlapped the load);
+     * ASYNC=2: leave it pending and commit whatever is ready */
+    if (!(*handle != NULL && (llms_pipe_async() != 1 || ds4_gpu_llms_commit_pending(*handle)) && (llms_pipe_async() != 2 || llms_try_commit_all()))) return false;
+    if (llms_router_first() && llms_pipe_async() == 1 && !llms_price_skip(64)) {   /* llms ROUTER_FIRST; llms ANE_FIX: per step */
+        if (!ds4_gpu_begin_commands()) return false;
+        if (llms_router_first() == 1 && !(g_llms_shx_il = il, llms_shared_expert_batch(b, model, l, h))) { fprintf(stderr, "llms router first: shared expert failed layer %u\n", il); return false; }
+        if (!ds4_gpu_llms_commit_close()) return false;
+        g_llms_rf_bufs++;
+    }
+    return true;
+}
+/* llms ROUTE_TRACE (apply_ds4_route_trace.py): the batched router's full record per (step, layer, group); measurement only */
+static FILE *g_llms_rt_f, *g_llms_rt_b; static int g_llms_rt_state = -1; static uint32_t g_llms_rt_step, g_llms_rt_cap = 200, g_llms_rt_from; static unsigned char g_llms_rt_seen[64];   /* llms ROUTE_TRACE_FROM */
+static int llms_rt_on(void) {
+    if (g_llms_rt_state < 0) {
+        const char *p = getenv("LLMS_DS4_ROUTE_TRACE"); g_llms_rt_state = 0;
+        if (p && *p) { char pb[1100]; snprintf(pb, sizeof pb, "%s.bias", p); g_llms_rt_f = fopen(p, "wb"); g_llms_rt_b = fopen(pb, "wb"); g_llms_rt_state = g_llms_rt_f && g_llms_rt_b;
+                       const char *s = getenv("LLMS_DS4_ROUTE_TRACE_STEPS"); if (s && *s) g_llms_rt_cap = (uint32_t)atoi(s);
+                       const char *fr = getenv("LLMS_DS4_ROUTE_TRACE_FROM"); if (fr && *fr) g_llms_rt_from = (uint32_t)atoi(fr);   /* llms ROUTE_TRACE_FROM */
+                       fprintf(stderr, "llms: ROUTE_TRACE %s (%u steps from step %u) -- measurement: router probabilities, selections, weights and residency per layer\n", p, g_llms_rt_cap, g_llms_rt_from + 1u); }
+    }
+    return g_llms_rt_state == 1;
+}
+static void llms_rt_write(const ds4_model *model, const ds4_layer_weights *l, uint32_t il, int grp, ds41_prefill_row *b, uint32_t h) {
+    if (il == 0 && grp == 0) g_llms_rt_step++;
+    if (g_llms_rt_step <= g_llms_rt_from || g_llms_rt_step > g_llms_rt_from + g_llms_rt_cap || h > 64u || DS4_N_EXPERT > 512u || DS4_N_EXPERT_USED > 8u) return;   /* llms ROUTE_TRACE_FROM */
+    static float pr[64 * 512], wt[64 * 8]; static int32_t sel[64 * 8]; static uint8_t res[512];
+    if (!ds4_gpu_tensor_read(b->route_probs, 0, pr, (uint64_t)h * DS4_N_EXPERT * sizeof(float)) ||
+        !ds4_gpu_tensor_read(b->selected, 0, sel, (uint64_t)h * DS4_N_EXPERT_USED * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_read(b->route_weights, 0, wt, (uint64_t)h * DS4_N_EXPERT_USED * sizeof(float))) { fprintf(stderr, "llms route trace: read failed layer %u\n", il); return; }
+    memset(res, 0, sizeof res); ds4_gpu_llms_resident_mask(il, res, DS4_N_EXPERT);
+    const int32_t hdr[4] = {(int32_t)g_llms_rt_step, (int32_t)il, (int32_t)grp, (int32_t)h};
+    fwrite(hdr, sizeof hdr, 1, g_llms_rt_f); fwrite(pr, sizeof(float), (size_t)h * DS4_N_EXPERT, g_llms_rt_f);
+    fwrite(sel, sizeof(int32_t), (size_t)h * DS4_N_EXPERT_USED, g_llms_rt_f); fwrite(wt, sizeof(float), (size_t)h * DS4_N_EXPERT_USED, g_llms_rt_f);
+    fwrite(res, 1, DS4_N_EXPERT, g_llms_rt_f);
+    if (il < 64 && !g_llms_rt_seen[il] && l->ffn_exp_probs_b) {
+        g_llms_rt_seen[il] = 1; const int32_t l32 = (int32_t)il;
+        fwrite(&l32, sizeof l32, 1, g_llms_rt_b); fwrite(tensor_data(model, l->ffn_exp_probs_b), sizeof(float), DS4_N_EXPERT, g_llms_rt_b); fflush(g_llms_rt_b);
+    }
+    if (il + 1u == DS4_N_LAYER) fflush(g_llms_rt_f);
+}
+/* llms RPOL (apply_ds4_rpol.py): a routing policy on the CPU in P2 -- resident bonus (optionally batch-coherent) and cost-aware drops */
+static uint64_t g_llms_sp_m0, g_llms_sp_cold_n, g_llms_sp_cold_calls; static float g_llms_sp_cold_m = -1.0f; static int g_llms_sp_cold_t;
+static float llms_sp_cold_mult(uint32_t il) {   /* llms SP_COLD: the multiplier for this layer's bonus while the step is cold */
+    if (g_llms_sp_cold_m < 0.0f) { const char *e = getenv("LLMS_DS4_SP_COLD"); g_llms_sp_cold_m = 1.0f; g_llms_sp_cold_t = 0;
+        if (e && *e) { g_llms_sp_cold_m = strtof(e, NULL); const char *c = strchr(e, ','); g_llms_sp_cold_t = c ? atoi(c + 1) : 20; if (g_llms_sp_cold_m <= 1.0f) g_llms_sp_cold_m = 1.0f;
+                       fprintf(stderr, "llms: sp cold %.2f %d (the short prefill's resident bonus x%.2f on a layer once the step's misses so far reach %d per layer done)\n", g_llms_sp_cold_m, g_llms_sp_cold_t, g_llms_sp_cold_m, g_llms_sp_cold_t);
+                       atexit_b(^{ fprintf(stderr, "llms sp cold: %llu layer calls boosted of %llu\n", (unsigned long long)g_llms_sp_cold_n, (unsigned long long)g_llms_sp_cold_calls); }); } }
+    if (g_llms_sp_cold_m <= 1.0f || !g_llms_sp_active) return 1.0f;
+    g_llms_sp_cold_calls++;
+    if (il < 2u) return 1.0f;
+    const uint64_t d = ds4_gpu_llms_stream_misses() - g_llms_sp_m0;
+    if (d >= (uint64_t)g_llms_sp_cold_t * (uint64_t)il) { g_llms_sp_cold_n++; return g_llms_sp_cold_m; }
+    return 1.0f;
+}
+static int g_prefill_route_on = -2; static float g_prefill_route_beta, g_prefill_route_tau = 1.0f; static int g_prefill_route_coh, g_prefill_route_m = 2; static uint64_t g_prefill_route_mask = ~0ull;
+static uint64_t g_prefill_route_bmask = ~0ull; static int g_prefill_route_topk = 6;   /* llms RPOL2 (apply_ds4_rpol2.py) */
+static float g_prefill_route_bl[64]; static int g_prefill_route_have_bl;   /* llms RPOL3 (apply_ds4_rpol3.py): the bonus per layer */
+static float g_prefill_route_bl2[64]; static int g_prefill_route_have_bl2;   /* llms RPOL_BETAS_ALT (apply_ds4_rpol_betas_alt.py): the 'off'-block schedule of ALT 'rpb' */
+static uint64_t g_prefill_route_calls, g_prefill_route_rows, g_prefill_route_subs, g_prefill_route_drops, g_prefill_route_ties; static double g_prefill_route_cost0, g_prefill_route_cost1;
+static void llms_prefill_route_report(void) { fprintf(stderr, "llms prefill route: %llu layer calls, %llu rows rewritten, %llu slots substituted, %llu slots dropped, %llu tie rows left to the GPU; routed cost %.4f of before\n",
+    (unsigned long long)g_prefill_route_calls, (unsigned long long)g_prefill_route_rows, (unsigned long long)g_prefill_route_subs, (unsigned long long)g_prefill_route_drops, (unsigned long long)g_prefill_route_ties, g_prefill_route_cost0 > 0 ? g_prefill_route_cost1 / g_prefill_route_cost0 : 1.0); }
+static int llms_prefill_route_on(void) {
+    if (g_prefill_route_on < -1) {
+        const char *e = getenv("LLMS_DS4_PREFILL_ROUTE"); g_prefill_route_on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? -1 : 1;
+        if (g_prefill_route_on) {
+            const char *s;
+            if ((s = getenv("LLMS_DS4_PREFILL_ROUTE_BETA")) && *s) g_prefill_route_beta = strtof(s, NULL);
+            if ((s = getenv("LLMS_DS4_PREFILL_ROUTE_COH")) && *s) g_prefill_route_coh = atoi(s);
+            if ((s = getenv("LLMS_DS4_PREFILL_ROUTE_BONUS")) && *s) {   /* llms RPOL3: 'v*n,v*n,...' over the layers in order */
+                int li = 0; const char *q = s;
+                while (*q && li < 64) {
+                    char *end = NULL; const float v = strtof(q, &end); if (end == q) break; q = end; int n = 1;
+                    if (*q == '*') { n = (int)strtol(q + 1, &end, 10); q = end; }
+                    for (int k = 0; k < n && li < 64; k++) g_prefill_route_bl[li++] = v;
+                    if (*q == ',') q++;
+                }
+                g_prefill_route_have_bl = li > 0;
+                fprintf(stderr, "llms: RPOL3 per-layer bonus over %d layers (layer 0: %.2f, layer %d: %.2f) -- FIDELITY DIAL [LLMS_DS4_PREFILL_ROUTE_BONUS, the batched steps]\n", li, g_prefill_route_bl[0], li - 1, g_prefill_route_bl[li > 0 ? li - 1 : 0]);
+            }
+            if ((s = getenv("LLMS_DS4_PREFILL_ROUTE_BONUS_ALT")) && *s) {   /* llms RPOL_BETAS_ALT */
+                int li = 0; const char *q = s;
+                while (*q && li < 64) {
+                    char *end = NULL; const float v = strtof(q, &end); if (end == q) break; q = end; int n = 1;
+                    if (*q == '*') { n = (int)strtol(q + 1, &end, 10); q = end; }
+                    for (int k = 0; k < n && li < 64; k++) g_prefill_route_bl2[li++] = v;
+                    if (*q == ',') q++;
+                }
+                g_prefill_route_have_bl2 = li > 0;
+                fprintf(stderr, "llms: RPOL_BETAS_ALT over %d layers (layer 0: %.2f, layer %d: %.2f) in the 'off' blocks of ALT 'rpb' -- FIDELITY DIAL\n", li, g_prefill_route_bl2[0], li - 1, g_prefill_route_bl2[li > 0 ? li - 1 : 0]);
+            }
+
+
+
+            if ((s = getenv("LLMS_DS4_PREFILL_ROUTE_TOPK")) && *s) { g_prefill_route_topk = atoi(s); if (g_prefill_route_topk < 1 || g_prefill_route_topk > 6) g_prefill_route_topk = 6; }
+            if (g_prefill_route_topk < 6) fprintf(stderr, "llms: RPOL2 top-%d in layers %llx, bonus layers %llx -- FIDELITY DIAL\n", g_prefill_route_topk, (unsigned long long)g_prefill_route_mask, (unsigned long long)g_prefill_route_bmask);
+            if (!(g_prefill_route_tau > 0.0f && g_prefill_route_tau <= 1.0f)) g_prefill_route_tau = 1.0f;
+            fprintf(stderr, g_prefill_route_on < 0 ? "llms: RPOL -- CANARY: every row's first two route weights swapped\n" :
+                    "llms: RPOL beta %.3f coherent %d tau %.3f m %d layers %llx -- %s\n", g_prefill_route_beta, g_prefill_route_coh, g_prefill_route_tau, g_prefill_route_m, (unsigned long long)g_prefill_route_mask,
+                    g_prefill_route_beta > 0.0f || g_prefill_route_tau < 1.0f ? "FIDELITY DIAL: NOT the model's routing" : "no row changes (exactness check)");
+            atexit(llms_prefill_route_report);
+            if (g_prefill_route_on > 0 && (g_prefill_route_tau < 1.0f || g_prefill_route_topk < 6)) ds4_gpu_llms_set_route_skip(1);   /* llms RPOL2: top-k drops too */   /* dropped slots are id -1: the Metal side must accept them (as ROUTE_SKIP does) */
+        }
+    }
+    return g_prefill_route_on;
+}
+void ds4_llms_rpol_set(int topk, uint64_t mask) {   /* llms SWEEP (apply_sweep.py): the harness sets the top-k dial between passes */
+    (void)llms_prefill_route_on();
+    g_prefill_route_topk = topk >= 1 && topk <= 6 ? topk : 6; g_prefill_route_mask = mask;
+    if (g_prefill_route_on > 0) ds4_gpu_llms_set_route_skip(1);
+}
+static double llms_prefill_route_cost(int n) { return (double)(n / 2) * 1.792 + (double)(n % 2) * 1.483; }
+static void llms_prefill_route_top6(const float *sc, int32_t *out) {   /* the six largest of 384 scores, best first */
+    float v[6]; for (int k = 0; k < 6; k++) { v[k] = -1e30f; out[k] = -1;   /* finite: -ffast-math assumes no infinities */ }
+    for (int e = 0; e < (int)DS4_N_EXPERT; e++) {
+        const float x = sc[e]; if (!(x > v[5])) continue;
+        int k = 5; while (k > 0 && x > v[k - 1]) { v[k] = v[k - 1]; out[k] = out[k - 1]; k--; }
+        v[k] = x; out[k] = e;
+    }
+}
+
+static float g_llms_cr_beta; static uint64_t g_llms_cr_calls, g_llms_cr_distinct, g_llms_cr_pairs, g_llms_cr_p4, g_llms_cr_p6, g_llms_cr_rows, g_llms_cr_changed;
+void ds4_llms_coroute_set(float beta) {
+    if (g_llms_cr_calls) fprintf(stderr, "llms coroute: previous setting %llu calls, distinct experts per call %.2f, pairs in experts with >= 4 rows %.4f, >= 6 rows %.4f, rows changed %.4f\n",
+        (unsigned long long)g_llms_cr_calls, (double)g_llms_cr_distinct / (double)g_llms_cr_calls, (double)g_llms_cr_p4 / (double)(g_llms_cr_pairs ? g_llms_cr_pairs : 1),
+        (double)g_llms_cr_p6 / (double)(g_llms_cr_pairs ? g_llms_cr_pairs : 1), (double)g_llms_cr_changed / (double)(g_llms_cr_rows ? g_llms_cr_rows : 1));
+    g_llms_cr_calls = g_llms_cr_distinct = g_llms_cr_pairs = g_llms_cr_p4 = g_llms_cr_p6 = g_llms_cr_rows = g_llms_cr_changed = 0;
+    g_llms_cr_beta = beta > 0.0f ? beta : 0.0f;
+    if (g_llms_cr_beta > 0.0f) fprintf(stderr, "llms coroute: beta %g per other row (cap 3, 3 passes) -- ROUTING DIAL (measurement); NOT the model's routing\n", (double)g_llms_cr_beta);
+}
+
+static float g_prefill_route_bl_env[64]; static int g_prefill_route_have_bl_env, g_prefill_route_coh_env, g_prefill_route_env_saved;
+void ds4_llms_rpol_policy_set(const char *betas, int coh) {
+    (void)llms_prefill_route_on();   /* the environment is parsed first, so it cannot overwrite a setting later */
+    if (!g_prefill_route_env_saved) { memcpy(g_prefill_route_bl_env, g_prefill_route_bl, sizeof g_prefill_route_bl); g_prefill_route_have_bl_env = g_prefill_route_have_bl; g_prefill_route_coh_env = g_prefill_route_coh; g_prefill_route_env_saved = 1; }
+    if (!betas) { memcpy(g_prefill_route_bl, g_prefill_route_bl_env, sizeof g_prefill_route_bl); g_prefill_route_have_bl = g_prefill_route_have_bl_env; g_prefill_route_coh = g_prefill_route_coh_env; return; }
+    memset(g_prefill_route_bl, 0, sizeof g_prefill_route_bl); int li = 0; const char *q = betas;
+    while (*q && li < 64) {
+        char *end = NULL; const float v = strtof(q, &end); if (end == q) break; q = end; int n = 1;
+        if (*q == '*') { n = (int)strtol(q + 1, &end, 10); q = end; }
+        for (int k = 0; k < n && li < 64; k++) g_prefill_route_bl[li++] = v;
+        if (*q == ',') q++;
+    }
+    g_prefill_route_have_bl = 1; g_prefill_route_coh = coh;   /* even an all-zero schedule decides (exact routing), not RPOL_BETA's mask */
+    fprintf(stderr, "llms rpolicy: bonus schedule over %d layers (layer 0: %.2f, layer %d: %.2f), coh %d -- ROUTING DIAL (measurement)\n", li, g_prefill_route_bl[0], li > 0 ? li - 1 : 0, g_prefill_route_bl[li > 0 ? li - 1 : 0], coh);
+}
+static bool llms_prefill_route_apply(const ds4_model *model, const ds4_layer_weights *l, uint32_t il, ds41_prefill_row *b, uint32_t h) {
+    if (h > llms_rows_cap_c() || DS4_N_EXPERT > 512u || DS4_N_EXPERT_USED != 6u || !l->ffn_exp_probs_b) return true;   /* llms ROWS128 part 2: was h > 64 */
+    static float pr[128 * 512], wt[128 * 6], sc[512]; static int32_t sel[128 * 6], ex[128 * 6], nw[128 * 6]; static uint8_t res[512], ld[512]; static int cnt[512]; static uint8_t chg[128], dropped[128];
+    const uint64_t n6 = (uint64_t)h * 6u;
+    if (!ds4_gpu_tensor_read(b->route_probs, 0, pr, (uint64_t)h * DS4_N_EXPERT * sizeof(float)) ||
+        !ds4_gpu_tensor_read(b->selected, 0, sel, n6 * sizeof(int32_t)) || !ds4_gpu_tensor_read(b->route_weights, 0, wt, n6 * sizeof(float))) return false;
+    g_prefill_route_calls++;
+    if (g_prefill_route_on < 0) {   /* canary */
+        for (uint32_t r = 0; r < h; r++) { const float t = wt[r * 6]; wt[r * 6] = wt[r * 6 + 1]; wt[r * 6 + 1] = t; }
+        return ds4_gpu_tensor_write(b->route_weights, 0, wt, n6 * sizeof(float)) != 0;
+    }
+    const float *bias = (const float *)tensor_data(model, l->ffn_exp_probs_b);
+    memset(res, 0, sizeof res); ds4_gpu_llms_resident_mask(il, res, DS4_N_EXPERT);
+    memcpy(ld, res, sizeof ld);
+    for (int pass = 0; pass < (g_prefill_route_coh ? 2 : 1); pass++) {
+        for (uint32_t r = 0; r < h; r++) {
+            const float *p = pr + (uint64_t)r * DS4_N_EXPERT;
+            for (int e = 0; e < (int)DS4_N_EXPERT; e++) sc[e] = p[e] + bias[e];
+            llms_prefill_route_top6(sc, ex + r * 6);
+            const float bl = g_prefill_route_have_bl ? (il < 64 ? ((g_prefill_route_have_bl2 && ds4_gpu_llms_alt_off("rpb")) ? g_prefill_route_bl2[il] : g_prefill_route_bl[il]) : 0.0f) : (il < 64 && ((g_prefill_route_bmask >> il) & 1ull)) ? g_prefill_route_beta : 0.0f;   /* llms RPOL2 / RPOL3: the bonus per layer; llms RPOL_BETAS_ALT */
+            const float blc = bl * llms_sp_cold_mult(il);   /* llms SP_COLD */
+            if (blc > 0.0f) { for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (ld[e]) sc[e] += blc; llms_prefill_route_top6(sc, nw + r * 6); }
+            else memcpy(nw + r * 6, ex + r * 6, 6 * sizeof(int32_t));
+        }
+        if (g_prefill_route_coh && pass == 0) for (uint64_t i = 0; i < n6; i++) ld[nw[i]] = 1;   /* the batch loads these anyway */
+    }
+    {   /* llms COROUTE: Jacobi passes on nw; the counts include every row's current set; a row's own membership is subtracted */
+        static int cr_cnt[512]; static int32_t cr_new[64 * 6];
+        {   static int cr_env = -1;   /* llms DIAL_ENV: LLMS_DS4_COROUTE=BETA, read once */
+            if (cr_env < 0) { const char *e = getenv("LLMS_DS4_COROUTE"); cr_env = e && *e ? 1 : 0; if (cr_env && g_llms_cr_beta == 0.0f) ds4_llms_coroute_set(strtof(e, NULL)); } }
+        if (g_llms_cr_beta > 0.0f && !ds4_gpu_llms_alt_off("coroute")) {   /* llms DIAL_ENV: ALT 'coroute' */
+            const float cr_bl = g_prefill_route_have_bl ? (il < 64 ? ((g_prefill_route_have_bl2 && ds4_gpu_llms_alt_off("rpb")) ? g_prefill_route_bl2[il] : g_prefill_route_bl[il]) : 0.0f) : (il < 64 && ((g_prefill_route_bmask >> il) & 1ull)) ? g_prefill_route_beta : 0.0f;   /* the layer's resident bonus, as in the pass loop */
+            for (int pass = 0; pass < 3; pass++) {
+                memset(cr_cnt, 0, sizeof cr_cnt);
+                for (uint64_t i = 0; i < n6; i++) if (nw[i] >= 0) cr_cnt[nw[i]]++;
+                for (uint32_t r = 0; r < h; r++) {
+                    const float *p = pr + (uint64_t)r * DS4_N_EXPERT;
+                    for (int e = 0; e < (int)DS4_N_EXPERT; e++) { int o = cr_cnt[e]; for (int k = 0; k < 6; k++) o -= nw[r * 6 + k] == e; sc[e] = p[e] + bias[e] + g_llms_cr_beta * (float)(o > 3 ? 3 : o) + (ld[e] ? cr_bl : 0.0f); }   /* 11:5x: the resident bonus kept (x203 arm a dropped it) */
+                    llms_prefill_route_top6(sc, cr_new + r * 6);
+                }
+                memcpy(nw, cr_new, n6 * sizeof(int32_t));
+            }
+        }
+        if (g_llms_cr_beta > 0.0f || g_llms_cr_calls == 0 || 1) {   /* statistics of the final sets (also with the dial off: the baseline) */
+            memset(cr_cnt, 0, sizeof cr_cnt); int distinct = 0;
+            for (uint64_t i = 0; i < n6; i++) if (nw[i] >= 0) { if (cr_cnt[nw[i]]++ == 0) distinct++; }
+            g_llms_cr_calls++; g_llms_cr_distinct += (uint64_t)distinct; g_llms_cr_rows += h;
+            for (uint64_t i = 0; i < n6; i++) if (nw[i] >= 0) { g_llms_cr_pairs++; if (cr_cnt[nw[i]] >= 4) g_llms_cr_p4++; if (cr_cnt[nw[i]] >= 6) g_llms_cr_p6++; }
+            for (uint32_t r = 0; r < h; r++) { int same = 1; for (int k = 0; k < 6 && same; k++) { int f = 0; for (int j = 0; j < 6; j++) f |= nw[r * 6 + k] == ex[r * 6 + j]; same = f; } g_llms_cr_changed += !same; }
+        }
+    }
+    /* rows whose exact top-6 (CPU) differs from the GPU's as a set have a score tie: leave them to the GPU */
+    for (uint32_t r = 0; r < h; r++) {
+        int same = 1; for (int k = 0; k < 6 && same; k++) { int f = 0; for (int j = 0; j < 6; j++) f |= sel[r * 6 + j] == ex[r * 6 + k]; same = f; }
+        chg[r] = 0; dropped[r] = 0;
+        if (!same) { memcpy(nw + r * 6, sel + r * 6, 6 * sizeof(int32_t)); g_prefill_route_ties++; continue; }
+        int sub = 0; for (int k = 0; k < 6; k++) { int f = 0; for (int j = 0; j < 6; j++) f |= nw[r * 6 + k] == sel[r * 6 + j]; sub += !f; }
+        if (sub) { chg[r] = 1; g_prefill_route_subs += (uint64_t)sub; }
+    }
+    if (g_prefill_route_topk < 6 && il < 64 && ((g_prefill_route_mask >> il) & 1ull) && !ds4_gpu_llms_alt_off("rptk")) {   /* llms RPOL2: per-layer top-k by selection score; llms RPOL_ALT: ALT rptk */
+        for (uint32_t r = 0; r < h; r++) {
+            float v[6]; int o[6];
+            for (int k = 0; k < 6; k++) { const int e = nw[r * 6 + k]; v[k] = e >= 0 ? pr[(uint64_t)r * DS4_N_EXPERT + e] + bias[e] : -1e30f; o[k] = k; }
+            for (int i = 1; i < 6; i++) { const int x = o[i]; int j = i; while (j > 0 && v[o[j - 1]] < v[x]) { o[j] = o[j - 1]; j--; } o[j] = x; }
+            for (int k = g_prefill_route_topk; k < 6; k++) if (nw[r * 6 + o[k]] >= 0) { nw[r * 6 + o[k]] = -1; dropped[r]++; g_prefill_route_drops++; chg[r] = 1; }
+        }
+    }
+    if (g_prefill_route_tau < 1.0f && il < 64 && ((g_prefill_route_mask >> il) & 1ull)) {
+        memset(cnt, 0, sizeof cnt); for (uint64_t i = 0; i < n6; i++) if (nw[i] >= 0) cnt[nw[i]]++;   /* llms RPOL2: skip dropped slots */
+        double base = 0.0; for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (cnt[e]) base += llms_prefill_route_cost(cnt[e]);
+        double cur = base; g_prefill_route_cost0 += base;
+        static float wn[64 * 6];
+        for (uint32_t r = 0; r < h; r++) { float s = 0.0f; for (int k = 0; k < 6; k++) if (nw[r * 6 + k] >= 0) s += pr[(uint64_t)r * DS4_N_EXPERT + nw[r * 6 + k]]; for (int k = 0; k < 6; k++) wn[r * 6 + k] = nw[r * 6 + k] >= 0 && s > 0.0f ? pr[(uint64_t)r * DS4_N_EXPERT + nw[r * 6 + k]] / s : 0.0f; }   /* llms RPOL2: skip dropped slots */
+        while (cur > (double)g_prefill_route_tau * base) {
+            double best = 0.0; int bi = -1;
+            for (uint64_t i = 0; i < n6; i++) {
+                const int e = nw[i]; if (e < 0 || dropped[i / 6] >= g_prefill_route_m) continue;
+                const double save = (cnt[e] & 1) ? 1.483 : 0.309, ratio = save / (wn[i] > 1e-9f ? wn[i] : 1e-9f);
+                if (ratio > best) { best = ratio; bi = (int)i; }
+            }
+            if (bi < 0) break;
+            const int e = nw[bi]; cur -= llms_prefill_route_cost(cnt[e]) - llms_prefill_route_cost(cnt[e] - 1); cnt[e]--; nw[bi] = -1; dropped[bi / 6]++; chg[bi / 6] = 1; g_prefill_route_drops++;
+        }
+        g_prefill_route_cost1 += cur;
+    }
+    int any = 0;
+    for (uint32_t r = 0; r < h; r++) {
+        if (!chg[r]) continue;
+        any = 1; g_prefill_route_rows++;
+        float s = 0.0f; for (int k = 0; k < 6; k++) if (nw[r * 6 + k] >= 0) s += pr[(uint64_t)r * DS4_N_EXPERT + nw[r * 6 + k]];
+        for (int k = 0; k < 6; k++) { sel[r * 6 + k] = nw[r * 6 + k]; wt[r * 6 + k] = nw[r * 6 + k] >= 0 && s > 0.0f ? pr[(uint64_t)r * DS4_N_EXPERT + nw[r * 6 + k]] / s * DS4_EXPERT_WEIGHT_SCALE : 0.0f; }
+    }
+    if (!any) return true;
+    return ds4_gpu_tensor_write(b->selected, 0, sel, n6 * sizeof(int32_t)) != 0 && ds4_gpu_tensor_write(b->route_weights, 0, wt, n6 * sizeof(float)) != 0;
+}
+/* llms WEIGHT_JITTER (apply_weight_jitter.py): route weights x (1 + eps * u), u from a hash of (seed, step, layer, group, row, slot) */
+static float g_llms_wj_eps; static uint32_t g_llms_wj_seed, g_llms_wj_step; static uint64_t g_llms_wj_calls;
+void ds4_llms_weight_jitter(float eps, uint32_t seed) { g_llms_wj_eps = eps; g_llms_wj_seed = seed; g_llms_wj_step = 0; }
+static uint32_t llms_wj_hash(uint32_t x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
+static bool llms_weight_jitter(uint32_t il, int grp, ds41_prefill_row *b, uint32_t h) {
+    if (il == 0 && grp <= 0) g_llms_wj_step++;
+    if (h > 64u || DS4_N_EXPERT_USED != 6u) return true;
+    static float wt[64 * 6]; const uint64_t n6 = (uint64_t)h * 6u;
+    if (!ds4_gpu_tensor_read(b->route_weights, 0, wt, n6 * sizeof(float))) return false;
+    for (uint64_t i = 0; i < n6; i++) {
+        const uint32_t k = llms_wj_hash(g_llms_wj_seed * 0x9E3779B1u ^ llms_wj_hash(g_llms_wj_step * 64u + il) ^ llms_wj_hash((uint32_t)(grp + 1) * 4096u + (uint32_t)i));
+        const float u = (float)k * (2.0f / 4294967296.0f) - 1.0f;
+        wt[i] *= 1.0f + g_llms_wj_eps * u;
+    }
+    g_llms_wj_calls++;
+    return ds4_gpu_tensor_write(b->route_weights, 0, wt, n6 * sizeof(float)) != 0;
+}
+/* llms ROUTE_REPLAY (apply_route_replay.py): record the routing of a reference pass, replay it (a dial applied on top) */
+static int g_llms_rr_mode; static uint32_t g_llms_rr_step; static int g_llms_rr_cap;
+typedef struct { int32_t sel[64 * 6]; float wt[64 * 6], raw[64 * 6], sc[64 * 6]; uint32_t h; int have; } llms_rr_ent;
+/* llms RR_PROFILE (apply_rr_profile.py): the reference's full router probabilities and the per-layer divergence of a replayed setting */
+static float *g_llms_rrp;   /* [step][layer 40][group 4][64 rows][384] -- allocated with the entries */
+static double g_llms_rrp_sum[40], g_llms_rrp_max[40]; static uint64_t g_llms_rrp_n[40], g_llms_rrp_flip[40]; static int g_llms_rrp_have;
+static void llms_rrp_print(void) {
+    if (!g_llms_rrp_have) return;
+    for (int l = 0; l < 40; l++) if (g_llms_rrp_n[l])
+        fprintf(stderr, "llms rr profile %2d: mean %.3e max %.3e flips %llu\n", l, g_llms_rrp_sum[l] / (double)g_llms_rrp_n[l], g_llms_rrp_max[l], (unsigned long long)g_llms_rrp_flip[l]);
+    memset(g_llms_rrp_sum, 0, sizeof g_llms_rrp_sum); memset(g_llms_rrp_max, 0, sizeof g_llms_rrp_max); memset(g_llms_rrp_n, 0, sizeof g_llms_rrp_n); memset(g_llms_rrp_flip, 0, sizeof g_llms_rrp_flip);
+    g_llms_rrp_have = 0;
+}
+static llms_rr_ent *g_llms_rr;   /* [step][layer 40][group 4] */
+static uint64_t g_llms_rr_written, g_llms_rr_missing, g_llms_rr_flips;
+static void llms_rr_report(void) { fprintf(stderr, "llms route replay: %llu layer calls replayed, %llu without a record, %llu flipped rows replaced by the frozen choice\n", (unsigned long long)g_llms_rr_written, (unsigned long long)g_llms_rr_missing, (unsigned long long)g_llms_rr_flips); }
+void ds4_llms_route_replay_mode(int mode) {
+    static int reported; if (!reported) { reported = 1; atexit(llms_rr_report); }
+    if (g_llms_rr_mode == 2) llms_rrp_print();   /* llms RR_PROFILE: the finished setting's profile */
+    g_llms_rr_mode = mode; g_llms_rr_step = 0;
+    if (!getenv("LLMS_POS_SWEEP_FREEZE_MOE_ONLY")) llms_index_replay_mode(mode);   /* llms INDEX_REPLAY: the indexer's selection frozen with the routing */
+}
+static bool llms_route_replay(const ds4_model *model, const ds4_layer_weights *l, uint32_t il, int grp, ds41_prefill_row *b, uint32_t h) {
+    if (il == 0 && grp == 0) g_llms_rr_step++;
+    if (h > 64u || DS4_N_EXPERT_USED != 6u || il >= 40u || grp < 0 || grp >= 4 || !l->ffn_exp_probs_b) return true;
+    const uint32_t st = g_llms_rr_step - 1u;
+    if ((int)st >= g_llms_rr_cap) {
+        const int nc = (int)st + 64; llms_rr_ent *nr = realloc(g_llms_rr, sizeof(llms_rr_ent) * (size_t)nc * 160u);
+        if (!nr) return false;
+        memset(nr + (size_t)g_llms_rr_cap * 160u, 0, sizeof(llms_rr_ent) * (size_t)(nc - g_llms_rr_cap) * 160u);
+        float *np_ = realloc(g_llms_rrp, sizeof(float) * (size_t)nc * 40u * 32u * 384u);   /* llms RR_PROFILE: group 0, <= 32 rows */
+        if (!np_) return false;
+        g_llms_rrp = np_;
+        g_llms_rr = nr; g_llms_rr_cap = nc;
+    }
+    llms_rr_ent *E = &g_llms_rr[((size_t)st * 40u + il) * 4u + (size_t)grp];
+    const uint64_t n6 = (uint64_t)h * 6u;
+    if (g_llms_rr_mode == 1) {
+        static float pr[64 * 512];
+        if (!ds4_gpu_tensor_read(b->route_probs, 0, pr, (uint64_t)h * DS4_N_EXPERT * sizeof(float)) ||
+            !ds4_gpu_tensor_read(b->selected, 0, E->sel, n6 * sizeof(int32_t)) || !ds4_gpu_tensor_read(b->route_weights, 0, E->wt, n6 * sizeof(float))) return false;
+        const float *bias = (const float *)tensor_data(model, l->ffn_exp_probs_b);
+        for (uint64_t i = 0; i < n6; i++) { const int e = E->sel[i]; E->raw[i] = e >= 0 ? pr[(i / 6u) * DS4_N_EXPERT + (uint64_t)e] : 0.0f; E->sc[i] = e >= 0 ? E->raw[i] + bias[e] : -1e30f; }
+        if (DS4_N_EXPERT == 384u && grp == 0 && h <= 32u) memcpy(g_llms_rrp + ((size_t)st * 40u + il) * 32u * 384u, pr, (size_t)h * 384u * sizeof(float));   /* llms RR_PROFILE */
+        E->h = h; E->have = 1;
+        return true;
+    }
+    if (!E->have || E->h != h) { g_llms_rr_missing++; return true; }
+    /* llms ROUTE_REPLAY live (apply_cf_form2.py): pin the discrete choice only */
+    static int32_t sel[64 * 6], lsel[64 * 6]; static float wt[64 * 6], pl[64 * 512];
+    if (!ds4_gpu_tensor_read(b->selected, 0, lsel, n6 * sizeof(int32_t)) || !ds4_gpu_tensor_read(b->route_weights, 0, wt, n6 * sizeof(float)) ||
+        !ds4_gpu_tensor_read(b->route_probs, 0, pl, (uint64_t)h * DS4_N_EXPERT * sizeof(float))) return false;
+    memcpy(sel, E->sel, n6 * sizeof(int32_t));
+    if (DS4_N_EXPERT == 384u && grp == 0 && h <= 32u) {   /* llms RR_PROFILE: |p_live - p_ref| and the rows whose live top-6 by score differs as a set */
+        const float *pref = g_llms_rrp + ((size_t)st * 40u + il) * 32u * 384u;
+        const float *bias = (const float *)tensor_data(model, l->ffn_exp_probs_b);
+        double sm = 0.0, mx = g_llms_rrp_max[il];
+        for (uint64_t i = 0; i < (uint64_t)h * 384u; i++) { const double dv = fabs((double)pl[i] - (double)pref[i]); sm += dv; if (dv > mx) mx = dv; }
+        g_llms_rrp_sum[il] += sm; g_llms_rrp_n[il] += (uint64_t)h * 384u; g_llms_rrp_max[il] = mx; g_llms_rrp_have = 1;
+        for (uint32_t r = 0; r < h; r++) {
+            int32_t ex[6]; float sc6[384];
+            for (int e = 0; e < 384; e++) sc6[e] = pl[(uint64_t)r * 384u + e] + bias[e];
+            llms_prefill_route_top6(sc6, ex);
+            int same = 1; for (int a_ = 0; a_ < 6 && same; a_++) { int f = 0; for (int j = 0; j < 6; j++) f |= E->sel[r * 6 + j] == ex[a_]; same = f; }
+            if (!same) g_llms_rrp_flip[il]++;
+        }
+    }
+    const int dial = g_prefill_route_topk < 6 && il < 64 && ((g_prefill_route_mask >> il) & 1ull);
+    int any = 0;
+    for (uint32_t r = 0; r < h; r++) {
+        if (dial) {   /* the dial on the recorded choice: keep the top-k by recorded score */
+            int o[6]; for (int k = 0; k < 6; k++) o[k] = k;
+            for (int i = 1; i < 6; i++) { const int x = o[i]; int j = i; while (j > 0 && E->sc[r * 6 + o[j - 1]] < E->sc[r * 6 + x]) { o[j] = o[j - 1]; j--; } o[j] = x; }
+            for (int k = g_prefill_route_topk; k < 6; k++) sel[r * 6 + o[k]] = -1;
+        }
+        int same = 1, nl = 0, nt = 0;
+        for (int a = 0; a < 6; a++) { nl += lsel[r * 6 + a] >= 0; const int e = sel[r * 6 + a]; if (e < 0) continue; nt++; int f = 0; for (int j = 0; j < 6; j++) f |= lsel[r * 6 + j] == e; same &= f; }
+        if (same && nl == nt) { memcpy(sel + r * 6, lsel + r * 6, 6 * sizeof(int32_t)); continue; }   /* the live arrays stay */
+        any = 1; g_llms_rr_flips++;
+        float sum = 0.0f; for (int k = 0; k < 6; k++) if (sel[r * 6 + k] >= 0) sum += pl[(uint64_t)r * DS4_N_EXPERT + (uint64_t)sel[r * 6 + k]];
+        for (int k = 0; k < 6; k++) wt[r * 6 + k] = sel[r * 6 + k] >= 0 && sum > 0.0f ? pl[(uint64_t)r * DS4_N_EXPERT + (uint64_t)sel[r * 6 + k]] / sum * DS4_EXPERT_WEIGHT_SCALE : 0.0f;
+    }
+    g_llms_rr_written++;
+    if (!any) return true;
+    return ds4_gpu_tensor_write(b->selected, 0, sel, n6 * sizeof(int32_t)) != 0 && ds4_gpu_tensor_write(b->route_weights, 0, wt, n6 * sizeof(float)) != 0;
+}
+
+
+static int g_llms_pd_mode; static float g_llms_pd_param; static uint64_t g_llms_pd_mask; static uint32_t g_llms_pd_seed, g_llms_pd_step;
+static uint64_t g_llms_pd_kept, g_llms_pd_total;
+void ds4_llms_pdrop_set(int mode, float param, uint64_t mask, uint32_t seed) {
+    if (g_llms_pd_total) fprintf(stderr, "llms pdrop: previous setting kept %llu of %llu pairs (%.4f)\n", (unsigned long long)g_llms_pd_kept,
+                                 (unsigned long long)g_llms_pd_total, (double)g_llms_pd_kept / (double)g_llms_pd_total);
+    if (g_llms_shx_skips) fprintf(stderr, "llms shx: previous setting skipped the shared expert %llu times\n", (unsigned long long)g_llms_shx_skips);
+    g_llms_shx_skips = 0; g_llms_shx_mask = mode == 5 ? mask : 0ull;   /* llms SHX */
+    g_llms_pd_mode = mode >= 1 && mode <= 4 ? mode : 0; g_llms_pd_param = param; g_llms_pd_mask = mask; g_llms_pd_seed = seed;
+    g_llms_pd_step = 0; g_llms_pd_kept = g_llms_pd_total = 0;
+    if (g_llms_pd_mode) { ds4_gpu_llms_set_route_skip(1);
+        fprintf(stderr, "llms pdrop: mode %d param %g mask %llx seed %u -- FIDELITY DIAL (measurement); NOT the model's routing\n", g_llms_pd_mode, (double)param, (unsigned long long)mask, seed); }
+}
+static bool llms_pdrop(uint32_t il, int grp, ds41_prefill_row *b, uint32_t h) {
+    if (il == 0 && grp <= 0) g_llms_pd_step++;
+    if (il >= 64u || !((g_llms_pd_mask >> il) & 1ull) || h > 64u || DS4_N_EXPERT_USED != 6u) return true;
+    static float wt[64 * 6]; static int32_t id[64 * 6]; const uint64_t n6 = (uint64_t)h * 6u;
+    if (!ds4_gpu_tensor_read(b->route_weights, 0, wt, n6 * sizeof(float)) || !ds4_gpu_tensor_read(b->selected, 0, id, n6 * sizeof(int32_t))) return false;
+    for (uint32_t r = 0; r < h; r++) {
+        float *t = wt + r * 6; int32_t *q = id + r * 6; float s = 0.0f; int jx = 0;
+        for (int j = 0; j < 6; j++) { if (q[j] < 0) t[j] = 0.0f; s += t[j]; if (t[j] > t[jx]) jx = j; }
+        if (s <= 0.0f) continue;
+        if (g_llms_pd_mode == 4) { for (int j = 0; j < 6; j++) t[j] = 0.0f; }   /* x194: an all-dropped call fails (sum6: no entries); slot jx keeps its id at weight 0 below */
+        else if (g_llms_pd_mode == 1 || g_llms_pd_mode == 3) {
+            int keep[6] = {0};
+            if (g_llms_pd_mode == 3) { for (int j = 0; j < 6; j++) keep[j] = j == jx || t[j] >= g_llms_pd_param * s; }
+            else { int ord[6] = {0, 1, 2, 3, 4, 5};
+                   for (int a = 1; a < 6; a++) for (int c = a; c > 0 && t[ord[c]] > t[ord[c - 1]]; c--) { int x = ord[c]; ord[c] = ord[c - 1]; ord[c - 1] = x; }
+                   float acc = 0.0f; for (int a = 0; a < 6; a++) { if (a > 0 && acc >= g_llms_pd_param * s) break; keep[ord[a]] = 1; acc += t[ord[a]]; } }
+            float kept = 0.0f; for (int j = 0; j < 6; j++) if (keep[j]) kept += t[j];
+            const float rr = kept > 0.0f ? s / kept : 1.0f;
+            for (int j = 0; j < 6; j++) t[j] = keep[j] ? t[j] * rr : 0.0f;
+        } else if (g_llms_pd_mode == 2) {
+            int clip[6] = {0}; double lam = 0.0;
+            for (int it = 0; it < 7; it++) {
+                int nc = 0; double ws = 0.0; for (int j = 0; j < 6; j++) { if (clip[j]) nc++; else ws += t[j]; }
+                lam = ws > 0.0 ? ((double)g_llms_pd_param - nc) / ws : 0.0; int ch = 0;
+                for (int j = 0; j < 6; j++) if (!clip[j] && t[j] > 0.0f && lam * t[j] >= 1.0) { clip[j] = 1; ch = 1; }
+                if (!ch) break;
+            }
+            for (int j = 0; j < 6; j++) {
+                if (t[j] <= 0.0f) continue;
+                const double p = clip[j] ? 1.0 : lam * t[j];
+                const uint32_t k = llms_wj_hash(g_llms_pd_seed * 0x9E3779B1u ^ llms_wj_hash(g_llms_pd_step * 64u + il) ^ llms_wj_hash((uint32_t)(grp + 1) * 4096u + r * 6u + (uint32_t)j));
+                const double u = (double)k * (1.0 / 4294967296.0);
+                t[j] = (p >= 1.0) ? t[j] : (u < p ? (float)(t[j] / p) : 0.0f);
+            }
+        }
+        for (int j = 0; j < 6; j++) { if (q[j] >= 0) { g_llms_pd_total++; if (t[j] > 0.0f) g_llms_pd_kept++; else if (!(g_llms_pd_mode == 4 && j == jx)) q[j] = -1; } }
+    }
+    return ds4_gpu_tensor_write(b->route_weights, 0, wt, n6 * sizeof(float)) != 0 && ds4_gpu_tensor_write(b->selected, 0, id, n6 * sizeof(int32_t)) != 0;
+}
+int ds4_gpu_llms_xquant_maybe(ds4_gpu_tensor *t, uint32_t rows, uint32_t cols);   /* llms AQUANT */
+
+static FILE *g_llms_hcd_f; static int g_llms_hcd_on = -1; static uint32_t g_llms_hcd_step;
+static void llms_hc_dump(uint32_t il, int grp, ds41_prefill_row *b, uint32_t h) {
+    if (g_llms_hcd_on < 0) { const char *e = getenv("LLMS_DS4_HC_DUMP"); g_llms_hcd_on = e && *e; if (g_llms_hcd_on) { g_llms_hcd_f = fopen(e, "wb"); if (!g_llms_hcd_f) g_llms_hcd_on = 0; else fprintf(stderr, "llms: hc dump -> %s (instrument)\n", e); } }
+    if (!g_llms_hcd_on) return;
+    (void)ds4_gpu_llms_owed_force(-1);   /* llms HC_OWED: the dump reads both splits */
+    if (il == 0 && grp <= 0) g_llms_hcd_step++;
+    if (g_llms_hcd_step < 2 || g_llms_hcd_step > 61 || h > 64u) return;
+    static float sa[64 * 24], sf[64 * 24];
+    if (!ds4_gpu_tensor_read(b->attn_split, 0, sa, (uint64_t)h * 24u * sizeof(float)) || !ds4_gpu_tensor_read(b->ffn_split, 0, sf, (uint64_t)h * 24u * sizeof(float))) return;
+    const uint32_t hdr[5] = { 0x31444348u, g_llms_hcd_step, il, (uint32_t)(grp < 0 ? 0 : grp), h };
+    fwrite(hdr, 4, 5, g_llms_hcd_f); fwrite(sa, 4, (size_t)h * 24u, g_llms_hcd_f); fwrite(sf, 4, (size_t)h * 24u, g_llms_hcd_f); fflush(g_llms_hcd_f);
+}
+static int llms_pipe_odd(void);   /* llms PIPE_ODD (defined before llms_pipe_layers) */
+static bool llms_pipe_p2(ds41_gpu_graph *gk, ds41_prefill_row *ak, uint32_t h, const ds4_model *model, const ds4_weights *weights,
+                         uint32_t il, void **handle) {
+    const ds4_layer_weights *l = &weights->layer[il];
+    ds41_prefill_row *b = &gk->batch;
+    if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) return false;
+    ds4_gpu_llms_set_ledger_tag(1, (uint32_t)g_llms_pipe_grp, il);   /* llms LEDGER_TAGS: the split's pass-1 buffer, if any, is committed inside this P2 */
+    ds4_gpu_llms_set_unit((int)il, g_llms_pipe_grp);   /* llms ALT2D */
+    if (llms_pipe_async() == 2 && !llms_commit_older(g_llms_pipe_grp)) { fprintf(stderr, "llms pipe: commit of the older buffer failed layer %u\n", il); return false; }
+    if (!(llms_pipe_async() ? ds4_gpu_llms_wait_pending(*handle) : ds4_gpu_llms_wait_handle(*handle))) { fprintf(stderr, "llms pipe: router wait failed layer %u\n", il); return false; }
+    *handle = NULL;
+    if (llms_prefill_route_on() && !llms_prefill_route_apply(model, l, il, b, h)) { fprintf(stderr, "llms prefill route: failed layer %u\n", il); return false; }   /* llms RPOL */
+    if (g_llms_rr_mode && !llms_route_replay(model, l, il, g_llms_pipe_grp, b, h)) { fprintf(stderr, "llms route replay: failed layer %u\n", il); return false; }   /* llms ROUTE_REPLAY */
+    if (g_llms_wj_eps > 0.0f && !llms_weight_jitter(il, g_llms_pipe_grp, b, h)) { fprintf(stderr, "llms weight jitter: failed layer %u\n", il); return false; }   /* llms WEIGHT_JITTER */
+    {   static int pd_env = -1;   /* llms DIAL_ENV: LLMS_DS4_PDROP_SPEC=mode:param:maskhex, read once */
+        if (pd_env < 0) { const char *e = getenv("LLMS_DS4_PDROP_SPEC"); pd_env = e && *e ? 1 : 0;
+            if (pd_env && !g_llms_pd_mode) { const char *c1 = strchr(e, ':'); const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+                const int pm = !strncmp(e, "cum", 3) ? 1 : !strncmp(e, "ht", 2) ? 2 : !strncmp(e, "thr", 3) ? 3 : !strncmp(e, "all", 3) ? 4 : !strncmp(e, "shx", 3) ? 5 : 0;
+                ds4_llms_pdrop_set(pm, c1 ? strtof(c1 + 1, NULL) : 0.0f, c2 ? strtoull(c2 + 1, NULL, 16) : ~0ull, 1u); } } }
+    if (g_llms_pd_mode && !ds4_gpu_llms_alt_off("pdrop") && !llms_pdrop(il, g_llms_pipe_grp, b, h)) { fprintf(stderr, "llms pdrop: failed layer %u\n", il); return false; }   /* llms PDROP; llms DIAL_ENV: ALT 'pdrop' */
+    llms_hc_dump(il, g_llms_pipe_grp, b, h);   /* llms HC_DUMP */
+    {
+        static FILE *xf; static int xon = -1; static uint64_t xmask; static uint32_t xstep; static float xb[64 * 5120];
+        if (xon < 0) { const char *e = getenv("LLMS_DS4_X_DUMP"), *m = getenv("LLMS_DS4_X_DUMP_LAYERS"); xon = e && *e; xmask = m && *m ? strtoull(m, NULL, 16) : ((1ull << 10) | (1ull << 30));
+                       if (xon) { xf = fopen(e, "wb"); if (!xf) xon = 0; else fprintf(stderr, "llms: x dump -> %s, layers %llx (instrument)\n", e, (unsigned long long)xmask); } }
+        if (xon) {
+            if (il == 0 && g_llms_pipe_grp <= 0) xstep++;
+            if (xstep >= 2 && xstep <= 41 && il < 64 && ((xmask >> il) & 1ull) && h <= 64u && DS4_N_EMBD == 5120u &&
+                ds4_gpu_tensor_read(b->norm, 0, xb, (uint64_t)h * 5120u * sizeof(float))) {
+                const uint32_t hdr[5] = { 0x31504458u, xstep, il, (uint32_t)(g_llms_pipe_grp < 0 ? 0 : g_llms_pipe_grp), h };
+                fwrite(hdr, 4, 5, xf); fwrite(xb, 4, (size_t)h * 5120u, xf); fflush(xf);
+            }
+        }
+    }
+    {
+        static FILE *cf; static int con = -1; static uint32_t cstep, c0 = 30, c1 = 31; static float cx[64 * 5120], cw[64 * 8]; static int32_t ci[64 * 8];
+        if (con < 0) { const char *e = getenv("LLMS_DS4_CAPTURE"), *r = getenv("LLMS_DS4_CAPTURE_STEPS"); con = e && *e;
+                       if (r && *r) { c0 = (uint32_t)atoi(r); const char *c = strchr(r, ':'); c1 = c ? (uint32_t)atoi(c + 1) : c0; }
+                       if (con) { cf = fopen(e, "wb"); if (!cf) con = 0; else fprintf(stderr, "llms: capture -> %s, steps %u..%u, every layer (instrument)\n", e, c0, c1); } }
+        if (con) {
+            if (il == 0 && g_llms_pipe_grp <= 0) cstep++;
+            const uint64_t nw = (uint64_t)h * DS4_N_EXPERT_USED;
+            if (cstep >= c0 && cstep <= c1 && h <= 64u && DS4_N_EMBD == 5120u && DS4_N_EXPERT_USED <= 8 &&
+                ds4_gpu_tensor_read(b->norm, 0, cx, (uint64_t)h * 5120u * sizeof(float)) &&
+                ds4_gpu_tensor_read(b->selected, 0, ci, nw * sizeof(int32_t)) && ds4_gpu_tensor_read(b->route_weights, 0, cw, nw * sizeof(float))) {
+                const uint32_t hdr[5] = { 0x31504143u, cstep, il, (uint32_t)(g_llms_pipe_grp < 0 ? 0 : g_llms_pipe_grp), h };
+                fwrite(hdr, 4, 5, cf); fwrite(cx, 4, (size_t)h * 5120u, cf); fwrite(ci, 4, (size_t)nw, cf); fwrite(cw, 4, (size_t)nw, cf); fflush(cf);
+            }
+        }
+    }
+    if (llms_rt_on()) llms_rt_write(model, l, il, g_llms_pipe_grp, b, h);   /* llms ROUTE_TRACE */
+    {
+        static int on = -1; static uint8_t prev[64][512]; static int32_t ids[64 * 8];
+        if (on < 0) { const char *e = getenv("LLMS_DS4_BPF"); on = e && *e && *e != '0'; }
+        if (on && h <= 64u && DS4_N_EXPERT <= 512 && il < 64u && DS4_N_EXPERT_USED <= 8 && ds4_gpu_tensor_read(b->selected, 0, ids, (uint64_t)h * DS4_N_EXPERT_USED * sizeof(int32_t))) {
+            if (il + 1u < DS4_N_LAYER && g_llms_pipe_grp <= 0) {
+                const ds4_layer_weights *ln = &weights->layer[il + 1u]; uint64_t dr = 0;
+                if (ln->ffn_down_exps && tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &dr))
+                    ds4_gpu_llms_bpf_prefetch(il + 1u, prev[il + 1u], ln->ffn_down_exps->abs_offset, dr * DS4_N_EMBD);
+            }
+            if (g_llms_pipe_grp <= 0) memset(prev[il], 0, sizeof prev[il]);
+            for (uint32_t p = 0; p < h * DS4_N_EXPERT_USED; p++) if (ids[p] >= 0 && ids[p] < (int32_t)DS4_N_EXPERT) prev[il][ids[p]] = 1;
+        }
+    }
+    if (llms_rp_on()) { llms_rp_compare(model, l, il, g_llms_pipe_grp, b, h); if (g_llms_pipe_grp == 1 && il + 1u == DS4_N_LAYER) g_llms_rp_step++; }   /* llms ROUTE_PREDICT */
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps), down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    bool mid_f16 = false;
+    ds4_gpu_llms_set_pipe(1);
+    ds4_gpu_llms_set_async_loads(llms_pipe_async());
+    if (!ds4_gpu_llms_xquant_maybe(b->norm, h, DS4_N_EMBD)) { fprintf(stderr, "llms aquant: x failed layer %u\n", il); return false; }   /* llms AQUANT */
+    bool ok = llms_price_skip(128) || ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+            model->map, model->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm, il, h - llms_moe_rows_skip(h), &mid_f16, false) != 0;
+    if (ok && llms_price_dup(128)) ok = ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,   /* llms PRICE_DUP: the routed kernels again, every expert resident */
+            model->map, model->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm, il, h, &mid_f16, false) != 0;
+    ds4_gpu_llms_set_pipe(0);
+    ds4_gpu_llms_set_async_loads(0);
+    if (ok && llms_pipe_async() == 2) ok = llms_try_commit_all();   /* this group's ticket is issued: the other group's buffer may go now */
+    if (ok && llms_pipe_odd() == 2 && (g_llms_pipe_ng == 1) && (h % 2u)) {   /* llms PIPE_ODD canary: the last row's MoE output dropped */
+        static ds4_gpu_tensor *llms_zero_odd;
+        if (!llms_zero_odd) { llms_zero_odd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float)); ok = llms_zero_odd && ds4_gpu_tensor_fill_f32(llms_zero_odd, 0.0f, DS4_N_EMBD); }
+        if (ok) ok = ds4_gpu_tensor_copy(ak->routed, (uint64_t)(h - 1u) * DS4_N_EMBD * sizeof(float), llms_zero_odd, 0, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+                     ds4_gpu_tensor_copy(ak->shared, (uint64_t)(h - 1u) * DS4_N_EMBD * sizeof(float), llms_zero_odd, 0, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
+    llms_elide_announce();   /* llms ELIDE: zero the masked parts of this layer's FFN output before the sum */
+    if (ok && il < 64u) {
+        const uint64_t bit = 1ull << il;
+        static ds4_gpu_tensor *llms_zero;   /* zeros written by the CPU once, before any GPU use; copied on the GPU, in order, after the FFN's kernels */
+        const uint64_t zb = (uint64_t)h * DS4_N_EMBD * sizeof(float);
+        const bool er = ((llms_elide_mask("LLMS_DS4_ELIDE_FFN") | llms_elide_mask("LLMS_DS4_ELIDE_ROUTED")) & bit) != 0;
+        const bool es = ((llms_elide_mask("LLMS_DS4_ELIDE_FFN") | llms_elide_mask("LLMS_DS4_ELIDE_SHARED")) & bit) != 0;
+        if ((er || es) && !llms_zero) { llms_zero = ds4_gpu_tensor_alloc((uint64_t)64 * DS4_N_EMBD * sizeof(float)); ok = llms_zero && ds4_gpu_tensor_fill_f32(llms_zero, 0.0f, (uint64_t)64 * DS4_N_EMBD); }
+        if (ok && er) ok = ds4_gpu_tensor_copy(ak->routed, 0, llms_zero, 0, zb) != 0;
+        if (ok && es) ok = ds4_gpu_tensor_copy(ak->shared, 0, llms_zero, 0, zb) != 0;
+    }
+    ok = ok && ds4_gpu_llms_owed_force(-1) && (llms_price_skip(256) || (ds4_gpu_add_tensor(ak->block, ak->routed, ak->shared, h * DS4_N_EMBD) &&   /* llms Q4L_K2SPLIT */
+        (!(g_llms_tail_publish && il + 1u == DS4_N_LAYER) || llms_tail_capture_l39_at(ak, h, (uint32_t)g_llms_pipe_grp * h)) &&   /* llms TAILFULL (apply_tailfull6.py): the pipelined group's rows are batch rows k * h .. */
+        ds4_gpu_dsv41_quantize(ak->block, DS4_N_EMBD, h, DS4_V41_BF16) &&
+        ds4_gpu_hc_expand_split_tensor(ak->residual, ak->block, ak->after_attn, ak->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(ak->residual, DS4_N_EMBD * DS4_N_HC, h, DS4_V41_BF16)));
+    if (!ok) fprintf(stderr, "llms pipe: P2 failed layer %u\n", il);
+    return ok;
+}
+/* llms LLMS_DS4_PIPE_GROUPS (apply_ds4_pipe_groups.py): the software pipeline over G groups of rows / G rows (2 = ds4x's two-group form) */
+#define LLMS_PIPE_MAXG 8
+/* llms PIPE_AUTO (apply_ds4_pipe_auto.py): one group or two, chosen by probing the step period */
+static struct { int mode, probing, since; double t_prev, base[8], probe[8]; int nb, np; uint64_t steps1, steps2, probes, switches; } g_llms_pa = { .mode = 2 };
+static void llms_pa_report(void) { fprintf(stderr, "llms pipe auto: %llu steps in one group, %llu in two; %llu probes, %llu switches; ends in %d\n",
+    (unsigned long long)g_llms_pa.steps1, (unsigned long long)g_llms_pa.steps2, (unsigned long long)g_llms_pa.probes, (unsigned long long)g_llms_pa.switches, g_llms_pa.mode); }
+static double llms_pa_median(const double *v, int n) {
+    double s[8]; for (int i = 0; i < n; i++) s[i] = v[i];
+    for (int i = 1; i < n; i++) { const double x = s[i]; int j = i; while (j > 0 && s[j - 1] > x) { s[j] = s[j - 1]; j--; } s[j] = x; }
+    return n ? (n & 1 ? s[n / 2] : 0.5 * (s[n / 2 - 1] + s[n / 2])) : 0.0;
+}
+static int llms_pipe_auto(void) {
+    enum { PERIOD = 160, PROBE = 10, SKIP = 2, KEEP = 8 };
+    static int reg; if (!reg) { reg = 1; atexit(llms_pa_report); fprintf(stderr, "llms: batch pipe groups AUTO (two groups; probes of one every %d steps)\n", PERIOD); }
+    const double now = now_sec();
+    const double dt = g_llms_pa.t_prev > 0.0 ? now - g_llms_pa.t_prev : 0.0;   /* the period of the step that just ended */
+    g_llms_pa.t_prev = now;
+    if (dt > 0.0) {
+        if (g_llms_pa.probing) { if (g_llms_pa.since > SKIP && g_llms_pa.np < KEEP) g_llms_pa.probe[g_llms_pa.np++] = dt; }
+        else if (g_llms_pa.since > SKIP) { if (g_llms_pa.nb < KEEP) g_llms_pa.base[g_llms_pa.nb++] = dt; else { memmove(g_llms_pa.base, g_llms_pa.base + 1, (KEEP - 1) * sizeof(double)); g_llms_pa.base[KEEP - 1] = dt; } }
+    }
+    g_llms_pa.since++;
+    if (g_llms_pa.probing && g_llms_pa.since > PROBE) {   /* the probe is over: keep the other schedule or go back */
+        const double mb = llms_pa_median(g_llms_pa.base, g_llms_pa.nb), mp = llms_pa_median(g_llms_pa.probe, g_llms_pa.np);
+        if (!(g_llms_pa.np >= 4 && g_llms_pa.nb >= 4 && mp < 0.97 * mb)) g_llms_pa.mode = 3 - g_llms_pa.mode; else { g_llms_pa.switches++; g_llms_pa.nb = 0; }
+        g_llms_pa.probing = 0; g_llms_pa.since = 0; g_llms_pa.np = 0;
+    } else if (!g_llms_pa.probing && g_llms_pa.since > PERIOD && g_llms_pa.nb >= 4) {
+        g_llms_pa.mode = 3 - g_llms_pa.mode; g_llms_pa.probing = 1; g_llms_pa.since = 0; g_llms_pa.np = 0; g_llms_pa.probes++;
+    }
+    if (g_llms_pa.mode == 1) g_llms_pa.steps1++; else g_llms_pa.steps2++;
+    return g_llms_pa.mode;
+}
+static int llms_pipe_ng(uint32_t rows) {
+    static int want = -1; static int llms_auto;
+    if (want < 0) { const char *e = getenv("LLMS_DS4_PIPE_GROUPS"); llms_auto = e && !strcmp(e, "auto"); want = e && *e ? atoi(e) : 2; if (llms_auto) want = 2; if (want < 1 || want > LLMS_PIPE_MAXG) want = 2;   /* llms ONE_GROUP (apply_ds4_one_group.py): 1 = every row in one group */
+                    if (want != 2) fprintf(stderr, "llms: batch pipe with %d groups (needs ASYNC=1, rows %% %d == 0, CPU shared / experts off)\n", want, want); }
+    if (llms_auto && llms_pipe_async() == 1 && !(rows % 2u)) return llms_pipe_auto();   /* llms PIPE_AUTO; llms ANE_FIX */
+    if (want == 2) return ((rows % 2u) && llms_pipe_odd()) ? 1 : 2;   /* llms PIPE_ODD2 (apply_pipe_odd2.py): odd rows -> one group */
+    static int said;
+    if (llms_pipe_async() != 1 || rows % (uint32_t)want) {
+        if (!said++) fprintf(stderr, "llms: batch pipe falls back to two groups (%u rows)\n", rows);
+        return 2;
+    }
+    return want;
+}
+static int llms_pipe_odd(void) {   /* llms PIPE_ODD: 1 = odd row counts into the one-group pipeline, 2 = canary */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_PIPE_ODD"); on = e && *e && *e != '0' ? (!strcmp(e, "canary") ? 2 : 1) : 0;
+                  if (on) fprintf(stderr, on == 2 ? "llms: pipe odd -- CANARY: odd steps drop the last row's MoE output\n" : "llms: pipe odd (odd row counts through the one-group pipeline)\n"); }
+    return on;
+}
+static unsigned long g_llms_pipe_odd_steps;   /* llms PIPE_ODD: odd-row steps the pipeline ran */
+static void llms_pipe_odd_report(void) { if (g_llms_pipe_odd_steps) fprintf(stderr, "llms pipe odd: %lu odd-row steps through the pipeline\n", g_llms_pipe_odd_steps); }
+void ds4_gpu_llms_set_pad_ok(int on);   /* llms PAD32 (ds4_metal.m) */
+/* llms DUMP_TARGET (apply_ds4_dump_target.py): DSpark's input at layers 37-39 per row and step, to a file (see the generator's docstring) */
+static FILE *g_llms_dt_file; static ds4_gpu_tensor *g_llms_dt_buf; static uint32_t g_llms_dt_cap_rows; static uint64_t g_llms_dt_steps;
+static void llms_dump_target_report(void) { if (g_llms_dt_file) { fclose(g_llms_dt_file); fprintf(stderr, "llms dump target: %llu steps written\n", (unsigned long long)g_llms_dt_steps); } }
+static int llms_dump_target(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_DUMP_TARGET"); on = 0;
+                  if (e && *e) { g_llms_dt_file = fopen(e, "wb"); if (g_llms_dt_file) { on = 1; atexit(llms_dump_target_report); fprintf(stderr, "llms: dump target (DSpark's input: the HC stream entering layers 37-39, mean of 4 copies, f16) to %s\n", e); }
+                                 else fprintf(stderr, "llms: DUMP_TARGET cannot open %s\n", e); } }
+    return on;
+}
+static unsigned long long g_llms_slp_n;   /* llms STEP_SLEEP */
+static void llms_slp_report(void) { fprintf(stderr, "llms step sleep: %llu sleeps\n", g_llms_slp_n); }
+static bool llms_pipe_layers(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs, const uint32_t *positions,
+                             ds4_gpu_tensor **queries, ds4_gpu_tensor **heads,
+                             const ds4_model *model, const ds4_weights *weights, uint32_t rows) {
+    ds4_gpu_llms_step_clock();   /* llms STEP_CLOCK: the expert cache's aging, once per batched step */
+    g_llms_async_step = -1;
+    {   static long slp_us = -1;
+        if (slp_us < 0) { const char *e = getenv("LLMS_DS4_STEP_SLEEP_US"); slp_us = e && *e ? atol(e) : 0;
+                          if (slp_us > 0) fprintf(stderr, "llms: step sleep %ld us at each step's start (INSTRUMENT; ALT slp)\n", slp_us); }
+        if (slp_us > 0 && !ds4_gpu_llms_alt_off("slp")) { usleep((useconds_t)slp_us);
+            if (g_llms_slp_n++ == 0) atexit(llms_slp_report); }
+    }
+    { const int llms_m = llms_pipe_async_env(); g_llms_async_step = (llms_m == 2 && g_llms_async2_serial && ds4_gpu_llms_alt_off_next("defer")) ? 1 : llms_m; }   /* llms ASYNC2_SERIAL: ALT defer = mode 1 on odd steps (the step counter advances in the first P1) */
+    const int NG = llms_pipe_ng(rows);
+    g_llms_pipe_ng = NG;
+    ds4_gpu_llms_set_pad_ok(NG == 1);   /* llms PAD32: rows h..31 of the group's batch views are this step's scratch only with one group */
+    const uint32_t h = rows / (uint32_t)NG;
+    ds41_gpu_graph G[LLMS_PIPE_MAXG];
+    ds41_prefill_row A[LLMS_PIPE_MAXG];
+    void *hd[LLMS_PIPE_MAXG];
+    for (int k = 0; k < NG; k++) { G[k] = *g; hd[k] = NULL; }
+    memset(A, 0, sizeof(A));
+    bool ok = true;
+    const uint64_t cap = g->prefill_cap;
+#define DS41_PIPE_VIEW(name, width) \
+    for (int k = 0; ok && k < NG; k++) { \
+        ok = (A[k].name = ds4_gpu_tensor_view(g->batch.name, (uint64_t)k * h * (width) * sizeof(float), (uint64_t)h * (width) * sizeof(float))) != NULL; \
+        if (ok && k > 0) ok = (G[k].batch.name = ds4_gpu_tensor_view(g->batch.name, (uint64_t)k * h * (width) * sizeof(float), (cap - (uint64_t)k * h) * (width) * sizeof(float))) != NULL; \
+    }
+    DS41_PREFILL_ROWS(DS41_PIPE_VIEW)
+#undef DS41_PIPE_VIEW
+    for (int k = 1; ok && k < NG; k++) {
+        G[k].rows_view = g->rows_view + (uint64_t)k * h;
+        ok = (G[k].prefill_tokens = ds4_gpu_tensor_view(g->prefill_tokens, (uint64_t)k * h * sizeof(int), (cap - (uint64_t)k * h) * sizeof(int))) != NULL;
+    }
+    static unsigned long steps; if (!steps++) fprintf(stderr, "llms: batch pipe on (%u rows in %d groups)\n", rows, NG);
+    if (rows % 2u) { static int reg; if (!reg++) atexit(llms_pipe_odd_report); g_llms_pipe_odd_steps++; }   /* llms PIPE_ODD */
+    const int llms_async = llms_pipe_async();
+    g_llms_hd = llms_async == 2 ? hd : NULL;
+    for (int k = 0; ok && k < NG; k++)
+        ok = (k == 0 || ds4_gpu_begin_commands()) && llms_pipe_p1(g, &G[k], &A[k], (uint32_t)k * h, h, graphs, positions, queries, heads, model, weights, 0, &hd[k]);
+    const int llms_dt = llms_dump_target() && DS4_N_LAYER == 40u;   /* llms DUMP_TARGET: targets 37, 38, 39 */
+    const uint64_t llms_dt_row = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (ok && llms_dt && rows > g_llms_dt_cap_rows) {
+        if (g_llms_dt_buf) ds4_gpu_tensor_free(g_llms_dt_buf);
+        g_llms_dt_buf = ds4_gpu_tensor_alloc(3u * (uint64_t)rows * llms_dt_row); g_llms_dt_cap_rows = g_llms_dt_buf ? rows : 0;
+        ok = g_llms_dt_buf != NULL;
+    }
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        for (int k = 0; ok && k < NG; k++) {
+            ok = (g_llms_pipe_grp = k, llms_pipe_p2(&G[k], &A[k], h, model, weights, il, &hd[k]));
+            if (ok && llms_dt && il + 1 >= 37u && il + 1 <= 39u)   /* llms DUMP_TARGET: the stream entering layer il + 1, before its first pass */
+                ok = ds4_gpu_tensor_copy(g_llms_dt_buf, ((uint64_t)(il + 1u - 37u) * rows + (uint64_t)k * h) * llms_dt_row, A[k].residual, 0, (uint64_t)h * llms_dt_row) != 0;
+            if (ok && il + 1 < DS4_N_LAYER)
+                ok = llms_pipe_p1(g, &G[k], &A[k], (uint32_t)k * h, h, graphs, positions, queries, heads, model, weights, il + 1, &hd[k]);
+            else if (ok) {   /* last layer: its MoE also waits for its ticket */
+                ds4_gpu_llms_set_ledger_tag(0, (uint32_t)k, DS4_N_LAYER);   /* llms LEDGER_TAGS */
+                if (ok && llms_async) ok = (hd[k] = ds4_gpu_llms_close_nocommit()) != NULL && (llms_async == 2 ? llms_try_commit_all() : ds4_gpu_llms_commit_pending(hd[k]) != 0);
+            }
+        }
+    }
+    if (llms_async == 2) llms_flush_pending();
+    for (int k = 0; k < NG; k++) if (hd[k]) { if (llms_async) (void)ds4_gpu_llms_wait_pending(hd[k]); else (void)ds4_gpu_llms_wait_handle(hd[k]); hd[k] = NULL; }
+    g_llms_hd = NULL;
+    if (ok && llms_dt) {   /* llms DUMP_TARGET: the step's GPU work has completed (the waits above); average the 4 copies, write f16 */
+        static float *hcbuf; static uint16_t *hbuf; static uint32_t hcap;
+        if (rows > hcap) { free(hcbuf); free(hbuf); hcbuf = malloc((size_t)3 * rows * llms_dt_row); hbuf = malloc((size_t)3 * rows * DS4_N_EMBD * sizeof(uint16_t)); hcap = (hcbuf && hbuf) ? rows : 0; }
+        if (hcap >= rows && ds4_gpu_tensor_read(g_llms_dt_buf, 0, hcbuf, 3u * (uint64_t)rows * llms_dt_row)) {
+            for (uint64_t r = 0; r < 3ull * rows; r++)
+                for (uint32_t e = 0; e < DS4_N_EMBD; e++) {
+                    const float *v = hcbuf + r * DS4_N_HC * DS4_N_EMBD + e;
+                    float acc = 0.f; for (uint32_t c = 0; c < DS4_N_HC; c++) acc += v[(uint64_t)c * DS4_N_EMBD];
+                    const _Float16 hv = (_Float16)(acc / (float)DS4_N_HC); memcpy(&hbuf[r * DS4_N_EMBD + e], &hv, 2);
+                }
+            const uint32_t magic = 0x44535054u;
+            fwrite(&magic, 4, 1, g_llms_dt_file); fwrite(&rows, 4, 1, g_llms_dt_file); fwrite(positions, 4, rows, g_llms_dt_file);
+            fwrite(hbuf, 2, (size_t)3 * rows * DS4_N_EMBD, g_llms_dt_file); g_llms_dt_steps++;
+        }
+    }
+    if (ok && !ds4_gpu_commands_active()) ok = ds4_gpu_begin_commands();
+#define DS41_PIPE_FREE(name, width) for (int k = 0; k < NG; k++) { ds4_gpu_tensor_free(A[k].name); if (k > 0) ds4_gpu_tensor_free(G[k].batch.name); }
+    DS41_PREFILL_ROWS(DS41_PIPE_FREE)
+#undef DS41_PIPE_FREE
+    for (int k = 1; k < NG; k++) ds4_gpu_tensor_free(G[k].prefill_tokens);
+    g_llms_async_step = -1;   /* llms ASYNC2_SERIAL */
+    ds4_gpu_llms_set_pad_ok(0);   /* llms PAD32 */
+    return ok;
+}
+static long g_llms_bs_call, g_llms_bs_at = -2;   /* llms BATCH_STAGE_SPLIT */
+static void llms_bstage(const char *name, uint32_t il, uint32_t rows) {
+    if (g_llms_bs_at == -2) { const char *e = getenv("LLMS_DS4_BATCH_STAGE_SPLIT"); g_llms_bs_at = (e && *e) ? (!strcmp(e, "all") ? -3 : atol(e)) : -1;
+                              if (g_llms_bs_at == -3) fprintf(stderr, "llms: bstage all (every batched call's stages in tagged command buffers: kind 5, stage 1-7, layer)\n"); }
+    if (g_llms_bs_at == -3) {
+        static const char *nm[7] = {"pre", "proj", "attn", "out", "ffn_pre", "moe", "post"}; uint32_t k = 0; while (k < 7u && strcmp(nm[k], name)) k++;
+        ds4_gpu_llms_set_ledger_tag(5u, k + 1u, il); (void)ds4_gpu_end_commands(); (void)ds4_gpu_begin_commands(); ds4_gpu_llms_tl_phase(20u + (k + 1u) % 7u, il, rows); return; }
+    if (g_llms_bs_at < 0 || g_llms_bs_call != g_llms_bs_at) return;
+    fprintf(stderr, "llms bstage %s layer %u rows %u\n", name, il, rows);
+    (void)ds4_gpu_end_commands(); (void)ds4_gpu_begin_commands();
+}
+
+
+static int llms_vpipe(void) {
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("LLMS_DS4_VPIPE"); n = e && atoi(e) > 0 ? atoi(e) : 0; if (n) fprintf(stderr, "llms: vpipe (batched step: commit every %d layers without waiting; Engram table 1 in its own buffer)\n", n); }
+    return n;
+}
+static ds4_gpu_tensor *g_llms_vp_eng2; static uint64_t g_llms_vp_eng2_bytes; static uint64_t g_llms_vp_flushes;
+
+static int g_llms_verify_all; static ds4_gpu_tensor *g_llms_verify_buf; static uint64_t g_llms_verify_cap;
+static ds4_engram_history g_llms_verify_hist[DS4_TP_BATCH_MAX_ROWS]; static uint32_t g_llms_verify_pos0, g_llms_verify_rows;   /* llms SPEC_COPY: for the rollback */
+static bool llms_verify_save(const ds4_gpu_tensor *src, uint64_t src_off, uint64_t dst_off, uint64_t bytes) {
+    if (!g_llms_verify_buf || dst_off + bytes > g_llms_verify_cap) return false;
+    return ds4_gpu_tensor_copy(g_llms_verify_buf, dst_off, src, src_off, bytes) != 0;
+}
+static bool llms_veng_now(void) {
+    static int on = -1; static uint64_t n;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_VERIFY_ENG"); on = e && *e && *e != '0';
+                  if (on) { fprintf(stderr, "llms: verify eng (a verify step's Engram rows advised / read beside its first layers)\n");
+                            atexit_b(^{ fprintf(stderr, "llms verify eng: %llu verify steps on the one-token Engram path\n", (unsigned long long)n); }); } }
+    {
+
+
+        static int sp = -1; static uint64_t nsp;
+        if (sp < 0) { const char *e = getenv("LLMS_DS4_ENGRAM_SP"); sp = e && *e && *e != '0';
+                      if (sp) { fprintf(stderr, "llms: engram sp (a short-prefill call's Engram rows advised / read beside its first layers)\n");
+                                atexit_b(^{ fprintf(stderr, "llms engram sp: %llu short-prefill calls on the one-token Engram path\n", (unsigned long long)nsp); }); } }
+        if (sp && on && g_llms_sp_active && !g_llms_verify_all && !ds4_gpu_llms_alt_off("veng")) { nsp++; return true; }
+    }
+    if (!on || !g_llms_verify_all || ds4_gpu_llms_alt_off("veng")) return false;
+    n++; return true;
+}
+/* llms DSP41 capture (apply_dsp41.py): with g_llms_dsp_cap_on, the HC stream entering layers 37-39 of each row (<= 4) of a batched step:
+   g_llms_dsp_cap[layer - 37][row][4 x 5120], kept on the GPU for the DSpark drafter's ring */
+static int g_llms_dsp_cap_on; static ds4_gpu_tensor *g_llms_dsp_cap; static uint32_t g_llms_dsp_cap_rows; static uint64_t g_llms_dsp_cap_n;
+int ds4_gpu_llms_attn_out_g64(ds4_gpu_tensor *out, ds4_gpu_tensor *low, uint64_t out_a_offset, uint64_t out_b_offset, const ds4_gpu_tensor *heads, uint32_t rows);   /* llms AO_G64 */
+
+static int llms_attn_out_chunked(ds41_gpu_graph *g, const ds4_layer_weights *l, uint32_t rows) {
+    static int qc = -1; static uint64_t calls;
+    if (qc < 0) { const char *e = getenv("LLMS_DS4_Q4L_CHUNK"); qc = e && *e && *e != '0';
+                  if (qc) atexit_b(^{ fprintf(stderr, "llms q4l chunk ao: %llu wide attention outputs on the 4-bit grouped path\n", (unsigned long long)calls); }); }
+    if (!qc) return 0;
+    {   /* llms AO_G64 (apply_ao_g64.py): steps of >= 8 rows as 64-token MMA passes; off unless set */
+        static int ag = -1; if (ag < 0) { const char *e = getenv("LLMS_DS4_AO_G64"); ag = e && *e && *e != '0'; }
+        if (ag && rows >= 8u && ds4_gpu_llms_attn_out_g64(g->batch.block, g->batch.low, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, g->batch.heads, rows)) { calls++; return 1; }
+    }
+    uint32_t r = 0; int ok = 1;
+    while (ok && r < rows) {
+        const uint32_t left = rows - r, c = left == 5u ? 3u : (left >= 4u ? 4u : left);
+        ds4_gpu_tensor *bv = ds4_gpu_tensor_view(g->batch.block, (uint64_t)r * DS4_N_EMBD * sizeof(float), (uint64_t)c * DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *lv = ds4_gpu_tensor_view(g->batch.low, (uint64_t)r * 8192u * sizeof(float), (uint64_t)c * 8192u * sizeof(float));
+        ds4_gpu_tensor *hv = ds4_gpu_tensor_view(g->batch.heads, (uint64_t)r * 32768u * sizeof(float), (uint64_t)c * 32768u * sizeof(float));
+        ok = bv && lv && hv && ds4_gpu_llms_attn_out_k(bv, lv, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, hv, c);
+        ds4_gpu_tensor_free(bv); ds4_gpu_tensor_free(lv); ds4_gpu_tensor_free(hv); r += c;
+    }
+    if (ok) calls++;
+    return ok;
+}
+
+/* ASTRA_SP_ATTN: no persistent defer flag; caller owns row lifetimes. */
+static int llms_sp_attn_verify(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_SP_ATTN_VERIFY"); on = e && *e && *e != '0'; if (on) fprintf(stderr, "llms: sp attn verify (Astra's batched short-prefill attention also for the verify's rows)\n"); }
+    return on;
+}
+static int astra_sp_attn_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("LLMS_DS4_ASTRA_SP_ATTN");
+        mode = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+        if (mode) fprintf(stderr, "astra short-prefill split batching%s\n",
+                          mode == 2 ? " CANARY: batched kernel skipped (heads stale)" : "");
+    }
+    return mode;
+}
+static bool astra_sp_attn_eligible(const ds41_gpu_graph *g,
+        ds41_gpu_graph *const *graphs, const uint32_t *positions,
+        uint32_t rows, uint32_t prefill_rows, uint32_t il, bool batch_output) {
+#ifndef __APPLE__
+    return false;
+#else
+    if (!astra_sp_attn_mode() || !g_llms_sp_active || (g_llms_verify_all && !llms_sp_attn_verify()) ||
+        prefill_rows != rows || rows < 2u || rows > 64u || g->tp_world != 1 ||
+        !batch_output || g_llms_win_pre) return false;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const char *idx = getenv("LLMS_DS4_V41_IDX_DECODE");
+    const char *mq = getenv("LLMS_DS4_MQA4_IDX");
+    if (!ratio || (positions[0] + 1u) / ratio < DS4_N_INDEXER_TOP_K ||
+        !idx || !*idx || *idx == '0' || (mq && *mq && *mq != '0')) return false;
+    if (il >= 20u && g_llms_ced_brs && positions[0] < g_llms_ced_brs) return false;
+    for (uint32_t i = 0; i < rows; i++)
+        if (graphs[i] != graphs[0] || positions[i] != positions[0] + i) return false;
+    return !ds4_gpu_llms_alt_off("aspa");
+#endif
+}
+
+
+
+
+static int g_llms_ring_try, g_llms_ring_layer; static uint64_t g_llms_ring_layers, g_llms_ring_fallbacks;
+int ds4_gpu_llms_att2_ring_set(const ds4_gpu_tensor *newkv, uint32_t prev);
+static int llms_att2_ring(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ATT2_RING"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: att2 ring -- CANARY: the ring start shifted by one row\n"
+                                                    : "llms: att2 ring (the batched rows attention reads its raw window from the ring and the new rows from batch.kv: no snapshot, no append copy)\n");
+                            atexit_b(^{ fprintf(stderr, "llms att2 ring: %llu layers read in place, %llu took the copies\n", (unsigned long long)g_llms_ring_layers, (unsigned long long)g_llms_ring_fallbacks); }); } }
+    return on;
+}
+static bool llms_ring_snapshot_copies(ds41_gpu_graph *g, const ds41_gpu_graph *session, uint32_t il, uint32_t start, uint32_t previous) {   /* llms ATT2_RING: the snapshot exactly as astra_sp_attn_snapshot takes it */
+    const uint32_t slot = (start - previous) % 128u;
+    const uint32_t first = previous < 128u - slot ? previous : 128u - slot;
+    const uint64_t bytes = DS4_N_HEAD_DIM * sizeof(float);
+    return (!first || ds4_gpu_tensor_copy(g->raw_prefill, 0, session->window[il], slot * bytes, first * bytes)) &&
+        (previous == first || ds4_gpu_tensor_copy(g->raw_prefill, first * bytes, session->window[il], 0, (previous - first) * bytes));
+}
+static bool astra_sp_attn_snapshot(ds41_gpu_graph *g, const ds41_gpu_graph *session,
+        uint32_t il, uint32_t start, uint32_t *previous) {
+    const uint32_t floor = il >= 20u ? g_llms_ced_brs : 0u;
+    *previous = start - floor < 127u ? start - floor : 127u;
+    const uint32_t slot = (start - *previous) % 128u;
+    const uint32_t first = *previous < 128u - slot ? *previous : 128u - slot;
+    const uint64_t bytes = DS4_N_HEAD_DIM * sizeof(float);
+    if (g_llms_ring_try) return true;   /* llms ATT2_RING: the copies wait; llms_ring_snapshot_copies takes them if the ring cannot be read in place */
+    return (!first || ds4_gpu_tensor_copy(g->raw_prefill, 0, session->window[il], slot * bytes, first * bytes)) &&
+        (*previous == first || ds4_gpu_tensor_copy(g->raw_prefill, first * bytes, session->window[il], 0, (*previous - first) * bytes));
+}
+static unsigned long long g_llms_astra_tail_layers, g_llms_astra_wins;
+static void llms_astra_tail_report(void) { fprintf(stderr, "llms astra tail: %llu layers with one tail dispatch, %llu with batched window writes\n", g_llms_astra_tail_layers, g_llms_astra_wins); }
+static int llms_astra_tail(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ASTRA_TAIL"); on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                  if (on) { fprintf(stderr, on == 2 ? "llms: astra tail -- CANARY: the tail's BF16 choice flipped\n"
+                                                    : "llms: astra tail (Astra's per-row inverse-rope tail in one dispatch; its window writes batched)\n");
+                            atexit(llms_astra_tail_report); } }
+    return on;
+}
+static bool astra_sp_attn_finish(ds41_gpu_graph *g, ds41_gpu_graph *session,
+        const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+        uint32_t start, uint32_t rows, uint32_t previous, ds4_gpu_tensor **heads) {
+#ifndef __APPLE__
+    return false;
+#else
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8u ? 0u : il < 14u ? 1u : il < 20u ? 2u : 3u;
+    const uint32_t n_comp = (start + rows) / ratio;
+    const uint64_t raw_bytes = DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t q_bytes = DS4_N_HEAD * raw_bytes;
+    const uint64_t id_bytes = DS4_N_INDEXER_TOP_K * sizeof(int32_t);
+    const bool llms_ring = g_llms_ring_layer && rows <= 16u && previous >= 1u && astra_sp_attn_mode() != 2;   /* llms ATT2_RING */
+    g_llms_ring_layer = 0;
+    if (!llms_ring && !ds4_gpu_tensor_copy(g->raw_prefill, previous * raw_bytes, g->batch.kv, 0, rows * raw_bytes)) return false;
+    const ds4_gpu_tensor *comp = llms_comp_half(session, owner, n_comp);
+    if (!comp) return false;
+    bool ok = true, llms_ring_done = false;
+    if (llms_ring) {   /* llms ATT2_RING: one chunk; raw rows from the ring at the snapshot's slot, the new rows from batch.kv */
+        ds4_gpu_tensor *q = ds4_gpu_tensor_view(g->batch.q, 0, rows * q_bytes);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(g->batch.heads, 0, rows * q_bytes);
+        ds4_gpu_tensor *ids = ds4_gpu_tensor_view(g->batch.selected_comp, 0, rows * id_bytes);
+        const uint32_t slot = (start - previous + (llms_att2_ring() == 2 ? 1u : 0u)) % 128u;
+        int r = 0;
+        if (q && out && ids && ds4_gpu_llms_att2_ring_set(g->batch.kv, previous))
+            r = ds4_gpu_attention_indexed_mixed_batch_heads_tensor_ex(out, m->map, m->size, l->attn_sinks->abs_offset, q, session->window[il],
+                comp, llms_kv_half() == 1 ? 1u : 0u, ids, rows, start, previous + rows, 128u, slot,
+                n_comp, DS4_N_INDEXER_TOP_K, 128u, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM, 1u);
+        ds4_gpu_llms_att2_ring_set(NULL, 0u);
+        if (ids) ds4_gpu_tensor_free(ids);
+        if (out) ds4_gpu_tensor_free(out);
+        if (q) ds4_gpu_tensor_free(q);
+        if (r) { llms_ring_done = true; g_llms_ring_layers++; }
+        else {   /* refused: the copies after all (nothing has written the ring or raw_prefill since the step began), then the original call */
+            g_llms_ring_fallbacks++;
+            ok = llms_ring_snapshot_copies(g, session, il, start, previous) &&
+                 ds4_gpu_tensor_copy(g->raw_prefill, previous * raw_bytes, g->batch.kv, 0, rows * raw_bytes);
+        }
+    }
+    for (uint32_t off = 0; ok && !llms_ring_done && off < rows; off += 16u) {
+        const uint32_t n = rows - off < 16u ? rows - off : 16u;
+        ds4_gpu_tensor *q = ds4_gpu_tensor_view(g->batch.q, off * q_bytes, n * q_bytes);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(g->batch.heads, off * q_bytes, n * q_bytes);
+        ds4_gpu_tensor *ids = ds4_gpu_tensor_view(g->batch.selected_comp, off * id_bytes, n * id_bytes);
+        ok = q && out && ids && (astra_sp_attn_mode() == 2 || ds4_gpu_attention_indexed_mixed_batch_heads_tensor_ex(
+            out, m->map, m->size, l->attn_sinks->abs_offset, q, g->raw_prefill,
+            comp, llms_kv_half() == 1 ? 1u : 0u, ids,
+            n, start + off, previous + off + n, g->prefill_cap + 128u, 0u,
+            n_comp, DS4_N_INDEXER_TOP_K, 128u, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM, 1u));
+        ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(q);
+    }
+    /* Same per-row tail as the adopted indexed path, including NO_BF16 policy. */
+    if (ok && llms_astra_tail() && rows <= 128u && !ds4_gpu_llms_alt_off("astt")) {   /* llms ASTRA_TAIL: the same tail in one dispatch */
+        uint32_t p[128];
+        for (uint32_t i = 0; i < rows; i++) p[i] = start + i;
+        const char *nb = getenv("LLMS_DS4_NO_BF16");
+        const bool bf16 = !(nb && *nb && *nb != '0' && !ds4_gpu_llms_alt_off("nobf"));   /* ds4_gpu_dsv41_quantize's own skip rule */
+        ok = llms_rope_rows(heads, p, rows, DS4_N_HEAD_DIM, DS4_N_HEAD, il, true, llms_astra_tail() == 2 ? !bf16 : bf16);
+        if (ok) g_llms_astra_tail_layers++;
+    } else
+    for (uint32_t i = 0; ok && i < rows; i++)
+        ok = ds41_bf16(heads[i], DS4_N_HEAD * DS4_N_HEAD_DIM) &&
+             ds41_rope(heads[i], DS4_N_HEAD, DS4_N_HEAD_DIM, il, start + i, true);
+    if (ok && g_llms_astra_wdefer) {   /* llms ASTRA_TAIL: the rows' window writes, deferred from the per-row loop: <= 2 ring pieces */
+        const uint32_t s0 = start % 128u, n1 = rows < 128u - s0 ? rows : 128u - s0;
+        ok = ds4_gpu_tensor_copy(session->window[il], (uint64_t)s0 * raw_bytes, g->batch.kv, 0, (uint64_t)n1 * raw_bytes) &&
+             (n1 == rows || ds4_gpu_tensor_copy(session->window[il], 0, g->batch.kv, (uint64_t)n1 * raw_bytes, (uint64_t)(rows - n1) * raw_bytes));
+        if (ok) g_llms_astra_wins++;
+    }
+    /* llms: the host-side zero fill was blind (it ran before the deferred GPU work); the canary skips the kernel above instead */
+    static uint64_t calls, row_count;
+    if (ok) {
+        if (!calls++) atexit_b(^{ fprintf(stderr, "astra short-prefill attention: %llu layers, %llu rows\n",
+                                         (unsigned long long)calls, (unsigned long long)row_count); });
+        row_count += rows;
+    }
+    return ok;
+#endif
+}
+
+static uint64_t g_llms_sp_vrows_layers;
+static int llms_sp_vrows(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_SP_VROWS"); on = e && *e && *e != '0' ? atoi(e) : 0;
+                  if (on) { fprintf(stderr, on >= 2 ? "llms: sp vrows 2 (the short prefill's per-row rope / kv quantize AND indexer + compressor projections batched over its rows)\n"
+                                                  : "llms: sp vrows (the short prefill's per-row rope / kv quantize batched over its rows)\n");
+                            atexit_b(^{ fprintf(stderr, "llms sp vrows: %llu layer steps batched\n", (unsigned long long)g_llms_sp_vrows_layers); }); } }
+    return on;
+}
+static bool llms_sp_rows_project(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *weight, const ds4_gpu_tensor *in, uint32_t rows, bool bf16) {   /* llms SP_VROWS 3: 4-row groups (the verify's exact k-row path) */
+    if (g_llms_verify_all || llms_sp_vrows() < 3) return ds41_project_rows(out, m, weight, in, rows, bf16);
+    const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
+    for (uint32_t r0 = 0; r0 < rows; r0 += 4u) {
+        const uint32_t n = rows - r0 < 4u ? rows - r0 : 4u;
+        ds4_gpu_tensor *iv = ds4_gpu_tensor_view(in, (uint64_t)r0 * width * 4u, (uint64_t)n * width * 4u);
+        ds4_gpu_tensor *ov = ds4_gpu_tensor_view(out, (uint64_t)r0 * outputs * 4u, (uint64_t)n * outputs * 4u);
+        const bool ok = iv && ov && (n >= 2u ? ds4_gpu_dsv41_projection_rows(ov, m->map, m->size, weight->abs_offset, width, outputs, n, iv) != 0
+                                             : ds41_matmul(ov, m, weight, iv, false));
+        if (ov) ds4_gpu_tensor_free(ov);
+        if (iv) ds4_gpu_tensor_free(iv);
+        if (!ok) return false;
+    }
+    return !bf16 || ds4_gpu_dsv41_quantize(out, outputs, rows, DS4_V41_BF16) != 0;
+}
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
-    if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
+    { static uint32_t llms_bstep; ds4_gpu_llms_set_step(++llms_bstep); }
+    if (!graphs || !tokens || count < (llms_verify_one() ? 1 : 2) || count > DS4_TP_BATCH_MAX_ROWS ||   /* llms VERIFY_ONE */
         prefill_rows > (uint32_t)count) return false;
     /* Sparse block masks scale with context, even when prefill caps match.
      * Attention and Engram history remain private to each session. */
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
-    const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
+    g_llms_bs_call++;
+    const bool prefill_only = prefill_rows == rows && !g_llms_verify_all && !g->verify_prefix;   /* llms VERIFY_ROWS: consecutive rows, all with logits; upstream: its verify prefix */
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds41_prefill_row active = {0};
@@ -42967,10 +46404,78 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    const int llms_epar = llms_engram_par();   /* llms LLMS_DS4_ENGRAM_PAR: hashes first, then all rows' table reads in parallel */
+    if (ok && llms_epar && count > 1 && count <= (int)DS4_TP_BATCH_MAX_ROWS) {
+        const double t0 = now_sec();
+        for (int i = 0; ok && i < count; i++) {
+            ds41_gpu_graph *s = graphs[i];
+            const bool continued = i > 0 && (uint32_t)i < prefill_rows;
+            positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
+            history[i] = continued ? history[i - 1] : s->history;
+            ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &g_llms_epar.ids[i][0][0]);
+            g_llms_epar.graph[i] = s;
+            g_llms_epar.dst[i] = engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
+        }
+        if (ok) {
+            g_llms_epar.swap = llms_epar == 2 || llms_engram_async() == 2; g_llms_epar.failed = 0;
+            bool llms_era_done = false;
+            if (llms_engram_ra() && (prefill_rows == 0 || llms_veng_now()) && !ds4_gpu_llms_alt_off_next("era")) {   /* llms ENGRAM_RA; ALT; llms VERIFY_ENG */
+                const bool sw = llms_engram_ra() == 2 || g_llms_epar.swap;
+                if (llms_engram_ra_map(&graphs[0]->table[0], 0) && llms_engram_ra_map(&graphs[0]->table[1], 1)) {
+                    const double t0 = now_sec();
+                    const int llms_ra2 = llms_engram_ra2() && !ds4_gpu_llms_alt_off_next("era2");   /* llms ENGRAM_RA2; ALT */
+                    for (unsigned table = 0; table < 2; table++) {   /* table 0 first: it is used at layer 1, table 1 at layer 14 */
+                        const unsigned src = sw ? 1u - table : table; const ds4_engram_table *t = &graphs[0]->table[src];
+                        if (llms_ra2) {   /* llms ENGRAM_RA2: the same advisories, on the background queue; the ids stay put until the joins */
+                            const int cnt = count; const int fdc = g_llms_era.fdc[src]; const uint64_t toff = t->offset, trows = t->rows;
+                            dispatch_group_async(g_llms_era2.grp[table], g_llms_era2.q, ^{
+                                const double tb = now_sec();
+                                for (int i = 0; i < cnt; i++) for (int c = 0; c < (int)DS4_ENGRAM_COLS; c++) {
+                                    const uint32_t row = g_llms_epar.ids[i][src][c];
+                                    if (row >= trows) continue;
+                                    struct radvisory ra = {.ra_offset = (off_t)(toff + (uint64_t)row * DS4_ENGRAM_ROW_BYTES), .ra_count = DS4_ENGRAM_ROW_BYTES};
+                                    (void)fcntl(fdc, F_RDADVISE, &ra);
+                                }
+                                g_llms_era2.bg_ms += (now_sec() - tb) * 1e3; });
+                            g_llms_era.advised += (uint64_t)count * DS4_ENGRAM_COLS; g_llms_era2.async[table] = 1;
+                        } else
+                        for (int i = 0; i < count; i++) for (int c = 0; c < (int)DS4_ENGRAM_COLS; c++) {
+                            const uint32_t row = g_llms_epar.ids[i][src][c];
+                            if (row >= t->rows) continue;   /* the read reports it */
+                            struct radvisory ra = {.ra_offset = (off_t)(t->offset + (uint64_t)row * DS4_ENGRAM_ROW_BYTES), .ra_count = DS4_ENGRAM_ROW_BYTES};
+                            (void)fcntl(g_llms_era.fdc[src], F_RDADVISE, &ra); g_llms_era.advised++;
+                        }
+                        g_llms_era.src[table] = src; g_llms_era.pending[table] = 1;
+                    }
+                    if (llms_ra2) g_llms_era2.steps++;
+                    g_llms_era.count = count; g_llms_era.steps++; g_llms_era.advise_ms += (now_sec() - t0) * 1e3;
+                    llms_era_done = true;
+                }
+            }
+            if (llms_era_done) { }
+            else if (llms_engram_async() && (prefill_rows == 0 || llms_veng_now()) && !ds4_gpu_llms_alt_off_next("easync")) {   /* llms ENGRAM_ASYNC; ALT; llms VERIFY_ENG */
+                if (!g_llms_easync.q) {
+                    g_llms_easync.q = dispatch_queue_create("llms.engram.async", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0));
+                    g_llms_easync.grp[0] = dispatch_group_create(); g_llms_easync.grp[1] = dispatch_group_create();
+                }
+                for (unsigned table = 0; table < 2; table++) {   /* table 0 first: it is used at layer 1, table 1 at layer 14 */
+                    for (int i = 0; i < count; i++) for (size_t part = 0; part < 3; part++)
+                        dispatch_group_async_f(g_llms_easync.grp[table], g_llms_easync.q, (void *)(uintptr_t)(((size_t)i * 2u + table) * 3u + part), llms_engram_async_job);
+                    g_llms_easync.pending[table] = 1;
+                }
+                g_llms_easync.steps++;
+            } else {
+            dispatch_apply_f((size_t)count * 2u, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &g_llms_epar, llms_engram_par_job);
+            ok = !g_llms_epar.failed;
+            }
+        }
+        g_llms_epar.steps++; g_llms_epar.ms += (now_sec() - t0) * 1e3;
+    }
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         uint32_t ids[2][DS4_ENGRAM_COLS];
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
+        if (!(llms_epar && count > 1 && count <= (int)DS4_TP_BATCH_MAX_ROWS)) {
         positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
         ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
@@ -42978,47 +46483,178 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
         for (unsigned table = 0; ok && table < 2; table++)
             ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        }
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
+            (llms_embd_cpu() ? llms_embd_cpu_row(g->rows_view[i].residual, model, weights, tokens[i]) :   /* llms EMBD_CPU */
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
-                weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
+                weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC));
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     uint32_t il = 0;
+    if (ok && getenv("LLMS_DS4_BATCH_PIPE") && getenv("LLMS_DS4_STREAM_ROW_BATCH") && prefill_rows == 0 && rows >= 4 &&
+        ((rows % 2) == 0 || (llms_pipe_odd() && llms_pipe_ng(rows) == 1)) && !shared_owner && g->tp_world == 1 && g->streaming) {   /* llms BATCH_PIPE; llms PIPE_ODD */
+        ok = llms_pipe_layers(g, graphs, positions, queries, heads, model, weights, rows);
+        if (!ok) fprintf(stderr, "llms pipe: step failed (%u rows)\n", rows);
+        il = DS4_N_LAYER;
+    }
+    int llms_qa_pend = -1;   /* llms HC_FUSEQA: the layer whose attention-side transition was deferred to its top */
+    bool llms_qa_done = false;
     for (; ok && il < DS4_N_LAYER; il++) {
+        { static int llms_ltd = -1; if (llms_ltd < 0) { llms_ltd = getenv("LLMS_DS4_LEDGER_LAYER") != NULL;  } if (llms_ltd) ds4_gpu_llms_set_ledger_tag(2, 3, il); }
+        llms_qa_done = false;
+        if (ok && llms_qa_pend == (int)il) {   /* llms HC_FUSEQA: the deferred expand + this layer's attention HC pre, fused, before any reader of the residual */
+            const ds4_layer_weights *lq = &weights->layer[il];
+            ds41_prefill_row *b = &active;
+            ok = ds4_gpu_llms_owed_force(-1) &&
+                 ds4_gpu_llms_hcq(b->residual, b->block, b->after_attn, b->ffn_split, b->ffn_split, b->x, b->norm, b->mix, model->map, model->size,
+                                  lq->attn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS, llms_hcqa() == 2, rows) != 0;
+            if (ok) {
+                const ds4_model *m = model;   /* LLMS_OWED_CONSTS names m */
+                ds4_gpu_llms_owe(0, &(ds4_gpu_llms_owed){ .kind = 2, .split = b->attn_split, .mix = b->mix, .xo = b->x, .no = b->norm, .hin = b->residual, .pre = b->ffn_split,
+                    .pre_stride = 24u, .rows = rows, .flags = 2 + ((llms_hcf1() == 3) ? 4 : 0), .fn_off = lq->hc_attn_fn->abs_offset, .scale_off = lq->hc_attn_scale->abs_offset,
+                    .base_off = lq->hc_attn_base->abs_offset, .nw_off = lq->attn_norm->abs_offset, .take_iters = DS4_N_HC_SINKHORN_ITER, LLMS_OWED_CONSTS });   /* llms HC_OWED */
+                g_llms_hcqa_n++;
+                llms_qa_done = true;
+            } else fprintf(stderr, "llms batch fail: hc fuseqa layer %u\n", il);
+            llms_qa_pend = -1;
+        }   /* llms LEDGER_LAYER: the verify forward's layer il */
+        if (g_llms_ced_lmax < 39 && (int)il > g_llms_ced_lmax) {   /* llms CED_SP: the rest of the decoder is outside every row's suffix */
+            if (il == 20u) {   /* encoder only: the decoder's global KV / indexer K come from H_20 */
+                const ds4_layer_weights *l20 = &weights->layer[20];
+                ok = ds41_before_attention_batch(g, &active, model, l20, 20u, rows) &&
+                     ds41_attention_publish_batch(g, &active, model, l20, 20u, positions[0], rows);
+                if (!ok) fprintf(stderr, "llms ced sp: layer-20 publication failed\n");
+            }
+            break;
+        }
         const ds4_layer_weights *l = &weights->layer[il];
+        bool llms_vp_done = false;   /* llms VPIPE: the before-attention step already ran on the separate Engram buffer */
+        if (ok && !g_llms_verify_all && prefill_rows > 0u && il >= 37u && il <= 39u && llms_dsp_pc_wanted())   /* llms DSP41_PROMPT: a short prefill's rows */
+            ok = llms_dsp_pc_rows(active.residual, il, 0, prefill_rows, positions[0]);
+        if (ok && g_llms_dsp_cap_on && g_llms_dsp_cap && il >= 37u && il <= 39u && rows <= LLMS_DSP_CAPR) {   /* llms DSP41: the stream entering this layer; llms LOOKUP: <= 9 rows */
+            ok = ds4_gpu_tensor_copy(g_llms_dsp_cap, (uint64_t)(il - 37u) * LLMS_DSP_CAPR * DS4_N_HC * DS4_N_EMBD * sizeof(float), active.residual, 0,
+                                     (uint64_t)rows * DS4_N_HC * DS4_N_EMBD * sizeof(float)) != 0;
+            if (il == 39u) { g_llms_dsp_cap_rows = rows; g_llms_dsp_cap_n++; }
+        }
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
+            if (!llms_engram_join(table)) { fprintf(stderr, "llms engram async: a table read failed (layer %u)\n", il); ok = false; }   /* llms ENGRAM_ASYNC */
+            const bool llms_vp_e2 = llms_vpipe() && table == 1u && !ds4_gpu_llms_alt_off("vpipe");   /* llms VPIPE */
+            if (llms_vp_e2) {
+                const uint64_t need = (uint64_t)count * sizeof(graphs[0]->rows[table]);
+                if (g_llms_vp_eng2_bytes < need) { if (g_llms_vp_eng2) ds4_gpu_tensor_free(g_llms_vp_eng2); g_llms_vp_eng2 = ds4_gpu_tensor_alloc_managed(need); g_llms_vp_eng2_bytes = g_llms_vp_eng2 ? need : 0; }
+                if (!g_llms_vp_eng2) ok = false;
+            }
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
-                ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
+                ok = llms_vp_e2 ? ds4_gpu_tensor_write(g_llms_vp_eng2, (uint64_t)i * sizeof(s->rows[table]),
+                    engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table], sizeof(s->rows[table])) :
+                    ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
                     engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
                     sizeof(s->rows[table]));
             }
+            {   /* llms ENG_HASH (apply_verify_eng.py): FNV-1a over every Engram row this step writes, per table */
+                static int eh = -1; static uint64_t hh[2] = {1469598103934665603ull, 1469598103934665603ull}, hn[2];
+                if (eh < 0) { eh = getenv("LLMS_DS4_ENG_HASH") != NULL;
+                              if (eh) atexit_b(^{ fprintf(stderr, "llms eng hash: table 0 %016llx (%llu rows), table 1 %016llx (%llu rows)\n",
+                                  (unsigned long long)hh[0], (unsigned long long)hn[0], (unsigned long long)hh[1], (unsigned long long)hn[1]); }); }
+                for (int i = 0; ok && eh && i < count; i++) {
+                    const unsigned char *pb = (const unsigned char *)(engram && (uint32_t)i < prefill_rows ? engram[i][table] : graphs[i]->rows[table]);
+                    for (size_t q = 0; q < sizeof(graphs[0]->rows[table]); q++) { hh[table] ^= pb[q]; hh[table] *= 1099511628211ull; }
+                    hn[table]++;
+                }
+            }
+            if (!ok) fprintf(stderr, "llms batch fail: engram_rows write layer %u\n", il);
+            if (ok && llms_vp_e2) { ds4_gpu_tensor *v2 = ds4_gpu_tensor_view(g_llms_vp_eng2, 0, (uint64_t)count * sizeof(graphs[0]->rows[table]));
+                ds4_gpu_tensor *keep = active.engram_rows; active.engram_rows = v2;
+                ok = v2 != NULL && ds41_before_attention_batch(g, &active, model, l, il, rows); active.engram_rows = keep; ds4_gpu_tensor_free(v2);
+                if (!ok) fprintf(stderr, "llms batch fail: before_attention_batch (vpipe) layer %u\n", il);
+                llms_vp_done = true; }
         }
-        for (int i = 0; ok && i < count; i++)
-            ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
-                g->rows_view[i].residual, 1);
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
-            ds41_attention_project_batch(g, model, l, rows);
-        bool batch_output = false;
+        for (int i = 0; ok && i < count; i++)   /* upstream 5379c1c: DSpark capture (no-op unless configured) */
+            ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i], g->rows_view[i].residual, 1);
+        static int llms_bao_env = -1; if (llms_bao_env < 0) llms_bao_env = getenv("LLMS_DS4_BATCH_ATTN_OUT") != NULL;   /* llms GENV: read once */
+        const bool llms_bao = llms_bao_env && g->tp_world == 1 &&
+            l->attn_output_b->type == DS4_TENSOR_Q8_0;   /* llms BATCH_ATTN_OUT */
+        if (ok && !llms_vp_done && !llms_qa_done) { ok = ds41_before_attention_batch(g, &active, model, l, il, rows);
+            if (!ok) fprintf(stderr, "llms batch fail: before_attention_batch layer %u\n", il); }
+        if (ok) llms_bstage("pre", il, rows);
+        if (ok) { ok = ds41_attention_project_batch(g, model, l, rows);
+            if (!ok) fprintf(stderr, "llms batch fail: attention_project_batch layer %u\n", il); llms_bstage("proj", il, rows); }
+        {
+            static int vp = -1; static uint64_t vp_layers;
+            if (vp < 0) { const char *e = getenv("LLMS_DS4_VROWS_PRE"); vp = e && *e && *e != '0';
+                          if (vp) { fprintf(stderr, "llms: vrows pre (the verify's index / compressor projections, rope and quantize batched over its rows)\n");
+                                    atexit_b(^{ fprintf(stderr, "llms vrows pre: %llu layer steps batched\n", (unsigned long long)vp_layers); }); } }
+            if (ok && vp && (g_llms_verify_all || (g_llms_sp_active && prefill_rows == rows && llms_sp_vrows())) && g->tp_world == 1 && rows >= 2u && rows <= llms_rows_cap_c() && !ds4_gpu_llms_alt_off("vrp")) {   /* ALT vrp; llms SP_VROWS */
+                if (llms_idx_rows() == 1 && ds41_index_source(il) && (g_llms_verify_all || llms_sp_vrows() >= 2)) {   /* llms SP_VROWS: projections only at level 2 */
+                    ok = llms_sp_rows_project(g->batch.index_q, model, l->indexer_attn_q_b, g->batch.qr, rows, true) &&
+                         llms_sp_rows_project(g->batch.index_weights, model, l->indexer_proj, g->batch.norm, rows, true);
+                    g_llms_idx_rows_pre = ok;
+                }
+                if (ok && llms_comp_rows() == 1 && ds41_kv_source(il) && (g_llms_verify_all || llms_sp_vrows() >= 2)) {   /* llms SP_VROWS: projections only at level 2 */
+                    const uint32_t cr = ds4_layer_compress_ratio(il);
+                    ok = llms_sp_rows_project(g->batch.pool_kv, model, l->attn_compressor_kv, g->batch.norm, rows, cr == 1) &&
+                         (cr != 2 || llms_sp_rows_project(g->batch.pool_score, model, l->attn_compressor_gate, g->batch.norm, rows, false));
+                    g_llms_comp_rows_pre = ok;
+                }
+                if (ok && llms_rows_rope()) {
+                    ds4_gpu_tensor *qs[128], *kvs[128]; uint32_t ps[128];
+                    for (uint32_t i = 0; i < rows; i++) { qs[i] = queries[i]; kvs[i] = g->rows_view[i].kv; ps[i] = positions[i]; }
+                    ok = llms_rope_rows(qs, ps, rows, DS4_N_HEAD_DIM, DS4_N_HEAD, il, false, false) &&
+                         llms_rope_rows(kvs, ps, rows, DS4_N_HEAD_DIM, 1, il, false, false) &&
+                         ds4_gpu_dsv41_quantize(g->batch.kv, DS4_N_HEAD_DIM, rows, DS4_V41_FP8_E8M0);
+                    g_llms_rope_pre = ok;
+                    if (ok && g_llms_idx_rows_pre) {
+                        ds4_gpu_tensor *iq[128];
+                        for (uint32_t i = 0; i < rows; i++) iq[i] = g->rows_view[i].index_q;
+                        ok = llms_rope_rows(iq, ps, rows, 128, DS4_N_INDEXER_HEAD, il, false, false) &&
+                             ds4_gpu_dsv41_quantize(g->batch.index_q, 128, DS4_N_INDEXER_HEAD * rows, DS4_V41_FP4_E8M0);
+                        g_llms_idx_rope_pre = ok;
+                    }
+                }
+                if (ok) { vp_layers++; if (!g_llms_verify_all) g_llms_sp_vrows_layers++; }
+                if (!ok) fprintf(stderr, "llms batch fail: vrows pre layer %u\n", il);
+            }
+        }
+        bool batch_output = false;   /* upstream 0df64b6: one batched verification output projection -- only when our BATCH_ATTN_OUT is off (one writer) */
 #ifndef DS4_ROCM_BUILD
-        batch_output =
+        batch_output = !llms_bao &&
             l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
             !getenv("DS4_DISABLE_V41_BATCH_OUTPUT");
 #endif
+        const bool astra_sp_attn = ok && astra_sp_attn_eligible(g, graphs, positions, rows, prefill_rows, il, llms_bao);
+        uint32_t astra_sp_previous = 0;
+        g_llms_ring_try = astra_sp_attn && llms_att2_ring() && g_llms_rope_pre && llms_astra_tail() == 1 && rows <= 16u && !ds4_gpu_llms_alt_off("a2r");       /* llms ATT2_RING */
+        if (astra_sp_attn) ok = astra_sp_attn_snapshot(g, graphs[0], il, positions[0], &astra_sp_previous);
+        g_llms_astra_wdefer = ok && astra_sp_attn && g_llms_rope_pre && llms_astra_tail() == 1 && rows <= 128u && !ds4_gpu_llms_alt_off("astt");   /* llms ASTRA_TAIL */
+        g_llms_ring_layer = g_llms_ring_try && g_llms_astra_wdefer;   /* llms ATT2_RING: in place only while the window writes wait for the attention */
+        if (ok && g_llms_ring_try && !g_llms_ring_layer) { ok = llms_ring_snapshot_copies(g, graphs[0], il, positions[0], astra_sp_previous); g_llms_ring_fallbacks++; }
+        g_llms_ring_try = 0;
+        static ds41_gpu_graph llms_rowbuf_layers;   /* llms ROW_SCRATCH */
         for (int i = 0; ok && i < count; i++) {
-            ds41_gpu_graph row = *graphs[i];
-            row.pos = positions[i];
-#define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
+            ds41_gpu_graph *const row = &llms_rowbuf_layers; llms_row_copy(row, graphs[i]);
+            row->pos = positions[i];
+#define DS41_SESSION_ROW(name, width) row->name = g->rows_view[i].name;
             DS41_PREFILL_ROWS(DS41_SESSION_ROW)
 #undef DS41_SESSION_ROW
-            row.q = queries[i];
-            row.heads = heads[i];
-            ok = ds41_attention(&row, model, l, il, true) &&
-                (batch_output || ds41_attention_output(&row, model, l));
+            row->q = queries[i];
+            row->heads = heads[i];
+            g_llms_rows_defer = llms_bao && llms_rows_attn_on() && (!g_llms_sp_active || llms_sp_defer_canary());   /* llms ROWS_ATTN; llms SP_NODEFER: not one session's rows (canary: LLMS_DS4_SP_DEFER_CANARY) */
+            ok = ds41_attention(row, model, l, il, true, astra_sp_attn) &&
+                (llms_bao || batch_output || ds41_attention_output(row, model, l));
+            g_llms_rows_defer = 0;
+            if (!ok) fprintf(stderr, "llms batch fail: per-row attention row %d layer %u\n", i, il);
         }
-        if (ok && batch_output)
+        if (ok && astra_sp_attn)
+            ok = astra_sp_attn_finish(g, graphs[0], model, l, il, positions[0], rows, astra_sp_previous, heads);
+        g_llms_idx_rows_pre = 0; g_llms_comp_rows_pre = 0; g_llms_rope_pre = 0; g_llms_idx_rope_pre = 0;   /* llms VROWS_PRE: only inside the loop above */
+        g_llms_astra_wdefer = 0;   /* llms ASTRA_TAIL: only inside the loop and finish above */
+        if (ok) { ok = llms_rows_flush(model); if (!ok) fprintf(stderr, "llms batch fail: rows attention layer %u\n", il); }
+        g_llms_rows_n = 0;
+        llms_bstage("attn", il, rows);
+        if (ok && batch_output)   /* upstream 0df64b6 */
             ok = g->tp_world == 2 ?
                 ds4_gpu_dsv41_attention_output_tp_batch(active.block, active.low,
                     model->map, model->size, l->attn_output_a->abs_offset,
@@ -43026,20 +46662,46 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 ds4_gpu_dsv41_attention_output_batch(active.block, active.low,
                     model->map, model->size, l->attn_output_a->abs_offset,
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
-        if (ok) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(&active, model, l, rows) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
+        if (ok && llms_bao) {   /* llms BATCH_ATTN_OUT: one batched output projection for all rows (as the prefill sweep) */
+            static int qkg = -1; if (qkg < 0) { const char *e = getenv("LLMS_DS4_Q4L_K"); qkg = e && *e && *e != '0'; }   /* llms Q4L_KG */
+            if (!(qkg && rows >= 2u && rows <= 4u && ds4_gpu_llms_attn_out_k(g->batch.block, g->batch.low, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, g->batch.heads, rows)) &&
+                !(qkg && rows > 4u && llms_attn_out_chunked(g, l, rows)))   /* llms Q4L_CHUNK_AO */
+            ok = ds4_gpu_dsv41_attention_output_batch(g->batch.block, g->batch.low, model->map, model->size,
+                l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, g->batch.heads, rows);
+        }
+        llms_bstage("out", il, rows);
+        if (ok) { ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
+            if (!ok) fprintf(stderr, "llms batch fail: sum_partial layer %u\n", il); }
+        if (ok) { ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+            ds41_after_attention_batch(&active, model, l, rows);
+            if (!ok) fprintf(stderr, "llms batch fail: after_attention_batch layer %u\n", il); llms_bstage("ffn_pre", il, rows); }
+        if (ok) { g_llms_stream_rows = getenv("LLMS_DS4_STREAM_ROW_BATCH") != NULL; llms_lag_arm(il); ok = ds41_moe_batch(g, model, l, il, rows, shared_owner); llms_lag_disarm(); g_llms_stream_rows = 0;
+            if (!ok) fprintf(stderr, "llms batch fail: moe_batch layer %u\n", il); llms_bstage("moe", il, rows); }
+        if (ok) ok = llms_lag_save(g->batch.norm, il, rows);   /* llms LAG */
+        if (ok) ok =
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
-                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
+                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD));
+        if (ok) ok = llms_lag_late(model, l, il, rows, active.block);   /* llms LAG: the lag call of layer il - d, before the bf16 rounding */
+        if (ok && g_llms_tail_publish && il + 1u == DS4_N_LAYER) ok = llms_tail_capture_l39_at(&active, rows, 0);   /* llms TAILFULL (apply_tailfull5.py): the last layer's norm / selected / route_weights / UNROUNDED f per row */
+        const bool llms_qa_defer = rows == 2u && llms_hcqa() && llms_hcq() && llms_mixdual() && llms_k2split() && llms_hcf_rows() && il + 1u < DS4_N_LAYER &&
+            !ds41_engram_layer(il + 1u) && !(g_llms_ced_lmax < 39 && (int)(il + 1u) > g_llms_ced_lmax) && weights->layer[il + 1u].hc_attn_fn->type == DS4_TENSOR_F16 &&
+            !ds4_gpu_llms_alt_off("hcqa") && !ds4_gpu_llms_alt_off("hcq") && !ds4_gpu_llms_alt_off("mixdual") && !ds4_gpu_llms_alt_off("k2split") && !ds4_gpu_llms_alt_off("hcfr");   /* llms HC_FUSEQA */
+        if (ok) ok =
             ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
+            (llms_qa_defer ||
+            (ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+            ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16)));
+        llms_qa_pend = ok && llms_qa_defer ? (int)(il + 1u) : -1;
         /* The second Engram upload reuses the first one's input storage. */
+        llms_bstage("post", il, rows);
+        if (llms_vpipe() && !ds4_gpu_llms_alt_off("vpipe")) {   /* llms VPIPE: no layer-13 wait; a commit without waiting every N layers */
+            if (ok && (il % (uint32_t)llms_vpipe()) == (uint32_t)llms_vpipe() - 1u && il + 1u < DS4_N_LAYER) { ok = ds4_gpu_flush_commands() != 0; g_llms_vp_flushes++; }
+        } else
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
+    { static int llms_lte = -1; if (llms_lte < 0) { llms_lte = getenv("LLMS_DS4_LEDGER_LAYER") != NULL;  } if (llms_lte) ds4_gpu_llms_set_ledger_tag(2, 3, 40); }   /* llms LEDGER_LAYER: the batch step after its layer loop: the head */
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
     /* The final FFN intermediates are dead. Reuse that storage for the head
@@ -43048,6 +46710,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     if (ok && !prefill_only && !getenv("DS4_METAL_DISABLE_V41_BATCH_HEAD") &&
         ds4_gpu_tensor_bytes(g->batch.mid) >= rows * logits_bytes)
         batch_logits = ds4_gpu_tensor_view(g->batch.mid, 0, rows * logits_bytes);
+    else if (ok && !prefill_only && !getenv("DS4_METAL_DISABLE_V41_BATCH_HEAD")) {   /* llms HEAD_BUF (apply_ds4_head_buf.py) */
+        static int hb_on = -1; static ds4_gpu_tensor *hb; static uint64_t hbb;
+        if (hb_on < 0) { const char *e = getenv("LLMS_DS4_HEAD_BUF"); hb_on = e && *e && *e != '0';
+                         if (hb_on) fprintf(stderr, "llms: head buf (the batched output head in its own buffer when the FFN scratch is too small)\n"); }
+        if (hb_on && (!hb || hbb < rows * logits_bytes)) {
+            if (hb) ds4_gpu_tensor_free(hb);
+            hbb = rows * logits_bytes; hb = ds4_gpu_tensor_alloc(hbb);
+            if (hb) fprintf(stderr, "llms head buf: %.2f MiB for %llu rows\n", (double)hbb / 1048576.0, (unsigned long long)rows);
+        }
+        if (hb_on && hb) batch_logits = ds4_gpu_tensor_view(hb, 0, rows * logits_bytes);
+    }
     /* Pure prefill publishes only its final row; the caller computes the head
      * once at the complete prompt frontier. */
     const int first_output = prefill_only ? count - 1 : 0;
@@ -43056,6 +46729,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = ds4_gpu_tensor_copy(s->residual, 0, g->rows_view[i].residual, 0,
                                  (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
             ds4_gpu_tensor_copy(s->pre, 0, g->rows_view[i].ffn_split, 0, DS4_N_HC * sizeof(float));
+        if (ok && g_llms_tail_publish && s->ffn_split) ok = ds4_gpu_tensor_copy(s->ffn_split, 0, g->rows_view[i].ffn_split, 0, 24u * sizeof(float));   /* llms TAILFULL (apply_tailfull3.py): the row's whole split into the session's own scratch, for ds4_session_copy_tail */
+        if (ok && g_llms_tail_publish && s->block && g->rows_view[i].block) ok = ds4_gpu_tensor_copy(s->block, 0, g->rows_view[i].block, 0, (uint64_t)DS4_N_EMBD * sizeof(float));   /* llms TAILFULL (apply_tailfull4.py): f = routed + shared of the last layer (BF16-rounded), the row's block */
         if (!ok || prefill_only) continue;
         ok = ds4_gpu_hc_weighted_sum_tensor(s->x, s->residual, s->pre, DS4_N_EMBD, DS4_N_HC) &&
             ds41_bf16(s->x, DS4_N_EMBD) && ds41_norm(s->norm, s->x, model, weights->output_norm);
@@ -43063,9 +46738,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_tensor_copy(g->rows_view[i].norm, 0, s->norm, 0, DS4_N_EMBD * sizeof(float)) :
             ds41_output_projection(s, s->tp_logits_half ? s->tp_logits_half : s->logits,
                                     model, weights, s->norm, 1);
+        if (ok && !batch_logits && g_llms_verify_all) ok = llms_verify_save(s->logits, 0, (uint64_t)i * logits_bytes, logits_bytes);   /* llms VERIFY_ROWS */
     }
-    if (ok && batch_logits)
+    if (ok && batch_logits && !llms_price_skip(512))   /* llms PRICE_SKIP */
         ok = ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
+    if (ok && batch_logits && g_llms_verify_all) ok = llms_verify_save(batch_logits, 0, 0, (uint64_t)rows * logits_bytes);   /* llms VERIFY_ROWS */
+    if (ok && batch_logits && llms_price_dup(512))   /* llms PRICE_DUP */
+        ok = ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
+    if (ok && g_llms_verify_all) { for (int i = 0; i < count; i++) g_llms_verify_hist[i] = history[i]; g_llms_verify_pos0 = positions[0]; g_llms_verify_rows = (uint32_t)count; }   /* llms SPEC_COPY */
     for (int i = first_output; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         if (batch_logits)
@@ -43082,21 +46762,746 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ds4_gpu_tensor_free(queries[i]);
         ds4_gpu_tensor_free(heads[i]);
     }
+    if (!llms_engram_join(0) || !llms_engram_join(1)) ok = false;   /* llms ENGRAM_ASYNC: nothing of this step's reads outlives it */
     free(engram);
     return ok;
 }
 
-static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
+void ds4_gpu_llms_startup_mark(const char *label);   /* llms STARTUP_LOG */
+static bool ds41_graph_short_prefill_tlimpl(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count);
+static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {   /* llms TL_PHASE wrapper: phase 2 */
+    uint32_t tl_pos, tl_rows; const uint32_t tl_ph = ds4_gpu_llms_tl_phase_get(&tl_pos, &tl_rows); ds4_gpu_llms_tl_phase(2u, (uint32_t)(g->pos), (uint32_t)(count));
+    ds4_gpu_llms_startup_mark("first short prefill: start");   /* llms STARTUP_LOG */
+    const bool tl_ok = ds41_graph_short_prefill_tlimpl(g, m, w, tokens, count); ds4_gpu_llms_tl_phase(tl_ph, tl_pos, tl_rows);
+    ds4_gpu_llms_startup_mark("first short prefill: end"); return tl_ok;
+}
+static bool ds41_graph_short_prefill_tlimpl(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_weights *w, const int *tokens, uint32_t count) {
     if (!g->valid || count < 2u || count > DS4_TP_BATCH_MAX_ROWS ||
         g->pos > g->ctx || count > g->ctx - g->pos) return false;
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (uint32_t i = 0; i < count; i++) graphs[i] = g;
+    static FILE *llms_spl = (FILE *)1; if (llms_spl == (FILE *)1) { const char *p = getenv("LLMS_DS4_SP_LOG"); llms_spl = p && *p ? fopen(p, "w") : NULL; }   /* llms SP_LOG: per short-prefill call */
+    const double llms_spt0 = llms_spl ? now_sec() : 0.0; const uint64_t llms_spm0 = llms_spl ? ds4_gpu_llms_stream_misses() : 0;
+    extern double ds4_gpu_llms_pipe_ms(void); const double llms_sppm0 = llms_spl ? ds4_gpu_llms_pipe_ms() : 0.0;   /* llms PIPE_CENSUS */
+    g_llms_sp_m0 = ds4_gpu_llms_stream_misses();   /* llms SP_COLD: the step's miss count at its start */
+    g_llms_sp_active = 1;   /* llms SP_RPOL */
+    { static int sppipe = -1; if (sppipe < 0) { const char *e = getenv("LLMS_DS4_SP_PIPE"); sppipe = e && *e && *e != '0'; if (sppipe) fprintf(stderr, "llms: sp pipe (the short prefill's batched step under BATCH_PIPE semantics: no batch end before the MoE, slots guarded at the exit)\n"); } if (sppipe && llms_prefill_route_short() && llms_prefill_route_on()) ds4_gpu_llms_set_pipe(1); }
+    { extern void ds4_gpu_llms_set_sp_npw(int); static int spnpw = -1; if (spnpw < 0) { const char *e = getenv("LLMS_DS4_SP_NPW"); spnpw = e && *e && *e != '0'; if (spnpw) fprintf(stderr, "llms: sp npw (the short prefill's routed calls keep the batch open after the MoE; the layer's slots guarded in flight)\n"); } ds4_gpu_llms_set_sp_npw(spnpw); }
+    { extern void ds4_gpu_llms_cache_trace(uint32_t, uint32_t, uint32_t); ds4_gpu_llms_cache_trace(4, (uint32_t)g->pos >> 16, (uint32_t)g->pos & 0xffffu); }   /* llms CACHE_TRACE */
+    if (llms_sp_split()) ds4_gpu_llms_set_sp_split(1);   /* llms SP_SPLIT */
+    g_llms_ced_lmax = 39;
+    if (llms_ced_sp() && g_llms_ced_end > g->pos + count - 1u) {   /* llms CED_SP */
+        const uint32_t d = g_llms_ced_end - 1u - (g->pos + count - 1u), c = (d + 126u) / 127u;
+        g_llms_ced_lmax = d == 0u ? 39 : (c >= 40u ? 19 : (int)(40u - c) < 19 ? 19 : (int)(40u - c));
+        if (llms_ced_sp() == 2) { g_llms_ced_brs = g_llms_ced_end > g_llms_ced_brlen ? g_llms_ced_end - g_llms_ced_brlen : 0u; g_llms_ced_lmax = d < g_llms_ced_brlen ? 39 : 19; }
+        g_llms_ced_steps++; g_llms_ced_rows += count; g_llms_ced_layers_skipped += (unsigned long long)count * (uint64_t)(39 - g_llms_ced_lmax);
+        { static int can = -1; if (can < 0) { can = getenv("LLMS_DS4_CED_SP_CANARY") != NULL; if (can) fprintf(stderr, "llms ced sp: CANARY -- one decoder layer fewer than the exact need\n"); }
+          if (can && d > 0u && g_llms_ced_lmax > 19) g_llms_ced_lmax--; }   /* the canary must change the text */
+        if (g_llms_ced_lmax < 20) g_llms_ced_enc_only++;
+    }
+    static int llms_sppad = -1; if (llms_sppad < 0) { const char *e = getenv("LLMS_DS4_SP_PAD"); llms_sppad = e && *e && *e != '0';
+                                                    if (llms_sppad) fprintf(stderr, "llms: sp pad (the adopted PAD8 / PAD16 / PAD32 / PADAO armed inside the short prefill)\n"); }
+    if (llms_sppad) ds4_gpu_llms_set_pad_ok(1);
+
+
     bool ok = ds4_gpu_begin_commands() && ds41_graph_step_batch(graphs, tokens,
         (int)count, count, m, w);
+    if (llms_sppad) ds4_gpu_llms_set_pad_ok(0);   /* llms SP_PAD */
+    g_llms_ced_lmax = 39; g_llms_ced_brs = 0;   /* llms CED_SP: never outlives the step */
+    g_llms_sp_active = 0;   /* llms SP_RPOL */
+    ds4_gpu_llms_set_pipe(0);   /* llms SP_PIPE */
+    { extern void ds4_gpu_llms_set_sp_npw(int); ds4_gpu_llms_set_sp_npw(0); }   /* llms SP_NPW */
+    ds4_gpu_llms_set_sp_split(0);   /* llms SP_SPLIT */
     if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (llms_spl) { extern unsigned long long ds4_gpu_llms_altw_offmask(void), ds4_gpu_llms_altw_qmask(void);   /* fields 5-6: the call's ALT OFF mask, its queried mask (apply_alt_table.py) */
+                   fprintf(llms_spl, "%.3f %u %u %llu %llu %llu %.1f\n", (now_sec() - llms_spt0) * 1e3, count, (unsigned)g->pos, (unsigned long long)(ds4_gpu_llms_stream_misses() - llms_spm0), ds4_gpu_llms_altw_offmask(), ds4_gpu_llms_altw_qmask(), ds4_gpu_llms_pipe_ms() - llms_sppm0);   /* field 7: llms PIPE_CENSUS */ fflush(llms_spl); }
     else (void)ds4_gpu_synchronize();
     if (!ok) g->valid = false;
+    return ok;
+}
+
+static ds4_gpu_tensor *g_llms_rb_win, *g_llms_rb_res0, *g_llms_rb_pre0; static ds4_engram_history g_llms_rb_hist0;
+static uint32_t g_llms_rb_pos0, g_llms_rb_rows; static int g_llms_rb_valid;
+static int llms_deeprb(void) { static int v = -1; if (v < 0) { const char *e = getenv("LLMS_DS4_DEEPRB"); v = e && *e && *e != '0'; if (v) fprintf(stderr, "llms: deeprb (k-row verify steps back up the raw window slots of rows 1..k-1: exact rollback to keep <= k-2)\n"); } return v; }
+static bool llms_rb_save(ds41_gpu_graph *g, uint32_t count) {   /* inside the open batch, before the step's writes */
+    g_llms_rb_valid = 0; g_llms_rb_snap = 0;   /* llms DEEPRB2 */
+    if ((!llms_deeprb() && !g_llms_rb_force) || count < 2u) return true;   /* llms LOOKUP: g_llms_rb_force */
+    if (count - 1u > LLMS_RB_ROWS) return true;   /* too wide: no deep rollback for this step */
+    if (!g_llms_rb_win) { g_llms_rb_win = ds4_gpu_tensor_alloc((uint64_t)40u * LLMS_RB_ROWS * 512u * sizeof(float));
+                          g_llms_rb_res0 = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)); g_llms_rb_pre0 = ds4_gpu_tensor_alloc(64);
+                          g_llms_rb_pool = ds4_gpu_tensor_alloc((uint64_t)3u * 2u * (LLMS_RB_ROWS + 1u) * 512u * 4u);   /* llms DEEPRB2 */
+                          g_llms_rb_prev = ds4_gpu_tensor_alloc((uint64_t)3u * 2u * 512u * 4u);
+                          if (!g_llms_rb_win || !g_llms_rb_res0 || !g_llms_rb_pre0 || !g_llms_rb_pool || !g_llms_rb_prev) return false; }
+    for (uint32_t il = 0; il < 40u; il++)
+        for (uint32_t j = 1; j < count; j++)
+            if (!ds4_gpu_tensor_copy(g_llms_rb_win, ((uint64_t)il * LLMS_RB_ROWS + j - 1u) * 512u * 4u, g->window[il], (uint64_t)((g->pos + j) % 128u) * 512u * 4u, 512u * 4u)) return false;
+    if (!ds4_gpu_tensor_copy(g_llms_rb_res0, 0, g->residual, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) ||
+        !ds4_gpu_tensor_copy(g_llms_rb_pre0, 0, g->pre, 0, DS4_N_HC * sizeof(float))) return false;
+    for (uint32_t o = 0; o < 3u; o++)   /* llms DEEPRB2: the pre-step pair state */
+        if (!ds4_gpu_tensor_copy(g_llms_rb_prev, ((uint64_t)o * 2u + 0u) * 512u * 4u, g->previous_kv[o], 0, 512u * 4u) ||
+            !ds4_gpu_tensor_copy(g_llms_rb_prev, ((uint64_t)o * 2u + 1u) * 512u * 4u, g->previous_score[o], 0, 512u * 4u)) return false;
+    g_llms_rb_snap = 1; g_llms_rb_snap_pos0 = g->pos;
+    g_llms_rb_hist0 = g->history; g_llms_rb_pos0 = g->pos; g_llms_rb_rows = count; g_llms_rb_valid = 1;
+    return true;
+}
+static bool ds41_graph_verify_rollback(ds41_gpu_graph *g, uint32_t keep);
+static bool ds41_graph_verify_rollback_deep(ds41_gpu_graph *g, uint32_t keep, int restore) {   /* llms DEEPRB: restore = 0 only for the canary */
+    if (keep + 1u >= g_llms_verify_rows) return keep == g_llms_verify_rows ? true : ds41_graph_verify_rollback(g, keep);
+    if (!g_llms_rb_valid || g_llms_rb_rows != g_llms_verify_rows || g_llms_rb_pos0 != g_llms_verify_pos0) return false;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && restore && il < 40u; il++)
+        for (uint32_t j = keep + 1u; ok && j < g_llms_rb_rows; j++)
+            ok = ds4_gpu_tensor_copy(g->window[il], (uint64_t)((g_llms_rb_pos0 + j) % 128u) * 512u * 4u, g_llms_rb_win, ((uint64_t)il * LLMS_RB_ROWS + j - 1u) * 512u * 4u, 512u * 4u) != 0;
+    for (uint32_t o = 0; ok && restore && o < 3u; o++) {   /* llms DEEPRB2: the pair owners' state after keep rows */
+        if (keep == 0u)
+            ok = ds4_gpu_tensor_copy(g->previous_kv[o], 0, g_llms_rb_prev, ((uint64_t)o * 2u + 0u) * 512u * 4u, 512u * 4u) &&
+                 ds4_gpu_tensor_copy(g->previous_score[o], 0, g_llms_rb_prev, ((uint64_t)o * 2u + 1u) * 512u * 4u, 512u * 4u);
+        else if ((g_llms_rb_pos0 + keep) & 1u)
+            ok = ds4_gpu_tensor_copy(g->previous_kv[o], 0, g_llms_rb_pool, (((uint64_t)o * 2u + 0u) * (LLMS_RB_ROWS + 1u) + keep - 1u) * 512u * 4u, 512u * 4u) &&
+                 ds4_gpu_tensor_copy(g->previous_score[o], 0, g_llms_rb_pool, (((uint64_t)o * 2u + 1u) * (LLMS_RB_ROWS + 1u) + keep - 1u) * 512u * 4u, 512u * 4u);
+    }
+    if (ok && keep == 0u) {
+        g->pos = g_llms_rb_pos0; g->history = g_llms_rb_hist0;
+        ok = ds4_gpu_tensor_copy(g->residual, 0, g_llms_rb_res0, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
+             ds4_gpu_tensor_copy(g->pre, 0, g_llms_rb_pre0, 0, DS4_N_HC * sizeof(float));
+    }
+    ok = ds4_gpu_end_commands() != 0 && ok;
+    if (ok && keep > 0u) ok = ds41_graph_verify_rollback(g, keep);
+    g_llms_rb_valid = 0;
+    return ok;
+}
+static bool ds41_graph_verify_rows_q8inner(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count, float *row_logits);
+static bool ds41_graph_verify_rows(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count, float *row_logits) {   /* llms Q8_FORBID */
+    ds4_gpu_llms_q8_guard(1); llms_lag_step_begin(count); const bool ok = ds41_graph_verify_rows_q8inner(g, m, w, tokens, count, row_logits); llms_lag_step_end(); ds4_gpu_llms_q8_guard(0); return ok; }   /* llms LAG */
+static bool ds41_graph_verify_rows_q8inner_tlimpl(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count, float *row_logits);
+static bool ds41_graph_verify_rows_q8inner(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count, float *row_logits) {   /* llms TL_PHASE wrapper: phase 1 */
+    uint32_t tl_pos, tl_rows; const uint32_t tl_ph = ds4_gpu_llms_tl_phase_get(&tl_pos, &tl_rows); ds4_gpu_llms_tl_phase(1u, (uint32_t)(g->pos), (uint32_t)(count));
+    const bool tl_ok = ds41_graph_verify_rows_q8inner_tlimpl(g, m, w, tokens, count, row_logits); ds4_gpu_llms_tl_phase(tl_ph, tl_pos, tl_rows); return tl_ok;
+}
+static bool ds41_graph_verify_rows_q8inner_tlimpl(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count, float *row_logits) {
+    if (!g->valid || count < (llms_verify_one() ? 1u : 2u) || count > DS4_TP_BATCH_MAX_ROWS || g->tp_world != 1 || g->pos > g->ctx || count > g->ctx - g->pos) return false;   /* llms VERIFY_ONE */
+    const uint64_t need = (uint64_t)count * DS4_N_VOCAB * sizeof(float);
+    if (g_llms_verify_cap < need) { if (g_llms_verify_buf) ds4_gpu_tensor_free(g_llms_verify_buf); g_llms_verify_buf = ds4_gpu_tensor_alloc(need); g_llms_verify_cap = g_llms_verify_buf ? need : 0; }
+    if (!g_llms_verify_buf) return false;
+    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+    for (uint32_t i = 0; i < count; i++) graphs[i] = g;
+    g_llms_sp_active = 1;   /* the short prefill's own switches (SP_RPOL / SP_SPLIT / SP_ED) apply: it is the same causal batched step */
+    if (llms_sp_split()) ds4_gpu_llms_set_sp_split(1);
+    static FILE *vlog = (FILE *)1; if (vlog == (FILE *)1) { const char *p = getenv("LLMS_DS4_VERIFY_LOG"); vlog = p && *p ? fopen(p, "w") : NULL;  if (p && *p && !vlog) fprintf(stderr, "llms: LLMS_DS4_VERIFY_LOG=%s cannot be opened -- NO verify log (a missing directory?)\n", p); }   /* llms VERIFY_LOG OPEN (build_job.py) */
+    const double vt0 = vlog ? now_sec() : 0.0; const uint64_t vm0 = vlog ? ds4_gpu_llms_stream_misses() : 0; const uint32_t vpos = g->pos;
+    g_llms_verify_all = 1;
+    bool ok = ds4_gpu_begin_commands() && llms_rb_save(g, count) && ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);   /* llms DEEPRB */
+    g_llms_rb_snap = 0;   /* llms DEEPRB2 */
+    g_llms_verify_all = 0; g_llms_sp_active = 0; ds4_gpu_llms_set_sp_split(0);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = ds4_gpu_tensor_read(g_llms_verify_buf, 0, row_logits, need) != 0;
+    if (vlog) { extern unsigned long long ds4_gpu_llms_altw_offmask(void), ds4_gpu_llms_altw_qmask(void);   /* 17:4x: fields 5-6 = the step's ALTW OFF / queried masks (tools/altw_lib.py) */
+                fprintf(vlog, "%.3f %u %u %llu %llu %llu\n", (now_sec() - vt0) * 1e3, count, vpos, (unsigned long long)(ds4_gpu_llms_stream_misses() - vm0),
+                        ds4_gpu_llms_altw_offmask(), ds4_gpu_llms_altw_qmask()); fflush(vlog); }   /* wall ms, rows, position, installs, ALTW off, ALTW queried */
+    if (!ok) g->valid = false;
+    return ok;
+}
+static bool ds41_graph_verify_rollback(ds41_gpu_graph *g, uint32_t keep) {   /* llms SPEC_COPY: the state after the first keep rows of the last verify step */
+    if (!g_llms_verify_rows || keep == 0 || keep > g_llms_verify_rows) return false;
+    const uint32_t r = keep - 1u;
+    g->pos = g_llms_verify_pos0 + keep;
+    g->history = g_llms_verify_hist[r];
+    return ds4_gpu_begin_commands() &&   /* llms ROLLBACK_FIX: the copies need an open batch */
+        ds4_gpu_tensor_copy(g->residual, 0, g->rows_view[r].residual, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
+        ds4_gpu_tensor_copy(g->pre, 0, g->rows_view[r].ffn_split, 0, DS4_N_HC * sizeof(float)) && ds4_gpu_end_commands();
+}
+
+
+
+
+typedef struct {
+    const ds4_tensor *attn_norm, *q_a, *q_a_norm, *q_b, *kv, *kv_norm, *out_a, *out_b, *sinks, *hc_attn_fn, *hc_attn_scale, *hc_attn_base,
+                     *hc_ffn_fn, *hc_ffn_scale, *hc_ffn_base, *ffn_norm, *gate_inp, *exp_bias, *gate_exps, *up_exps, *down_exps,
+                     *gate_sh, *up_sh, *down_sh;
+} llms_dsp_stage;
+enum { LLMS_DSP_STAGES = 3, LLMS_DSP_WIN = 128, LLMS_DSP_EXPERTS = 128, LLMS_DSP_USED = 3, LLMS_DSP_RANK = 256 };
+static struct {
+    int on;   /* -1 not tried, 0 off or failed, 1 ready */
+    ds4_model m;
+    llms_dsp_stage st[LLMS_DSP_STAGES];
+    const ds4_tensor *main_proj, *main_norm, *norm, *mk_w1, *mk_w2;
+    uint64_t gate_eb, gate_rb, down_eb, down_rb;
+    ds4_gpu_tensor *ring[LLMS_DSP_STAGES];
+    uint32_t ring_n, ring_next;     /* entries since the last restart; the position after the newest */
+    uint32_t pend_rows, pend_pos;   /* rows of the last verify step that still go into the ring (capture rows 0 ..) */
+    ds4_gpu_tensor *hc, *ahc, *flat, *mix, *asplit, *fsplit, *pre, *pre_id, *quarter, *x, *n, *qr, *q, *kvb, *heads, *low, *blk,
+                   *rl, *sel, *rw, *probs, *sg, *su, *sm, *sh, *rt, *eg, *eu, *em, *ex, *logits, *mk_e, *mk_b, *mx3, *mx, *mkv;
+    float *ql, *qp, *res, *row_logits;
+    uint64_t cycles, drafts, accepts, no_draft, ring_resets, plain, rewinds;
+    double draft_ms, verify_ms;
+    int last_valid; uint32_t last_P, last_k;   /* the last verify step, for a rewind into it */
+    ds4_engram_history hist0; ds4_gpu_tensor *res0, *pre0;   /* the state before it (a rewind of both rows) */
+} g_dsp = { .on = -1 };
+static int g_dsp_lazy_tok = -1; static uint32_t g_dsp_lazy_P; static uint64_t g_dsp_lazy_hits, g_dsp_lazy_miss;   /* llms DSP41_LAZY0 */
+static int g_dsp_res_pend; static uint32_t g_dsp_res_P; static uint64_t g_dsp_res_restored;   /* llms DSP41_RESRAW */
+/* llms DSP41_BANK (apply_dsp41_bank.py): a compact resident expert bank per stage; LLMS_DS4_DSP41_COUNT: per-stage selection counts */
+static int g_dsp_bank_on;
+static uint32_t g_dsp_bank_n[3];
+static ds4_gpu_tensor *g_dsp_bank_g[3], *g_dsp_bank_u[3], *g_dsp_bank_d[3], *g_dsp_bank_map[3], *g_dsp_bank_bias[3], *g_dsp_selb, *g_dsp_selh;
+static uint64_t g_dsp_gap_off[16], g_dsp_gap_len[16], g_dsp_gap_max[16]; static uint32_t g_dsp_gap_n;
+static uint64_t g_dsp_cnt[3][128], g_dsp_cnt_cycles; static const char *g_dsp_cnt_path;
+static bool llms_dsp_gaps(void) {   /* the support file's spans between the nine routed-expert tensors, each with its largest tensor */
+    uint64_t lo[9], hi[9]; uint32_t ne = 0;
+    for (uint32_t s = 0; s < LLMS_DSP_STAGES; s++) {
+        const ds4_tensor *ts[3] = { g_dsp.st[s].gate_exps, g_dsp.st[s].up_exps, g_dsp.st[s].down_exps };
+        for (uint32_t k = 0; k < 3; k++) { lo[ne] = ts[k]->abs_offset; hi[ne] = ts[k]->abs_offset + ts[k]->bytes; ne++; }
+    }
+    for (uint32_t i = 1; i < ne; i++) for (uint32_t j = i; j > 0 && lo[j] < lo[j - 1]; j--) {
+        uint64_t t = lo[j]; lo[j] = lo[j - 1]; lo[j - 1] = t; t = hi[j]; hi[j] = hi[j - 1]; hi[j - 1] = t; }
+    uint64_t cur = g_dsp.m.tensor_data_pos; g_dsp_gap_n = 0;
+    for (uint32_t i = 0; i <= ne; i++) {
+        const uint64_t end = i < ne ? lo[i] : g_dsp.m.size;
+        if (end > cur && g_dsp_gap_n < 16u) {
+            uint64_t mx = 0;
+            for (uint64_t k = 0; k < g_dsp.m.n_tensors; k++) {
+                const ds4_tensor *t = &g_dsp.m.tensors[k];
+                if (t->abs_offset >= cur && t->abs_offset + t->bytes <= end && t->bytes > mx) mx = t->bytes;
+            }
+            if (mx) { g_dsp_gap_off[g_dsp_gap_n] = cur; g_dsp_gap_len[g_dsp_gap_n] = end - cur; g_dsp_gap_max[g_dsp_gap_n] = mx; g_dsp_gap_n++; }
+        }
+        if (i < ne && hi[i] > cur) cur = hi[i];
+    }
+    return g_dsp_gap_n > 0;
+}
+static bool llms_dsp_bank_load(const char *path) {   /* after llms_dsp_bind: the kept experts into Metal buffers, the map and the masked bias */
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "llms dsp41 bank: cannot open %s\n", path); return false; }
+    int ids[3][128]; uint32_t n[3] = {0, 0, 0}; char line[4096];
+    for (uint32_t s = 0; s < 3; s++) {
+        if (!fgets(line, sizeof line, f)) { fclose(f); fprintf(stderr, "llms dsp41 bank: %s has fewer than 3 lines\n", path); return false; }
+        char *p = line, *q;
+        for (;;) { const long v = strtol(p, &q, 10); if (q == p) break; p = q;
+                   if (v < 0 || v >= 128 || n[s] >= 128) { fclose(f); fprintf(stderr, "llms dsp41 bank: bad id %ld (stage %u)\n", v, s); return false; }
+                   ids[s][n[s]++] = (int)v; }
+        if (n[s] < LLMS_DSP_USED) { fclose(f); fprintf(stderr, "llms dsp41 bank: stage %u keeps %u < %u experts\n", s, n[s], (unsigned)LLMS_DSP_USED); return false; }
+    }
+    fclose(f);
+    uint64_t total = 0;
+
+
+
+    static int llms_bshm = -1; if (llms_bshm < 0) { const char *be = getenv("LLMS_DS4_DSP_BANK_SHM");   /* 1 on, 2 verify, 3 canary */
+                                                     llms_bshm = !be || !*be || *be == '0' ? 0 : !strcmp(be, "verify") ? 2 : !strcmp(be, "canary") ? 3 : 1; }
+    const double llms_bl0 = now_sec(); uint64_t bshm_cmp = 0, bshm_ncmp = 0;
+    extern int ds4_gpu_llms_shm_holder(void); extern ds4_gpu_tensor *ds4_gpu_llms_shm_tensor(uint64_t bytes, const char *key, int *valid_out); extern void ds4_gpu_llms_shm_tensor_valid(void);
+    uint64_t bo_g[3], bo_u[3], bo_d[3], btot = 0; const uint64_t bal = 16384u;
+    for (uint32_t s = 0; s < 3; s++) {
+        bo_g[s] = btot; btot += ((uint64_t)n[s] * g_dsp.gate_eb + bal - 1u) / bal * bal;
+        bo_u[s] = btot; btot += ((uint64_t)n[s] * g_dsp.gate_eb + bal - 1u) / bal * bal;
+        bo_d[s] = btot; btot += ((uint64_t)n[s] * g_dsp.down_eb + bal - 1u) / bal * bal;
+    }
+    ds4_gpu_tensor *bshm_t = NULL; int bshm_valid = 0;
+    if (llms_bshm && ds4_gpu_llms_shm_holder()) {
+        struct stat st1, st2; const char *sp = getenv("LLMS_DS4_DSP41");
+        const int ok1 = sp && stat(sp, &st1) == 0, ok2 = stat(path, &st2) == 0;
+        char bkey[256];
+        snprintf(bkey, sizeof bkey, "s%llx.%llx.%llx;b%llx.%llx.%llx;n%u.%u.%u;e%llx.%llx;t%llx",
+                 ok1 ? (unsigned long long)st1.st_size : 0ull, ok1 ? (unsigned long long)st1.st_mtimespec.tv_sec : 0ull, ok1 ? (unsigned long long)st1.st_ino : 0ull,
+                 ok2 ? (unsigned long long)st2.st_size : 0ull, ok2 ? (unsigned long long)st2.st_mtimespec.tv_sec : 0ull, ok2 ? (unsigned long long)st2.st_ino : 0ull,
+                 n[0], n[1], n[2], (unsigned long long)g_dsp.gate_eb, (unsigned long long)g_dsp.down_eb, (unsigned long long)btot);
+        bshm_t = ok1 && ok2 ? ds4_gpu_llms_shm_tensor(btot, bkey, &bshm_valid) : NULL;
+        fprintf(stderr, "llms dsp bank shm: %s (%.2f GiB)\n", !bshm_t ? "unavailable -- a private bank" : bshm_valid ? "valid under the same key -- mapped, nothing copied" : "filled by this run",
+                btot / 1073741824.0);
+    }
+    for (uint32_t s = 0; s < 3; s++) {
+        const llms_dsp_stage *t = &g_dsp.st[s];
+        if (t->exp_bias->type != DS4_TENSOR_F32 || t->exp_bias->elements != 128u) { fprintf(stderr, "llms dsp41 bank: stage %u bias is not 128 F32\n", s); return false; }
+        if (bshm_t) {   /* llms DSP_BANK_SHM */
+            g_dsp_bank_g[s] = ds4_gpu_tensor_view(bshm_t, bo_g[s], (uint64_t)n[s] * g_dsp.gate_eb); g_dsp_bank_u[s] = ds4_gpu_tensor_view(bshm_t, bo_u[s], (uint64_t)n[s] * g_dsp.gate_eb);
+            g_dsp_bank_d[s] = ds4_gpu_tensor_view(bshm_t, bo_d[s], (uint64_t)n[s] * g_dsp.down_eb);
+        } else {
+        g_dsp_bank_g[s] = ds4_gpu_tensor_alloc((uint64_t)n[s] * g_dsp.gate_eb); g_dsp_bank_u[s] = ds4_gpu_tensor_alloc((uint64_t)n[s] * g_dsp.gate_eb);
+        g_dsp_bank_d[s] = ds4_gpu_tensor_alloc((uint64_t)n[s] * g_dsp.down_eb);
+        }
+        g_dsp_bank_map[s] = ds4_gpu_tensor_alloc(128u * sizeof(int32_t)); g_dsp_bank_bias[s] = ds4_gpu_tensor_alloc(128u * sizeof(float));
+        if (!g_dsp_bank_g[s] || !g_dsp_bank_u[s] || !g_dsp_bank_d[s] || !g_dsp_bank_map[s] || !g_dsp_bank_bias[s]) { fprintf(stderr, "llms dsp41 bank: allocation failed\n"); return false; }
+        int32_t map[128]; float bias[128]; int seen[128];
+        memset(map, 0, sizeof map); memset(seen, 0, sizeof seen);
+        memcpy(bias, g_dsp.m.map + t->exp_bias->abs_offset, sizeof bias);
+        for (uint32_t k = 0; k < n[s]; k++) {
+            const int e = ids[s][k];
+            if (seen[e]) { fprintf(stderr, "llms dsp41 bank: id %d twice in stage %u\n", e, s); return false; }
+            seen[e] = 1; map[e] = (int32_t)k;
+            if (!bshm_valid && (!ds4_gpu_tensor_write(g_dsp_bank_g[s], (uint64_t)k * g_dsp.gate_eb, g_dsp.m.map + t->gate_exps->abs_offset + (uint64_t)e * g_dsp.gate_eb, g_dsp.gate_eb) ||   /* llms DSP_BANK_SHM: valid -> no copy */
+                !ds4_gpu_tensor_write(g_dsp_bank_u[s], (uint64_t)k * g_dsp.gate_eb, g_dsp.m.map + t->up_exps->abs_offset + (uint64_t)e * g_dsp.gate_eb, g_dsp.gate_eb) ||
+                !ds4_gpu_tensor_write(g_dsp_bank_d[s], (uint64_t)k * g_dsp.down_eb, g_dsp.m.map + t->down_exps->abs_offset + (uint64_t)e * g_dsp.down_eb, g_dsp.down_eb)))
+                return false;
+            if (bshm_valid && llms_bshm >= 2) {   /* llms DSP_BANK_SHM verify / canary: the mapped bytes against the file's */
+                uint8_t *pgt = (uint8_t *)ds4_gpu_tensor_contents(g_dsp_bank_g[s]) + (uint64_t)k * g_dsp.gate_eb;
+                const uint8_t *pup = (const uint8_t *)ds4_gpu_tensor_contents(g_dsp_bank_u[s]) + (uint64_t)k * g_dsp.gate_eb;
+                const uint8_t *pdn = (const uint8_t *)ds4_gpu_tensor_contents(g_dsp_bank_d[s]) + (uint64_t)k * g_dsp.down_eb;
+                if (llms_bshm == 3 && s == 0 && k == 0) pgt[0] ^= 0x5a;   /* canary: one byte flipped before the compare */
+                bshm_cmp += memcmp(pgt, g_dsp.m.map + t->gate_exps->abs_offset + (uint64_t)e * g_dsp.gate_eb, g_dsp.gate_eb) != 0;
+                bshm_cmp += memcmp(pup, g_dsp.m.map + t->up_exps->abs_offset + (uint64_t)e * g_dsp.gate_eb, g_dsp.gate_eb) != 0;
+                bshm_cmp += memcmp(pdn, g_dsp.m.map + t->down_exps->abs_offset + (uint64_t)e * g_dsp.down_eb, g_dsp.down_eb) != 0;
+                if (llms_bshm == 3 && s == 0 && k == 0) pgt[0] ^= 0x5a;   /* restored */
+                bshm_ncmp += 3;
+            }
+        }
+        for (uint32_t e = 0; e < 128u; e++) if (!seen[e]) bias[e] = -1e30f;
+        if (!ds4_gpu_tensor_write(g_dsp_bank_map[s], 0, map, sizeof map) || !ds4_gpu_tensor_write(g_dsp_bank_bias[s], 0, bias, sizeof bias)) return false;
+        g_dsp_bank_n[s] = n[s];
+        total += (uint64_t)n[s] * (2u * g_dsp.gate_eb + g_dsp.down_eb);
+    }
+    if (bshm_t && !bshm_valid) ds4_gpu_llms_shm_tensor_valid();   /* llms DSP_BANK_SHM: the next process maps it */
+    if (bshm_ncmp) fprintf(stderr, "llms dsp bank shm %s: %llu of %llu expert tensors differ from the file\n", llms_bshm == 3 ? "CANARY (one byte flipped, then restored)" : "verify",
+                           (unsigned long long)bshm_cmp, (unsigned long long)bshm_ncmp);
+    if (llms_bshm) fprintf(stderr, "llms dsp bank load: %.1f ms (%s)\n", (now_sec() - llms_bl0) * 1e3, bshm_valid ? "mapped" : "copied");
+    g_dsp_selb = ds4_gpu_tensor_alloc(16u * sizeof(int32_t));
+    if (!g_dsp_selb) return false;
+    g_dsp_bank_on = 1;
+    fprintf(stderr, "llms dsp41 bank: %u / %u / %u experts kept (%.2f GiB in Metal buffers; router masked to the bank) from %s\n",
+            n[0], n[1], n[2], total / 1073741824.0, path);
+    return true;
+}
+static void llms_dsp_count_write(void) {
+    if (!g_dsp_cnt_path) return;
+    FILE *f = fopen(g_dsp_cnt_path, "w"); if (!f) return;
+    for (uint32_t s = 0; s < 3; s++) { for (uint32_t e = 0; e < 128u; e++) fprintf(f, "%s%llu", e ? " " : "", (unsigned long long)g_dsp_cnt[s][e]); fputc('\n', f); }
+    fclose(f);
+    fprintf(stderr, "llms dsp41 count: %llu drafts' selections written to %s\n", (unsigned long long)g_dsp_cnt_cycles, g_dsp_cnt_path);
+}
+/* llms DSP41_SHADOW (apply_dsp41_shadow.py) */
+static int g_dsp_shadow; static float *g_dsp_ql2, *g_dsp_q2; static uint32_t g_dsp_q2_idx[4096], g_dsp_q2_n;
+static double g_dsp_sh_a1, g_dsp_sh_a2, g_dsp_sh_d2; static uint64_t g_dsp_sh_n; static FILE *g_dsp_sh_log;
+static int llms_dsp_q2_cmp(const void *a, const void *b) {
+    const float x = g_dsp_ql2[*(const uint32_t *)a], y = g_dsp_ql2[*(const uint32_t *)b];
+    return x > y ? -1 : x < y ? 1 : (*(const uint32_t *)a < *(const uint32_t *)b ? -1 : 1);
+}
+static void llms_dsp_q2_build(float temp, int top_k, float top_p, float min_p) {   /* llms_dsp_fast_q's distribution over g_dsp_ql2, no draw */
+    for (uint32_t k = 0; k < g_dsp_q2_n; k++) g_dsp_q2[g_dsp_q2_idx[k]] = 0.0f;
+    g_dsp_q2_n = 0;
+    float mx = -INFINITY;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) if (g_dsp_ql2[i] > mx) mx = g_dsp_ql2[i];
+    if (!isfinite(mx) || !(temp > 0.0f)) return;
+    const float lo = mx - 16.0f * temp; uint32_t n = 0;
+    for (uint32_t i = 0; i < DS4_N_VOCAB && n < 4096u; i++) if (g_dsp_ql2[i] >= lo) g_dsp_q2_idx[n++] = i;
+    qsort(g_dsp_q2_idx, n, sizeof(uint32_t), llms_dsp_q2_cmp);
+    uint32_t nn = n; if (top_k > 0 && (uint32_t)top_k < nn) nn = (uint32_t)top_k;
+    static double w[4096]; double tot = 0.0;
+    for (uint32_t k = 0; k < nn; k++) { w[k] = exp((double)(g_dsp_ql2[g_dsp_q2_idx[k]] - mx) / temp); tot += w[k]; }
+    uint32_t keep = 0; double cum = 0.0;
+    for (uint32_t k = 0; k < nn; k++) {
+        if (k > 0 && min_p > 0.0f && w[k] < w[0] * min_p) break;
+        cum += w[k]; keep = k + 1;
+        if (top_p > 0.0f && top_p < 1.0f && cum / tot >= top_p) break;
+    }
+    for (uint32_t k = 0; k < keep; k++) g_dsp_q2[g_dsp_q2_idx[k]] = (float)(w[k] / cum);
+    g_dsp_q2_n = n;   /* the zeroing list covers every index touched */
+}
+static void llms_dsp_shadow_report(void) {
+    if (!g_dsp_sh_n) { fprintf(stderr, "llms dsp41 shadow: no paired cycles\n"); return; }
+    const double n = (double)g_dsp_sh_n, md = (g_dsp_sh_a2 - g_dsp_sh_a1) / n;
+    const double var = g_dsp_sh_n > 1 ? (g_dsp_sh_d2 - n * md * md) / (n - 1.0) : 0.0;
+    fprintf(stderr, "llms dsp41 shadow: %llu paired cycles; expected acceptance full %.5f, bank %.5f; bank - full %+.5f (se %.5f)\n",
+            (unsigned long long)g_dsp_sh_n, g_dsp_sh_a1 / n, g_dsp_sh_a2 / n, md, var > 0.0 ? sqrt(var / n) : 0.0);
+}
+static bool llms_dsp_moe_any(uint32_t s, ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
+                             const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                             uint32_t gate_type, uint32_t down_type, uint64_t gate_eb, uint64_t gate_rb, uint64_t down_eb, uint64_t down_rb,
+                             uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+                             uint32_t n_total, uint32_t n_used, float clamp, const ds4_gpu_tensor *x) {
+    if (g_dsp_selh && !ds4_gpu_tensor_copy(g_dsp_selh, (uint64_t)s * 4u * sizeof(int32_t), (ds4_gpu_tensor *)selected, 0, (uint64_t)n_used * sizeof(int32_t))) return false;
+    if (g_dsp_bank_on)
+        return ds4_gpu_llms_dsp_moe_bank(out, gate, up, mid, experts, g_dsp_bank_g[s], g_dsp_bank_u[s], g_dsp_bank_d[s], g_dsp_bank_map[s], g_dsp_selb,
+                                         gate_type, down_type, gate_eb, gate_rb, down_eb, down_rb, in_dim, mid_dim, out_dim, selected, weights,
+                                         n_total, g_dsp_bank_n[s], n_used, clamp, x) != 0;
+    return ds4_gpu_llms_dsp_moe(out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type,
+                                gate_eb, gate_rb, down_eb, down_rb, in_dim, mid_dim, out_dim, selected, weights, n_total, n_used, clamp, x) != 0;
+}
+__attribute__((constructor)) static void llms_dsp_res_report_init(void) {
+    atexit_b(^{ if (g_dsp_res_restored) fprintf(stderr, "llms dsp41 resraw: %llu residual logits restored to raw at a sampling-mode change\n", (unsigned long long)g_dsp_res_restored); });
+}
+static ds4_gpu_tensor *llms_dsp_alloc(uint64_t floats) { return ds4_gpu_tensor_alloc(floats * sizeof(float)); }
+static uint64_t g_dspb_hist[];
+static void llms_dsp_report(void) {
+    if (g_dsp.on != 1) return;
+    if (g_dspb_hist[0] + g_dspb_hist[1] + g_dspb_hist[2] + g_dspb_hist[3]) fprintf(stderr, "llms dsp41 block: accepted drafts per cycle 0/1/2/3: %llu / %llu / %llu / %llu\n",
+        (unsigned long long)g_dspb_hist[0], (unsigned long long)g_dspb_hist[1], (unsigned long long)g_dspb_hist[2], (unsigned long long)g_dspb_hist[3]);   /* llms DSP41_BLOCK */
+    const double tok = (double)(g_dsp.cycles + g_dsp.accepts);
+    fprintf(stderr, "llms dsp41: %llu cycles (%llu drafted, %llu accepted = %.3f; %llu without a draft, %llu plain steps), %.3f tokens per cycle; "
+            "drafter %.2f ms, verify %.2f ms per cycle; %llu ring restarts, %llu rewinds (%llu lazy keep-0 served, %llu not), %llu captures; prompt capture %llu rows, %llu ring fills\n",
+            (unsigned long long)g_dsp.cycles, (unsigned long long)g_dsp.drafts, (unsigned long long)g_dsp.accepts,
+            g_dsp.drafts ? (double)g_dsp.accepts / (double)g_dsp.drafts : 0.0, (unsigned long long)g_dsp.no_draft, (unsigned long long)g_dsp.plain,
+            g_dsp.cycles ? tok / (double)g_dsp.cycles : 0.0, g_dsp.cycles ? g_dsp.draft_ms / (double)g_dsp.cycles : 0.0,
+            g_dsp.cycles ? g_dsp.verify_ms / (double)g_dsp.cycles : 0.0, (unsigned long long)g_dsp.ring_resets, (unsigned long long)g_dsp.rewinds,
+            (unsigned long long)g_dsp_lazy_hits, (unsigned long long)g_dsp_lazy_miss,
+            (unsigned long long)g_llms_dsp_cap_n, (unsigned long long)g_llms_dsp_pc_rows, (unsigned long long)g_llms_dsp_pc_fills);
+}
+static bool llms_dsp_wanted(void) {
+    static int w = -1;
+    if (w < 0) { const char *p = getenv("LLMS_DS4_DSP41"); w = p && *p && strcmp(p, "0") != 0; }
+    return w == 1;
+}
+static bool llms_dsp_bind(void) {
+    char nm[160];
+#define DSPT(dst, fmt, s_) do { snprintf(nm, sizeof nm, fmt, (unsigned)(s_)); (dst) = model_find_tensor(&g_dsp.m, nm); \
+        if (!(dst)) { fprintf(stderr, "llms dsp41: support tensor %s is missing\n", nm); return false; } } while (0)
+    for (uint32_t s = 0; s < LLMS_DSP_STAGES; s++) {
+        llms_dsp_stage *t = &g_dsp.st[s];
+        DSPT(t->attn_norm, "mtp.%u.attn_norm.weight", s); DSPT(t->q_a, "mtp.%u.attn_q_a.weight", s); DSPT(t->q_a_norm, "mtp.%u.attn_q_a_norm.weight", s);
+        DSPT(t->q_b, "mtp.%u.attn_q_b.weight", s); DSPT(t->kv, "mtp.%u.attn_kv.weight", s); DSPT(t->kv_norm, "mtp.%u.attn_kv_a_norm.weight", s);
+        DSPT(t->out_a, "mtp.%u.attn_output_a.weight", s); DSPT(t->out_b, "mtp.%u.attn_output_b.weight", s); DSPT(t->sinks, "mtp.%u.attn_sinks.weight", s);
+        DSPT(t->hc_attn_fn, "mtp.%u.hc_attn_fn.weight", s); DSPT(t->hc_attn_scale, "mtp.%u.hc_attn_scale.weight", s); DSPT(t->hc_attn_base, "mtp.%u.hc_attn_base.weight", s);
+        DSPT(t->hc_ffn_fn, "mtp.%u.hc_ffn_fn.weight", s); DSPT(t->hc_ffn_scale, "mtp.%u.hc_ffn_scale.weight", s); DSPT(t->hc_ffn_base, "mtp.%u.hc_ffn_base.weight", s);
+        DSPT(t->ffn_norm, "mtp.%u.ffn_norm.weight", s); DSPT(t->gate_inp, "mtp.%u.ffn_gate_inp.weight", s); DSPT(t->exp_bias, "mtp.%u.exp_probs_b.bias", s);
+        DSPT(t->gate_exps, "mtp.%u.ffn_gate_exps.weight", s); DSPT(t->up_exps, "mtp.%u.ffn_up_exps.weight", s); DSPT(t->down_exps, "mtp.%u.ffn_down_exps.weight", s);
+        DSPT(t->gate_sh, "mtp.%u.ffn_gate_shexp.weight", s); DSPT(t->up_sh, "mtp.%u.ffn_up_shexp.weight", s); DSPT(t->down_sh, "mtp.%u.ffn_down_shexp.weight", s);
+        if (t->q_a->dim[0] != DS4_N_EMBD || t->q_a->dim[1] != DS4_N_LORA_Q || t->q_b->dim[1] != (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM ||
+            t->kv->dim[1] != DS4_N_HEAD_DIM || t->out_a->dim[0] != 4096u || t->out_a->dim[1] != (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O ||
+            t->gate_exps->type != DS4_TENSOR_IQ2_XXS || t->up_exps->type != DS4_TENSOR_IQ2_XXS || t->down_exps->type != DS4_TENSOR_Q2_K ||
+            t->gate_exps->dim[0] != DS4_N_EMBD || t->gate_exps->dim[1] != DS4_N_FF_EXP || t->gate_exps->dim[2] != LLMS_DSP_EXPERTS ||
+            t->gate_inp->dim[1] != LLMS_DSP_EXPERTS || t->hc_attn_fn->dim[0] != (uint64_t)DS4_N_HC * DS4_N_EMBD) {
+            fprintf(stderr, "llms dsp41: stage %u tensor shapes are not the V4.1 DSpark layout\n", s); return false;
+        }
+    }
+    DSPT(g_dsp.main_proj, "mtp.%u.main_proj.weight", 0); DSPT(g_dsp.main_norm, "mtp.%u.main_norm.weight", 0);
+    DSPT(g_dsp.norm, "mtp.%u.norm.weight", 2); DSPT(g_dsp.mk_w1, "mtp.%u.markov_head.markov_w1.weight", 2); DSPT(g_dsp.mk_w2, "mtp.%u.markov_head.markov_w2.weight", 2);
+#undef DSPT
+    if (g_dsp.main_proj->dim[0] != 3u * DS4_N_EMBD || g_dsp.main_proj->dim[1] != DS4_N_EMBD || g_dsp.mk_w1->type != DS4_TENSOR_Q8_0 ||
+        g_dsp.mk_w1->dim[0] != LLMS_DSP_RANK || g_dsp.mk_w1->dim[1] != DS4_N_VOCAB || g_dsp.mk_w2->dim[0] != LLMS_DSP_RANK || g_dsp.mk_w2->dim[1] != DS4_N_VOCAB) {
+        fprintf(stderr, "llms dsp41: main_proj / Markov tensor shapes are not the V4.1 DSpark layout\n"); return false;
+    }
+    if (!tensor_nbytes(g_dsp.st[0].gate_exps->type, DS4_N_EMBD, &g_dsp.gate_rb) || !tensor_nbytes(g_dsp.st[0].down_exps->type, DS4_N_FF_EXP, &g_dsp.down_rb)) return false;
+    g_dsp.gate_eb = g_dsp.gate_rb * DS4_N_FF_EXP; g_dsp.down_eb = g_dsp.down_rb * DS4_N_EMBD;
+    return true;
+}
+static const void *g_llms_dsp_host;   /* llms DSP41_COPY: the support data's host-visible copy (tensor_data_pos at offset 0) */
+static bool llms_dsp_init(void) {
+    if (g_dsp.on >= 0) return g_dsp.on == 1;
+    g_dsp.on = 0;
+    if (!llms_dsp_wanted() || DS4_N_HC != 4u || DS4_N_LAYER != 40u) return false;
+    const char *p = getenv("LLMS_DS4_DSP41");
+    model_open(&g_dsp.m, p, true, false);
+    if (!llms_dsp_bind()) return false;
+    const int llms_views = getenv("LLMS_DS4_DSP41_VIEWS") != NULL;   /* llms DSP41_COPY: a Metal-allocated copy unless VIEWS */
+    const char *llms_bankp = getenv("LLMS_DS4_DSP41_BANK");   /* llms DSP41_BANK */
+    if (llms_bankp && *llms_bankp) {
+        if (!llms_views || !llms_dsp_gaps() || !llms_dsp_bank_load(llms_bankp)) { fprintf(stderr, "llms dsp41 bank: needs LLMS_DS4_DSP41_VIEWS and a valid bank\n"); return false; }
+        uint64_t vb = 0;
+        for (uint32_t i = 0; i < g_dsp_gap_n; i++) {
+            if (!ds4_gpu_llms_add_model_view_span(g_dsp.m.map, g_dsp.m.size, g_dsp_gap_off[i], g_dsp_gap_len[i], g_dsp_gap_max[i])) { fprintf(stderr, "llms dsp41 bank: view span %u failed\n", i); return false; }
+            vb += g_dsp_gap_len[i];
+        }
+        fprintf(stderr, "llms dsp41 bank: Metal views over the %u non-expert spans only (%.2f GiB)\n", g_dsp_gap_n, vb / 1073741824.0);
+    }
+    { const char *cp = getenv("LLMS_DS4_DSP41_COUNT"); if (cp && *cp) { g_dsp_cnt_path = cp; g_dsp_selh = ds4_gpu_tensor_alloc(16u * sizeof(int32_t)); atexit(llms_dsp_count_write); } }
+    if (g_dsp_bank_on) { /* views made above */ }
+    else if (llms_views ? !ds4_gpu_llms_add_model_views(g_dsp.m.map, g_dsp.m.size, g_dsp.m.tensor_data_pos, g_dsp.m.size - g_dsp.m.tensor_data_pos, g_dsp.m.max_tensor_bytes)
+                   : !ds4_gpu_llms_add_model_copy(g_dsp.m.map, g_dsp.m.size, g_dsp.m.tensor_data_pos, g_dsp.m.size - g_dsp.m.tensor_data_pos, &g_llms_dsp_host)) {
+        fprintf(stderr, "llms dsp41: the support model's Metal storage failed\n"); return false;
+    }
+    if (!llms_views) {   /* llms DSP41_COPY: the file pages are not needed by the GPU any more (the host reads only the Markov rows) */
+        const uint64_t pg = 16384u, lo = (g_dsp.m.tensor_data_pos + pg - 1u) / pg * pg, hi = g_dsp.m.size / pg * pg;
+        if (hi > lo) (void)msync((void *)(g_dsp.m.map + lo), (size_t)(hi - lo), MS_INVALIDATE | MS_ASYNC);
+    }
+    if (getenv("LLMS_DS4_DSP41_VIEWS") && !getenv("LLMS_DS4_DSP41_NOLOCK")) {   /* llms DSP41_LOCK (views only; llms DSP41_COPY): the support data stays resident */
+        const uint64_t pg = 16384u;
+        uint64_t locked = 0, failed = 0; int llms_lock_errno = 0; const double tl = now_sec();
+        const uint32_t nsp = g_dsp_bank_on ? g_dsp_gap_n : 1u;   /* llms DSP41_BANK: only the non-expert spans */
+        for (uint32_t sp = 0; sp < nsp; sp++) {
+            const uint64_t lo = (g_dsp_bank_on ? g_dsp_gap_off[sp] : g_dsp.m.tensor_data_pos) / pg * pg;
+            const uint64_t hi = g_dsp_bank_on ? g_dsp_gap_off[sp] + g_dsp_gap_len[sp] : g_dsp.m.size;
+        for (uint64_t off = lo; off < hi;) {
+            const uint64_t len = hi - off > 256ull * 1048576ull ? 256ull * 1048576ull : hi - off;
+            if (!failed && mlock(g_dsp.m.map + off, (size_t)len) == 0) locked += len; else { if (!failed) llms_lock_errno = errno; failed += len; }
+            off += len;
+        }
+        }
+        fprintf(stderr, "llms dsp41: support data locked %.2f GiB, not locked %.2f GiB (errno %d, %.0f ms)\n", locked / 1073741824.0, failed / 1073741824.0, llms_lock_errno, (now_sec() - tl) * 1e3);
+    }
+    {   /* llms DSP41_SHADOW: a bank beside the full support, used only for the paired second pass */
+        const char *sp = getenv("LLMS_DS4_DSP41_SHADOW");
+        if (sp && *sp && !g_dsp_bank_on) {
+            if (!llms_dsp_bank_load(sp)) return false;
+            g_dsp_bank_on = 0; g_dsp_shadow = 1;
+            g_dsp_ql2 = malloc((size_t)DS4_N_VOCAB * sizeof(float)); g_dsp_q2 = calloc((size_t)DS4_N_VOCAB, sizeof(float));
+            if (!g_dsp_ql2 || !g_dsp_q2) return false;
+            const char *lp = getenv("LLMS_DS4_DSP41_SHADOW_LOG"); if (lp && *lp) g_dsp_sh_log = fopen(lp, "w");
+            atexit(llms_dsp_shadow_report);
+            fprintf(stderr, "llms dsp41 shadow: the bank runs as a paired second drafter pass on every drafted sampled cycle\n");
+        }
+    }
+    const uint64_t hcw = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    g_llms_dsp_cap = llms_dsp_alloc(3u * LLMS_DSP_CAPR * hcw);   /* llms LOOKUP: was 3 x 4 rows */
+    for (uint32_t s = 0; s < LLMS_DSP_STAGES; s++) g_dsp.ring[s] = llms_dsp_alloc((uint64_t)LLMS_DSP_WIN * DS4_N_HEAD_DIM);
+    g_dsp.hc = llms_dsp_alloc(hcw); g_dsp.ahc = llms_dsp_alloc(hcw); g_dsp.flat = llms_dsp_alloc(hcw); g_dsp.res0 = llms_dsp_alloc(hcw);
+    g_dsp.mix = llms_dsp_alloc(64); g_dsp.asplit = llms_dsp_alloc(64); g_dsp.fsplit = llms_dsp_alloc(64);
+    g_dsp.pre = llms_dsp_alloc(16); g_dsp.pre_id = llms_dsp_alloc(16); g_dsp.quarter = llms_dsp_alloc(16); g_dsp.pre0 = llms_dsp_alloc(16);
+    g_dsp.x = llms_dsp_alloc(DS4_N_EMBD); g_dsp.n = llms_dsp_alloc(DS4_N_EMBD); g_dsp.qr = llms_dsp_alloc(DS4_N_LORA_Q);
+    g_dsp.q = llms_dsp_alloc((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM); g_dsp.kvb = llms_dsp_alloc(DS4_N_HEAD_DIM);
+    g_dsp.heads = llms_dsp_alloc((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM); g_dsp.low = llms_dsp_alloc((uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O);
+    g_dsp.blk = llms_dsp_alloc(DS4_N_EMBD); g_dsp.rl = llms_dsp_alloc(LLMS_DSP_EXPERTS); g_dsp.sel = llms_dsp_alloc(16); g_dsp.rw = llms_dsp_alloc(16);
+    g_dsp.probs = llms_dsp_alloc(LLMS_DSP_EXPERTS); g_dsp.sg = llms_dsp_alloc(DS4_N_FF_EXP); g_dsp.su = llms_dsp_alloc(DS4_N_FF_EXP);
+    g_dsp.sm = llms_dsp_alloc(DS4_N_FF_EXP); g_dsp.sh = llms_dsp_alloc(DS4_N_EMBD); g_dsp.rt = llms_dsp_alloc(DS4_N_EMBD);
+    g_dsp.eg = llms_dsp_alloc((uint64_t)LLMS_DSP_USED * DS4_N_FF_EXP); g_dsp.eu = llms_dsp_alloc((uint64_t)LLMS_DSP_USED * DS4_N_FF_EXP);
+    g_dsp.em = llms_dsp_alloc((uint64_t)LLMS_DSP_USED * DS4_N_FF_EXP); g_dsp.ex = llms_dsp_alloc((uint64_t)LLMS_DSP_USED * DS4_N_EMBD);
+    g_dsp.logits = llms_dsp_alloc(DS4_N_VOCAB); g_dsp.mk_e = llms_dsp_alloc(LLMS_DSP_RANK); g_dsp.mk_b = llms_dsp_alloc(DS4_N_VOCAB);
+    g_dsp.mx3 = llms_dsp_alloc(64u * 3u * DS4_N_EMBD); g_dsp.mx = llms_dsp_alloc(64u * DS4_N_EMBD); g_dsp.mkv = llms_dsp_alloc(64u * DS4_N_HEAD_DIM);   /* llms DSP41_ROWS; llms DSP41_RING: 64 rows */
+    g_dsp.ql = malloc((size_t)DS4_N_VOCAB * sizeof(float)); g_dsp.qp = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    g_dsp.res = malloc((size_t)DS4_N_VOCAB * sizeof(float)); g_dsp.row_logits = malloc((size_t)LLMS_DSP_CAPR * DS4_N_VOCAB * sizeof(float));   /* llms LOOKUP: was 4 rows */
+    if (!g_llms_dsp_cap || !g_dsp.mkv || !g_dsp.mx3 || !g_dsp.mk_b || !g_dsp.logits || !g_dsp.ex || !g_dsp.ring[2] || !g_dsp.ql || !g_dsp.qp ||
+        !g_dsp.res || !g_dsp.row_logits || !g_dsp.pre0) { fprintf(stderr, "llms dsp41: allocation failed\n"); return false; }
+    const float id4[4] = {1.0f, 0.0f, 0.0f, 0.0f}, q4[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+    if (!ds4_gpu_tensor_write(g_dsp.pre_id, 0, id4, sizeof id4) || !ds4_gpu_tensor_write(g_dsp.quarter, 0, q4, sizeof q4)) return false;
+    g_dsp.on = 1;
+    atexit(llms_dsp_report);
+    fprintf(stderr, "llms dsp41: DSpark drafter (3 stages, block 1) on %s\n", p);
+    return true;
+}
+static bool llms_dsp_markov_row(int token) {   /* w1[token]: the Markov embedding, 256 Q8_0 values dequantized on the host */
+    float e[LLMS_DSP_RANK];
+    const uint8_t *row = (g_llms_dsp_host ? (const uint8_t *)g_llms_dsp_host + (g_dsp.mk_w1->abs_offset - g_dsp.m.tensor_data_pos) : g_dsp.m.map + g_dsp.mk_w1->abs_offset)
+                         + (uint64_t)token * (LLMS_DSP_RANK / 32u) * 34u;   /* llms DSP41_COPY */
+    for (uint32_t b = 0; b < LLMS_DSP_RANK / 32u; b++) {
+        uint16_t hb; memcpy(&hb, row + b * 34u, 2); const float d = f16_to_f32(hb);
+        const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+        for (uint32_t i = 0; i < 32u; i++) e[b * 32u + i] = d * (float)qs[i];
+    }
+    return ds4_gpu_tensor_write(g_dsp.mk_e, 0, e, sizeof e) != 0;
+}
+static FILE *g_llms_dsp_dump;   /* llms DSP41_DUMP */
+static bool llms_dsp_ring_load(const ds4_gpu_tensor *src, int from_pc, uint32_t pos0, uint32_t n);   /* llms DSP41_PROMPT */
+static uint32_t g_llms_cap_r0;   /* llms LOOKUP: the capture row the loader starts at */
+static uint32_t llms_dsp_ring_chunk(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("LLMS_DS4_DSP41_RING"); c = e && atoi(e) > 0 ? atoi(e) : 4; if (c > 64) c = 64; if (getenv("LLMS_DS4_DSP41_DUMP")) c = 4;
+                 if (c != 4) fprintf(stderr, "llms: dsp41 ring %d rows per load\n", c); }
+    return (uint32_t)c;
+}
+static bool llms_dsp_ring_rows(void) {   /* the pending verified rows into every stage's ring (llms DSP41_PROMPT: through llms_dsp_ring_load) */
+    bool ok = true;   /* llms LOOKUP: pending rows in chunks of <= 4 (the loader's own limit) */
+    for (uint32_t c = 0; ok && c < g_dsp.pend_rows; c += 4u) { g_llms_cap_r0 = c; ok = llms_dsp_ring_load(g_llms_dsp_cap, 0, g_dsp.pend_pos + c, g_dsp.pend_rows - c < 4u ? g_dsp.pend_rows - c : 4u); }
+    g_llms_cap_r0 = 0;
+    if (ok) g_dsp.pend_rows = 0;
+    return ok;
+}
+static bool llms_dsp_ring_load(const ds4_gpu_tensor *src, int from_pc, uint32_t pos0, uint32_t n) {   /* inside an open batch, Q4L bypassed; n <= 4 */
+    if (n == 0) return true;
+    if (n > llms_dsp_ring_chunk() || !src) return false;   /* llms DSP41_RING */
+    const uint64_t hcw = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    bool ok = true;
+    for (uint32_t r = 0; ok && r < n; r++)
+        for (uint32_t l = 0; ok && l < 3u; l++) {
+            const uint64_t srow = from_pc ? (uint64_t)l * 128u + (pos0 + r) % 128u : (uint64_t)l * LLMS_DSP_CAPR + g_llms_cap_r0 + r;   /* llms LOOKUP: capture stride / row offset */
+            ds4_gpu_tensor *sv = ds4_gpu_tensor_view(src, srow * hcw * sizeof(float), hcw * sizeof(float));
+            ds4_gpu_tensor *dst = ds4_gpu_tensor_view(g_dsp.mx3, ((uint64_t)r * 3u + l) * DS4_N_EMBD * sizeof(float), (uint64_t)DS4_N_EMBD * sizeof(float));
+            ok = sv && dst && ds4_gpu_hc_weighted_sum_tensor(dst, sv, g_dsp.quarter, DS4_N_EMBD, DS4_N_HC);
+            ds4_gpu_tensor_free(sv); ds4_gpu_tensor_free(dst);
+        }
+    ok = ok && ds4_gpu_dsv41_quantize(g_dsp.mx3, 3u * DS4_N_EMBD, n, DS4_V41_BF16);
+    {   /* llms DSP41_DUMP: each ring row's layer means, for the torch reference */
+        static FILE *df = (FILE *)1; if (df == (FILE *)1) { const char *p = getenv("LLMS_DS4_DSP41_DUMP"); df = p && *p ? fopen(p, "wb") : NULL; }
+        g_llms_dsp_dump = df;
+        if (ok && df) {
+            static float mx3h[4 * 3 * 5120];
+            ok = ds4_gpu_end_commands() && ds4_gpu_tensor_read(g_dsp.mx3, 0, mx3h, (uint64_t)n * 3u * 5120u * sizeof(float)) && ds4_gpu_begin_commands();
+            for (uint32_t r = 0; r < n; r++) { const uint32_t hd[2] = {1u, pos0 + r}; fwrite(hd, 4, 2, df); fwrite(mx3h + (size_t)r * 3u * 5120u, 4, 3 * 5120, df); }
+            fflush(df);
+        }
+    }
+    ok = ok && ds41_matmul_batch(g_dsp.mx, &g_dsp.m, g_dsp.main_proj, g_dsp.mx3, n, true) && ds41_norm_batch(g_dsp.mx, g_dsp.mx, &g_dsp.m, g_dsp.main_norm, n);
+    for (uint32_t s = 0; ok && s < LLMS_DSP_STAGES; s++) {
+        const llms_dsp_stage *t = &g_dsp.st[s];
+        ok = ds41_matmul_batch(g_dsp.mkv, &g_dsp.m, t->kv, g_dsp.mx, n, true) && ds41_norm_batch(g_dsp.mkv, g_dsp.mkv, &g_dsp.m, t->kv_norm, n) &&
+             ds4_gpu_dsv41_rope(g_dsp.mkv, DS4_N_HEAD_DIM, 1, n, pos0, false, false) &&
+             ds4_gpu_dsv41_quantize(g_dsp.mkv, DS4_N_HEAD_DIM, n, DS4_V41_FP8_E8M0);
+        for (uint32_t r = 0; ok && r < n; r++)
+            ok = ds4_gpu_tensor_copy(g_dsp.ring[s], (uint64_t)((pos0 + r) % LLMS_DSP_WIN) * DS4_N_HEAD_DIM * sizeof(float), g_dsp.mkv,
+                                     (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float), (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    }
+    if (!ok) return false;
+    g_dsp.ring_n += n; g_dsp.ring_next = pos0 + n;
+    return true;
+}
+
+static int32_t *g_dsp_sl_ids; static uint8_t *g_dsp_sl_in; static uint32_t g_dsp_sl_n, g_dsp_sl_static, g_dsp_sl_scan; static int g_dsp_sl_on = -1, g_dsp_sl_dirty = 1;
+static uint64_t g_dsp_sl_full;
+static void llms_dsp_sl_add(int id) { if (id >= 0 && id < (int)DS4_N_VOCAB && !g_dsp_sl_in[id]) { g_dsp_sl_in[id] = 1; g_dsp_sl_ids[g_dsp_sl_n++] = id; } }
+static int llms_dsp_sl_init(void) {
+    if (g_dsp_sl_on >= 0) return g_dsp_sl_on;
+    g_dsp_sl_on = 0;
+    const char *e = getenv("LLMS_DS4_DSP41_SHORT"); if (!e || !*e || !strcmp(e, "0")) return 0;
+    FILE *f = fopen(e, "r"); if (!f) { fprintf(stderr, "llms dsp41 short: cannot open %s -- off\n", e); return 0; }
+    g_dsp_sl_ids = calloc(DS4_N_VOCAB, sizeof(int32_t)); g_dsp_sl_in = calloc(DS4_N_VOCAB, 1);
+    int id; while (fscanf(f, "%d", &id) == 1) llms_dsp_sl_add(id);
+    fclose(f); g_dsp_sl_static = g_dsp_sl_n;
+    fprintf(stderr, "llms dsp41 short: the drafter's head over %u listed ids + the session's context ids (%s)\n", g_dsp_sl_n, e);
+    atexit_b(^{ fprintf(stderr, "llms dsp41 short: %u ids at exit (%u listed, %u from the context), %llu full-head fallbacks\n", g_dsp_sl_n, g_dsp_sl_static, g_dsp_sl_n - g_dsp_sl_static, (unsigned long long)g_dsp_sl_full); });
+    g_dsp_sl_on = g_dsp_sl_n > 0; return g_dsp_sl_on;
+}
+static bool llms_dsp_forward_tlimpl(const ds4_model *mm, const ds4_weights *mw, int token, uint32_t pos);
+static bool llms_dsp_forward(const ds4_model *mm, const ds4_weights *mw, int token, uint32_t pos) {   /* llms TL_PHASE wrapper: phase 5 */
+    uint32_t tl_pos, tl_rows; const uint32_t tl_ph = ds4_gpu_llms_tl_phase_get(&tl_pos, &tl_rows); ds4_gpu_llms_tl_phase(5u, (uint32_t)(pos), (uint32_t)(1u));
+    const bool tl_ok = llms_dsp_forward_tlimpl(mm, mw, token, pos); ds4_gpu_llms_tl_phase(tl_ph, tl_pos, tl_rows); return tl_ok;
+}
+static bool llms_dsp_forward_tlimpl(const ds4_model *mm, const ds4_weights *mw, int token, uint32_t pos) {   /* inside an open batch, Q4L bypassed */
+    const uint32_t n_raw = g_dsp.ring_n < LLMS_DSP_WIN ? g_dsp.ring_n : LLMS_DSP_WIN;
+    const uint32_t raw_start = (g_dsp.ring_next + LLMS_DSP_WIN * 4u - n_raw) % LLMS_DSP_WIN;
+    const ds4_model *m = &g_dsp.m;
+    bool ok = n_raw > 0 && ds4_gpu_embed_token_hc_tensor(g_dsp.hc, mm->map, mm->size, mw->token_embd->abs_offset, DS4_N_VOCAB,
+                                                         (uint32_t)token, DS4_N_EMBD, DS4_N_HC) != 0;
+    const ds4_gpu_tensor *pre = g_dsp.pre_id;
+    for (uint32_t s = 0; ok && s < LLMS_DSP_STAGES; s++) {
+        const llms_dsp_stage *t = &g_dsp.st[s];
+        ok = ds4_gpu_rms_norm_plain_tensor(g_dsp.flat, g_dsp.hc, DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
+             ds41_matmul(g_dsp.mix, m, t->hc_attn_fn, g_dsp.flat, false) &&
+             ds4_gpu_hc_split_sinkhorn_tensor(g_dsp.asplit, g_dsp.mix, m->map, m->size, t->hc_attn_scale->abs_offset, t->hc_attn_base->abs_offset,
+                                              DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) &&
+             ds4_gpu_hc_weighted_sum_tensor(g_dsp.x, g_dsp.hc, pre, DS4_N_EMBD, DS4_N_HC) && ds41_bf16(g_dsp.x, DS4_N_EMBD) &&
+             ds41_norm(g_dsp.n, g_dsp.x, m, t->attn_norm) &&
+             ds41_matmul(g_dsp.qr, m, t->q_a, g_dsp.n, true) && ds41_norm(g_dsp.qr, g_dsp.qr, m, t->q_a_norm) &&
+             ds41_matmul_rows(g_dsp.q, m, t->q_b, g_dsp.qr, 0, DS4_N_HEAD * DS4_N_HEAD_DIM) &&
+             ds41_matmul(g_dsp.kvb, m, t->kv, g_dsp.n, true) && ds41_norm(g_dsp.kvb, g_dsp.kvb, m, t->kv_norm) &&
+             ds4_gpu_dsv41_rope(g_dsp.q, DS4_N_HEAD_DIM, DS4_N_HEAD, 1, pos, false, false) &&
+             ds4_gpu_dsv41_rope(g_dsp.kvb, DS4_N_HEAD_DIM, 1, 1, pos, false, false) &&
+             ds4_gpu_dsv41_quantize(g_dsp.kvb, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) &&
+             ds4_gpu_attention_decode_heads_tensor(g_dsp.heads, m->map, m->size, t->sinks->abs_offset, g_dsp.q, g_dsp.ring[s], n_raw, LLMS_DSP_WIN,
+                                                   raw_start, g_dsp.kvb, 0, 1, NULL, 0, DS4_N_HEAD, DS4_N_HEAD_DIM) &&
+             ds41_bf16(g_dsp.heads, DS4_N_HEAD * DS4_N_HEAD_DIM) &&
+             ds4_gpu_dsv41_rope(g_dsp.heads, DS4_N_HEAD_DIM, DS4_N_HEAD, 1, pos, false, true) &&
+             ds4_gpu_attention_output_low_q8_tensor(g_dsp.low, m->map, m->size, t->out_a->abs_offset, 4096, DS4_N_LORA_O, DS4_N_OUT_GROUP, g_dsp.heads) &&
+             ds41_bf16(g_dsp.low, DS4_N_OUT_GROUP * DS4_N_LORA_O) &&
+             ds41_matmul(g_dsp.blk, m, t->out_b, g_dsp.low, true) &&
+             ds4_gpu_hc_expand_split_tensor(g_dsp.ahc, g_dsp.blk, g_dsp.hc, g_dsp.asplit, DS4_N_EMBD, DS4_N_HC) &&
+             ds41_bf16(g_dsp.ahc, DS4_N_HC * DS4_N_EMBD) &&
+             ds4_gpu_rms_norm_plain_tensor(g_dsp.flat, g_dsp.ahc, DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
+             ds41_matmul(g_dsp.mix, m, t->hc_ffn_fn, g_dsp.flat, false) &&
+             ds4_gpu_hc_split_sinkhorn_tensor(g_dsp.fsplit, g_dsp.mix, m->map, m->size, t->hc_ffn_scale->abs_offset, t->hc_ffn_base->abs_offset,
+                                              DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) &&
+             ds4_gpu_hc_weighted_sum_split_tensor(g_dsp.x, g_dsp.ahc, g_dsp.asplit, DS4_N_EMBD, DS4_N_HC) && ds41_bf16(g_dsp.x, DS4_N_EMBD) &&
+             ds41_norm(g_dsp.n, g_dsp.x, m, t->ffn_norm) &&
+             ds41_matmul(g_dsp.rl, m, t->gate_inp, g_dsp.n, false) &&
+             (ds4_gpu_llms_router_bias_override(g_dsp_bank_on ? g_dsp_bank_bias[s] : NULL), true) &&   /* llms DSP41_BANK */
+             ds4_gpu_router_select_tensor(g_dsp.sel, g_dsp.rw, g_dsp.probs, m->map, m->size, t->exp_bias->abs_offset, 0, 0, (uint32_t)token,
+                                          LLMS_DSP_EXPERTS, LLMS_DSP_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, g_dsp.rl) &&
+             (ds4_gpu_llms_router_bias_override(NULL), true) &&
+             ds41_matmul(g_dsp.sg, m, t->gate_sh, g_dsp.n, true) && ds41_matmul(g_dsp.su, m, t->up_sh, g_dsp.n, true) &&
+             ds4_gpu_swiglu_tensor(g_dsp.sm, g_dsp.sg, g_dsp.su, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) && ds41_bf16(g_dsp.sm, DS4_N_FF_EXP) &&
+             ds41_matmul(g_dsp.sh, m, t->down_sh, g_dsp.sm, true) &&
+             llms_dsp_moe_any(s, g_dsp.rt, g_dsp.eg, g_dsp.eu, g_dsp.em, g_dsp.ex, m->map, m->size, t->gate_exps->abs_offset, t->up_exps->abs_offset,   /* llms DSP41_BANK */
+                                  t->down_exps->abs_offset, t->gate_exps->type, t->down_exps->type, g_dsp.gate_eb, g_dsp.gate_rb, g_dsp.down_eb,
+                                  g_dsp.down_rb, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g_dsp.sel, g_dsp.rw, LLMS_DSP_EXPERTS, LLMS_DSP_USED,
+                                  DS4_SWIGLU_CLAMP_EXP, g_dsp.n) &&
+             ds4_gpu_add_tensor(g_dsp.blk, g_dsp.rt, g_dsp.sh, DS4_N_EMBD) && ds41_bf16(g_dsp.blk, DS4_N_EMBD) &&
+             ds4_gpu_hc_expand_split_tensor(g_dsp.hc, g_dsp.blk, g_dsp.ahc, g_dsp.fsplit, DS4_N_EMBD, DS4_N_HC) &&
+             ds41_bf16(g_dsp.hc, DS4_N_HC * DS4_N_EMBD) &&
+             ds4_gpu_tensor_copy(g_dsp.pre, 0, g_dsp.fsplit, 0, DS4_N_HC * sizeof(float));
+        pre = g_dsp.pre;
+    }
+    ds4_gpu_llms_router_bias_override(NULL);   /* llms DSP41_BANK: never left set on a failed stage */
+    ok = ok && ds4_gpu_hc_weighted_sum_tensor(g_dsp.x, g_dsp.hc, g_dsp.pre, DS4_N_EMBD, DS4_N_HC) && ds41_bf16(g_dsp.x, DS4_N_EMBD) &&
+         ds41_norm(g_dsp.n, g_dsp.x, m, g_dsp.norm);
+    if (ok) {   /* the main model's head: its own 4-bit copy */
+        ds4_gpu_llms_q4l_bypass(0);
+        if (g_dsp_sl_on > 0 && !g_dsp_sl_dirty && ds4_gpu_llms_q4l_short(g_dsp.logits, mw->output->abs_offset, (uint32_t)mw->output->dim[0], (uint32_t)mw->output->dim[1], g_dsp.n, g_dsp_sl_ids, g_dsp_sl_n)) ok = true;   /* llms DSP41_SHORT */
+        else { ok = ds41_matmul_batch(g_dsp.logits, mm, mw->output, g_dsp.n, 1, false); if (g_dsp_sl_on > 0) { g_dsp_sl_full++; g_dsp_sl_dirty = 1; } }
+        ds4_gpu_llms_q4l_bypass(1);
+    }
+    return ok && ds41_matmul(g_dsp.mk_b, m, g_dsp.mk_w2, g_dsp.mk_e, false) && ds4_gpu_add_tensor(g_dsp.logits, g_dsp.logits, g_dsp.mk_b, DS4_N_VOCAB);
+}
+
+enum { LLMS_DSP_BMAX = 3, LLMS_DSP_NOISE = 128799 };
+static ds4_gpu_tensor *g_dspb_hc[LLMS_DSP_BMAX], *g_dspb_as[LLMS_DSP_BMAX], *g_dspb_pre[LLMS_DSP_BMAX], *g_dspb_q[LLMS_DSP_BMAX], *g_dspb_kv, *g_dspb_n, *g_dspb_logits;
+static bool llms_dspb_alloc(void) {
+    if (g_dspb_logits) return true;
+    const uint64_t hcw = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    for (uint32_t r = 0; r < LLMS_DSP_BMAX; r++) {
+        g_dspb_hc[r] = llms_dsp_alloc(hcw); g_dspb_as[r] = llms_dsp_alloc(64); g_dspb_pre[r] = llms_dsp_alloc(16);
+        g_dspb_q[r] = llms_dsp_alloc((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM);
+        if (!g_dspb_hc[r] || !g_dspb_as[r] || !g_dspb_pre[r] || !g_dspb_q[r]) return false;
+    }
+    g_dspb_kv = llms_dsp_alloc((uint64_t)LLMS_DSP_BMAX * DS4_N_HEAD_DIM); g_dspb_n = llms_dsp_alloc((uint64_t)LLMS_DSP_BMAX * DS4_N_EMBD);
+    g_dspb_logits = llms_dsp_alloc((uint64_t)LLMS_DSP_BMAX * DS4_N_VOCAB);
+    return g_dspb_kv && g_dspb_n && g_dspb_logits;
+}
+static bool llms_dsp_forward_blk_tlimpl(const ds4_model *mm, const ds4_weights *mw, int token, uint32_t pos, uint32_t B);
+static bool llms_dsp_forward_blk(const ds4_model *mm, const ds4_weights *mw, int token, uint32_t pos, uint32_t B) {   /* llms TL_PHASE wrapper: phase 6 */
+    uint32_t tl_pos, tl_rows; const uint32_t tl_ph = ds4_gpu_llms_tl_phase_get(&tl_pos, &tl_rows); ds4_gpu_llms_tl_phase(6u, (uint32_t)(pos), (uint32_t)(B));
+    const bool tl_ok = llms_dsp_forward_blk_tlimpl(mm, mw, token, pos, B); ds4_gpu_llms_tl_phase(tl_ph, tl_pos, tl_rows); return tl_ok;
+}
+static bool llms_dsp_forward_blk_tlimpl(const ds4_model *mm, const ds4_weights *mw, int token, uint32_t pos, uint32_t B) {   /* inside an open batch, Q4L bypassed */
+    const uint32_t n_raw = g_dsp.ring_n < LLMS_DSP_WIN ? g_dsp.ring_n : LLMS_DSP_WIN;
+    const uint32_t raw_start = (g_dsp.ring_next + LLMS_DSP_WIN * 4u - n_raw) % LLMS_DSP_WIN;
+    const ds4_model *m = &g_dsp.m;
+    bool ok = n_raw > 0 && B >= 1u && B <= LLMS_DSP_BMAX && llms_dspb_alloc();
+    for (uint32_t r = 0; ok && r < B; r++)
+        ok = ds4_gpu_embed_token_hc_tensor(g_dspb_hc[r], mm->map, mm->size, mw->token_embd->abs_offset, DS4_N_VOCAB,
+                                           r == 0 ? (uint32_t)token : (uint32_t)LLMS_DSP_NOISE, DS4_N_EMBD, DS4_N_HC) != 0 &&
+             ds4_gpu_tensor_copy(g_dspb_pre[r], 0, g_dsp.pre_id, 0, DS4_N_HC * sizeof(float)) != 0;
+    for (uint32_t s = 0; ok && s < LLMS_DSP_STAGES; s++) {
+        const llms_dsp_stage *t = &g_dsp.st[s];
+        for (uint32_t r = 0; ok && r < B; r++) {   /* phase A: everything up to this row's query and block key */
+            ok = ds4_gpu_rms_norm_plain_tensor(g_dsp.flat, g_dspb_hc[r], DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
+                 ds41_matmul(g_dsp.mix, m, t->hc_attn_fn, g_dsp.flat, false) &&
+                 ds4_gpu_hc_split_sinkhorn_tensor(g_dspb_as[r], g_dsp.mix, m->map, m->size, t->hc_attn_scale->abs_offset, t->hc_attn_base->abs_offset,
+                                                  DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) &&
+                 ds4_gpu_hc_weighted_sum_tensor(g_dsp.x, g_dspb_hc[r], g_dspb_pre[r], DS4_N_EMBD, DS4_N_HC) && ds41_bf16(g_dsp.x, DS4_N_EMBD) &&
+                 ds41_norm(g_dsp.n, g_dsp.x, m, t->attn_norm) &&
+                 ds41_matmul(g_dsp.qr, m, t->q_a, g_dsp.n, true) && ds41_norm(g_dsp.qr, g_dsp.qr, m, t->q_a_norm) &&
+                 ds41_matmul_rows(g_dspb_q[r], m, t->q_b, g_dsp.qr, 0, DS4_N_HEAD * DS4_N_HEAD_DIM) &&
+                 ds41_matmul(g_dsp.kvb, m, t->kv, g_dsp.n, true) && ds41_norm(g_dsp.kvb, g_dsp.kvb, m, t->kv_norm) &&
+                 ds4_gpu_dsv41_rope(g_dspb_q[r], DS4_N_HEAD_DIM, DS4_N_HEAD, 1, pos + r, false, false) &&
+                 ds4_gpu_dsv41_rope(g_dsp.kvb, DS4_N_HEAD_DIM, 1, 1, pos + r, false, false) &&
+                 ds4_gpu_dsv41_quantize(g_dsp.kvb, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) &&
+                 ds4_gpu_tensor_copy(g_dspb_kv, (uint64_t)r * DS4_N_HEAD_DIM * sizeof(float), g_dsp.kvb, 0, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        }
+        for (uint32_t r = 0; ok && r < B; r++) {   /* phase B: attention over the ring and all B block keys, then the rest of the stage */
+            ok = ds4_gpu_attention_decode_heads_tensor(g_dsp.heads, m->map, m->size, t->sinks->abs_offset, g_dspb_q[r], g_dsp.ring[s], n_raw, LLMS_DSP_WIN,
+                                                       raw_start, g_dspb_kv, 0, B, NULL, 0, DS4_N_HEAD, DS4_N_HEAD_DIM) &&
+                 ds41_bf16(g_dsp.heads, DS4_N_HEAD * DS4_N_HEAD_DIM) &&
+                 ds4_gpu_dsv41_rope(g_dsp.heads, DS4_N_HEAD_DIM, DS4_N_HEAD, 1, pos + r, false, true) &&
+                 ds4_gpu_attention_output_low_q8_tensor(g_dsp.low, m->map, m->size, t->out_a->abs_offset, 4096, DS4_N_LORA_O, DS4_N_OUT_GROUP, g_dsp.heads) &&
+                 ds41_bf16(g_dsp.low, DS4_N_OUT_GROUP * DS4_N_LORA_O) &&
+                 ds41_matmul(g_dsp.blk, m, t->out_b, g_dsp.low, true) &&
+                 ds4_gpu_hc_expand_split_tensor(g_dsp.ahc, g_dsp.blk, g_dspb_hc[r], g_dspb_as[r], DS4_N_EMBD, DS4_N_HC) &&
+                 ds41_bf16(g_dsp.ahc, DS4_N_HC * DS4_N_EMBD) &&
+                 ds4_gpu_rms_norm_plain_tensor(g_dsp.flat, g_dsp.ahc, DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
+                 ds41_matmul(g_dsp.mix, m, t->hc_ffn_fn, g_dsp.flat, false) &&
+                 ds4_gpu_hc_split_sinkhorn_tensor(g_dsp.fsplit, g_dsp.mix, m->map, m->size, t->hc_ffn_scale->abs_offset, t->hc_ffn_base->abs_offset,
+                                                  DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) &&
+                 ds4_gpu_hc_weighted_sum_split_tensor(g_dsp.x, g_dsp.ahc, g_dspb_as[r], DS4_N_EMBD, DS4_N_HC) && ds41_bf16(g_dsp.x, DS4_N_EMBD) &&
+                 ds41_norm(g_dsp.n, g_dsp.x, m, t->ffn_norm) &&
+                 ds41_matmul(g_dsp.rl, m, t->gate_inp, g_dsp.n, false) &&
+                 (ds4_gpu_llms_router_bias_override(g_dsp_bank_on ? g_dsp_bank_bias[s] : NULL), true) &&
+                 ds4_gpu_router_select_tensor(g_dsp.sel, g_dsp.rw, g_dsp.probs, m->map, m->size, t->exp_bias->abs_offset, 0, 0,
+                                              r == 0 ? (uint32_t)token : (uint32_t)LLMS_DSP_NOISE,
+                                              LLMS_DSP_EXPERTS, LLMS_DSP_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, g_dsp.rl) &&
+                 (ds4_gpu_llms_router_bias_override(NULL), true) &&
+                 ds41_matmul(g_dsp.sg, m, t->gate_sh, g_dsp.n, true) && ds41_matmul(g_dsp.su, m, t->up_sh, g_dsp.n, true) &&
+                 ds4_gpu_swiglu_tensor(g_dsp.sm, g_dsp.sg, g_dsp.su, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) && ds41_bf16(g_dsp.sm, DS4_N_FF_EXP) &&
+                 ds41_matmul(g_dsp.sh, m, t->down_sh, g_dsp.sm, true) &&
+                 llms_dsp_moe_any(s, g_dsp.rt, g_dsp.eg, g_dsp.eu, g_dsp.em, g_dsp.ex, m->map, m->size, t->gate_exps->abs_offset, t->up_exps->abs_offset,
+                                  t->down_exps->abs_offset, t->gate_exps->type, t->down_exps->type, g_dsp.gate_eb, g_dsp.gate_rb, g_dsp.down_eb,
+                                  g_dsp.down_rb, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g_dsp.sel, g_dsp.rw, LLMS_DSP_EXPERTS, LLMS_DSP_USED,
+                                  DS4_SWIGLU_CLAMP_EXP, g_dsp.n) &&
+                 ds4_gpu_add_tensor(g_dsp.blk, g_dsp.rt, g_dsp.sh, DS4_N_EMBD) && ds41_bf16(g_dsp.blk, DS4_N_EMBD) &&
+                 ds4_gpu_hc_expand_split_tensor(g_dspb_hc[r], g_dsp.blk, g_dsp.ahc, g_dsp.fsplit, DS4_N_EMBD, DS4_N_HC) &&
+                 ds41_bf16(g_dspb_hc[r], DS4_N_HC * DS4_N_EMBD) &&
+                 ds4_gpu_tensor_copy(g_dspb_pre[r], 0, g_dsp.fsplit, 0, DS4_N_HC * sizeof(float));
+        }
+    }
+    ds4_gpu_llms_router_bias_override(NULL);
+    for (uint32_t r = 0; ok && r < B; r++)
+        ok = ds4_gpu_hc_weighted_sum_tensor(g_dsp.x, g_dspb_hc[r], g_dspb_pre[r], DS4_N_EMBD, DS4_N_HC) && ds41_bf16(g_dsp.x, DS4_N_EMBD) &&
+             ds41_norm(g_dsp.n, g_dsp.x, m, g_dsp.norm) &&
+             ds4_gpu_tensor_copy(g_dspb_n, (uint64_t)r * DS4_N_EMBD * sizeof(float), g_dsp.n, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
+    if (ok) {   /* the main model's head on its 4-bit copy, B rows */
+        ds4_gpu_llms_q4l_bypass(0);
+        ok = ds41_matmul_batch(g_dspb_logits, mm, mw->output, g_dspb_n, B, false);
+        ds4_gpu_llms_q4l_bypass(1);
+    }
+    if (!ok) return false;
+    ds4_gpu_tensor *l0 = ds4_gpu_tensor_view(g_dspb_logits, 0, (uint64_t)DS4_N_VOCAB * sizeof(float));
+    ok = l0 && ds41_matmul(g_dsp.mk_b, m, g_dsp.mk_w2, g_dsp.mk_e, false) && ds4_gpu_add_tensor(l0, l0, g_dsp.mk_b, DS4_N_VOCAB);
+    if (l0) ds4_gpu_tensor_free(l0);
     return ok;
 }
 #include "ds4_deepseek41_dspark.h"
@@ -44862,6 +49267,8 @@ static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     return false;
 }
 
+int ds4_token_think_end(ds4_engine *e) { return e->vocab.think_end_id; }   /* llms THINK_BUDGET */
+
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
 }
@@ -45044,6 +49451,15 @@ typedef struct {
     float logit;
     float prob;
 } sample_candidate;
+_Static_assert(sizeof(sample_candidate) <= LLMS_SAMP_CAND_BYTES, "llms STATIC_STATE: candidate storage too small");   /* llms STATIC_STATE */
+static void llms_samp_report(void) { fprintf(stderr, "llms static state: sampler %llu calls, %llu heap (concurrent / oversize)\n", (unsigned long long)g_llms_samp_calls, (unsigned long long)g_llms_samp_heap); }
+static sample_candidate *llms_samp_take(uint64_t n) {
+    static int reg; if (!reg) { reg = 1; atexit(llms_samp_report); }
+    g_llms_samp_calls++;
+    int z = 0; if (n <= LLMS_SAMP_MAX_CAND && atomic_compare_exchange_strong(&g_llms_samp_busy, &z, 1)) return (sample_candidate *)g_llms_samp_cand;
+    g_llms_samp_heap++; return xmalloc((size_t)n * sizeof(sample_candidate));
+}
+static void llms_samp_give(sample_candidate *c) { if ((unsigned char *)c == g_llms_samp_cand) atomic_store(&g_llms_samp_busy, 0); else free(c); }
 
 static int sample_candidate_cmp_desc(const void *a, const void *b) {
     const sample_candidate *ca = a;
@@ -45092,6 +49508,7 @@ static void sample_heap_sift_down(sample_candidate *heap, uint32_t n, uint32_t i
 /* Materialize the exact distribution represented by the public sampling
  * knobs. Speculative decoding needs probabilities, rather than only a sampled
  * token, for the p/q acceptance test and the corrected rejection sample. */
+static inline int llms_finitef(float v) { uint32_t u; memcpy(&u, &v, 4); return (u & 0x7f800000u) != 0x7f800000u; }
 static bool sample_build_probabilities(
         const float *logits,
         uint32_t     n_vocab,
@@ -45121,7 +49538,7 @@ static bool sample_build_probabilities(
     uint32_t heap_n = 0;
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < n_vocab; i++) {
-        if (!isfinite(logits[i])) continue;
+        if (!llms_finitef(logits[i])) continue;
         finite++;
         if (logits[i] > max_logit) max_logit = logits[i];
     }
@@ -45134,7 +49551,7 @@ static bool sample_build_probabilities(
     float heap_sum = 0.0f;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (!isfinite(v)) continue;
+        if (!llms_finitef(v)) continue;
         const float raw = expf((v - max_logit) / temperature);
         full_sum += raw;
         sample_candidate cand = {.id = (int)i, .logit = v, .prob = raw};
@@ -45150,7 +49567,7 @@ static bool sample_build_probabilities(
             sample_heap_sift_down(heap, heap_n, 0);
         }
     }
-    if (full_sum <= 0.0f || !isfinite(full_sum) || heap_n == 0) {
+    if (full_sum <= 0.0f || !llms_finitef(full_sum) || heap_n == 0) {
         probs[sample_argmax(logits, n_vocab)] = 1.0f;
         return true;
     }
@@ -45189,7 +49606,7 @@ static bool sample_build_probabilities(
         cand_n = 0;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
-            if (!isfinite(v)) continue;
+            if (!llms_finitef(v)) continue;
             cand[cand_n++] = (sample_candidate){
                 .id = (int)i,
                 .logit = v,
@@ -45210,7 +49627,7 @@ static bool sample_build_probabilities(
         owned = true;
     }
 
-    if (filtered == 0 || filtered_sum <= 0.0f || !isfinite(filtered_sum)) {
+    if (filtered == 0 || filtered_sum <= 0.0f || !llms_finitef(filtered_sum)) {
         probs[cand[0].id] = 1.0f;
     } else {
         const float inv_sum = 1.0f / filtered_sum;
@@ -45230,17 +49647,17 @@ static int sample_probabilities(const float *probs, uint32_t n_vocab,
     float best_p = probs[0];
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float p = probs[i];
-        if (p > 0.0f && isfinite(p)) sum += p;
+        if (p > 0.0f && llms_finitef(p)) sum += p;
         if (p > best_p) {
             best_p = p;
             best = (int)i;
         }
     }
-    if (sum <= 0.0f || !isfinite(sum)) return best;
+    if (sum <= 0.0f || !llms_finitef(sum)) return best;
     float r = sample_rng_f32(rng) * sum;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float p = probs[i];
-        if (p <= 0.0f || !isfinite(p)) continue;
+        if (p <= 0.0f || !llms_finitef(p)) continue;
         r -= p;
         if (r <= 0.0f) return (int)i;
     }
@@ -45265,11 +49682,11 @@ static int sample_residual_probabilities(float *target_probs,
             target_best = (int)i;
         }
         float residual = target_probs[i] - draft_probs[i];
-        if (!(residual > 0.0f) || !isfinite(residual)) residual = 0.0f;
+        if (!(residual > 0.0f) || !llms_finitef(residual)) residual = 0.0f;
         target_probs[i] = residual;
         sum += residual;
     }
-    if (sum <= 0.0f || !isfinite(sum)) return target_best;
+    if (sum <= 0.0f || !llms_finitef(sum)) return target_best;
     return sample_probabilities(target_probs, n_vocab, rng);
 }
 #endif
@@ -45298,7 +49715,7 @@ static bool sample_fast_top_p(
 
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (!isfinite(v)) continue;
+        if (!llms_finitef(v)) continue;
         const float p = expf((v - max_logit) / temperature);
         sum += p;
         sample_candidate cand = {.id = (int)i, .logit = v, .prob = p};
@@ -45314,7 +49731,7 @@ static bool sample_fast_top_p(
             sample_heap_sift_down(heap, n, 0);
         }
     }
-    if (sum <= 0.0f || !isfinite(sum)) {
+    if (sum <= 0.0f || !llms_finitef(sum)) {
         *token_out = best;
         return true;
     }
@@ -45362,6 +49779,52 @@ static bool sample_fast_top_p(
     return true;
 }
 
+
+
+static int g_llms_fast_sampler = -1;
+void ds4_llms_fast_sampler_set(int on) { g_llms_fast_sampler = on ? 1 : 0; }
+static int llms_fast_sampler_on(void) {
+    if (g_llms_fast_sampler < 0) { const char *e = getenv("LLMS_DS4_FAST_SAMPLER"); g_llms_fast_sampler = e && *e && *e != '0';
+        if (g_llms_fast_sampler) fprintf(stderr, "llms: fast sampler (an exact top-p: only a certified superset of the nucleus is sorted)\n"); }
+    return g_llms_fast_sampler;
+}
+static int llms_sample_top_p_hist(const float *logits, uint32_t n_vocab, float max_logit, float temperature, float top_p, uint64_t *rng, float *scratch) {
+    enum { NB = 2048 };
+    { static int can = -1; if (can < 0) { const char *e = getenv("LLMS_DS4_FAST_SAMPLER"); can = e && !strcmp(e, "canary");
+          if (can) fprintf(stderr, "llms: fast sampler -- CANARY: the nucleus cut at 0.9 x top_p\n"); }
+      if (can) top_p *= 0.9f; }   /* canary (apply_fast_sampler.py): the comparison must see mismatches */
+    const float bw = 1.0f / 64.0f;   /* bin width in nats of (max - logit) / temperature */
+    double mass[NB]; memset(mass, 0, sizeof mass);
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {   /* the original's order: the same float sum */
+        const float v = logits[i];
+        if (!llms_finitef(v)) { scratch[i] = -1.0f; continue; }
+        const float sc = (max_logit - v) / temperature;
+        const float p = expf((v - max_logit) / temperature);
+        scratch[i] = p; sum += p;
+        int b = (int)(sc / bw); if (b < 0) b = 0; if (b >= NB) b = NB - 1;
+        mass[b] += (double)p;
+    }
+    if (!(sum > 0.0f) || !llms_finitef(sum)) return -1;
+    const double need = (double)top_p * (double)sum * 1.001;
+    double cum = 0.0; int bstar = -1;
+    for (int b = 0; b < NB - 1; b++) { cum += mass[b]; if (cum >= need) { bstar = b; break; } }
+    if (bstar < 0) return -1;   /* the nucleus reaches the open last bin: let the original decide */
+    const float cut = (float)(bstar + 1) * bw;   /* keep every token with sc < cut (and the boundary, conservatively) */
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) if (scratch[i] >= 0.0f && (max_logit - logits[i]) / temperature <= cut) n++;
+    sample_candidate *cand = llms_samp_take(n);   /* llms STATIC_STATE */
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) if (scratch[i] >= 0.0f && (max_logit - logits[i]) / temperature <= cut) cand[k++] = (sample_candidate){.id = (int)i, .logit = logits[i], .prob = scratch[i]};
+    qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
+    float filtered_sum = 0.0f; uint32_t filtered = 0; int reached = 0;
+    for (uint32_t i = 0; i < n; i++) { filtered_sum += cand[i].prob; filtered++; if (filtered_sum / sum >= top_p) { reached = 1; break; } }
+    if (!reached) { llms_samp_give(cand); return -1; }   /* not certified after all: the original runs */
+    float r = sample_rng_f32(rng) * filtered_sum;
+    for (uint32_t i = 0; i < filtered; i++) { r -= cand[i].prob; if (r <= 0.0f) { const int id = cand[i].id; llms_samp_give(cand); return id; } }
+    const int id = cand[filtered - 1].id; llms_samp_give(cand); return id;
+}
+
 static int sample_full_vocab(
         const float *logits,
         uint32_t     n_vocab,
@@ -45375,7 +49838,7 @@ static int sample_full_vocab(
     uint32_t finite = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (!isfinite(v)) continue;
+        if (!llms_finitef(v)) continue;
         finite++;
         if (v > max_logit) {
             max_logit = v;
@@ -45384,6 +49847,12 @@ static int sample_full_vocab(
     }
     if (finite == 0) return sample_argmax(logits, n_vocab);
 
+    if (top_p < 1.0f && !(min_p > 0.0f) && prob_scratch && llms_fast_sampler_on()) {   /* llms FAST_SAMPLER */
+        uint64_t rng0 = *rng;
+        const int t = llms_sample_top_p_hist(logits, n_vocab, max_logit, temperature, top_p, rng, prob_scratch);
+        if (t >= 0) return t;
+        *rng = rng0;   /* not certified: the original path draws from the same rng state */
+    }
     int fast_token = best;
     if (top_p < 1.0f &&
         sample_fast_top_p(logits,
@@ -45411,9 +49880,9 @@ static int sample_full_vocab(
          * still take the ordinary expf comparison. */
         float reject_scaled = DS4_NEG_INF;
         bool have_reject_scaled = false;
-        if (min_rel > 0.0f && isfinite(min_rel)) {
+        if (min_rel > 0.0f && llms_finitef(min_rel)) {
             float cutoff = logf(min_rel);
-            for (int i = 0; i < 8 && isfinite(cutoff); i++) {
+            for (int i = 0; i < 8 && llms_finitef(cutoff); i++) {
                 cutoff = nextafterf(cutoff, -FLT_MAX);
                 if (expf(cutoff) < min_rel) {
                     reject_scaled = cutoff;
@@ -45426,7 +49895,7 @@ static int sample_full_vocab(
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
-            if (!isfinite(v)) continue;
+            if (!llms_finitef(v)) continue;
             const float scaled = (v - max_logit) / temperature;
             if (have_reject_scaled && scaled <= reject_scaled) continue;
             const float p = expf(scaled);
@@ -45434,7 +49903,7 @@ static int sample_full_vocab(
             prob_scratch[i] = p;
             sum += p;
         }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
+        if (sum <= 0.0f || !llms_finitef(sum)) return best;
         float r = sample_rng_f32(rng) * sum;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float p = prob_scratch[i];
@@ -45457,12 +49926,12 @@ static int sample_full_vocab(
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
-            if (!isfinite(v)) continue;
+            if (!llms_finitef(v)) continue;
             const float p = expf((v - max_logit) / temperature);
             prob_scratch[i] = p;
             sum += p;
         }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
+        if (sum <= 0.0f || !llms_finitef(sum)) return best;
 
         const float min_prob = (1.0f / sum) * min_p;
         for (uint32_t i = 0; i < n_vocab; i++) {
@@ -45484,13 +49953,13 @@ static int sample_full_vocab(
         cand = xmalloc((size_t)finite * sizeof(cand[0]));
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
-            if (!isfinite(v)) continue;
+            if (!llms_finitef(v)) continue;
             const float p = expf((v - max_logit) / temperature);
             cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
             sum += p;
         }
     }
-    if (sum <= 0.0f || !isfinite(sum)) {
+    if (sum <= 0.0f || !llms_finitef(sum)) {
         free(cand);
         return best;
     }
@@ -45555,7 +50024,7 @@ static int sample_top_p_min_p(
     int n = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
         float v = logits[i];
-        if (!isfinite(v)) continue;
+        if (!llms_finitef(v)) continue;
         if (n == top_k && v <= vals[n - 1]) continue;
         int j = n < top_k ? n++ : n - 1;
         while (j > 0 && vals[j - 1] < v) {
@@ -45575,7 +50044,7 @@ static int sample_top_p_min_p(
         probs[i] = expf((vals[i] - max_logit) / temperature);
         sum += probs[i];
     }
-    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
+    if (sum <= 0.0f || !llms_finitef(sum)) return ids[0];
 
     const float min_prob = (probs[0] / sum) * min_p;
     float filtered_sum = 0.0f;
@@ -63184,11 +67653,20 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
            e->mtp_ready;
 }
 
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+static bool llms_dsp_wanted(void);   /* llms DSP41 */
+#endif
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && llms_dsp_wanted()) return true;   /* llms DSP41: drafts are exact-sampled */
+#endif
     return e && e->dspark_exact_sampling;
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend != DS4_BACKEND_CPU && llms_dsp_wanted()) return 2;   /* llms DSP41 */
+#endif
     if (e && ds4_model_is_qwen4()) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend != DS4_BACKEND_CPU ? 2 : 0;
     }
@@ -63417,6 +67895,103 @@ static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
     return n;
 }
 
+/* llms KV_HALF payload (apply_ds4_kv_half.py): the compressed spans are half in the tensor and float in the file */
+static bool llms_span_is_compressed(const ds41_gpu_graph *g, const ds4_gpu_tensor *t) {
+    for (uint32_t k = 0; k < 4; k++) if (t == g->compressed[k]) return true;
+    return false;
+}
+static bool llms_span_is_index(const ds41_gpu_graph *g, const ds4_gpu_tensor *t) {   /* llms IDX_HALF payload */
+    for (uint32_t k = 0; k < 4; k++) if (t == g->index_cache[k]) return true;
+    return false;
+}
+static int llms_payload_write_half_as_float(FILE *fp, const ds4_gpu_tensor *tensor, uint64_t float_bytes, uint8_t *buf, size_t cap, char *err, size_t errlen) {
+    const uint64_t half_bytes = float_bytes / 2u;
+    if (!tensor || half_bytes > ds4_gpu_tensor_bytes(tensor)) { payload_set_err(err, errlen, "session tensor is smaller than the payload"); return 1; }
+    const size_t hcap = cap / 2u; uint16_t *hb = xmalloc(hcap);
+    uint64_t done = 0;
+    while (done < half_bytes) {
+        const size_t n = half_bytes - done > (uint64_t)hcap ? hcap : (size_t)(half_bytes - done);
+        if (ds4_gpu_tensor_read(tensor, done, hb, n) == 0) { free(hb); payload_set_err(err, errlen, "failed to read accelerator session tensor"); return 1; }
+        float *fb = (float *)buf; const _Float16 *hv = (const _Float16 *)hb;
+        for (size_t i = 0; i < n / 2u; i++) fb[i] = (float)hv[i];
+        if (payload_write_bytes(fp, buf, n * 2u, err, errlen) != 0) { free(hb); return 1; }
+        done += n;
+    }
+    free(hb); return 0;
+}
+static int llms_payload_read_float_as_half(FILE *fp, ds4_gpu_tensor *tensor, uint64_t float_bytes, uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen) {
+    const uint64_t half_bytes = float_bytes / 2u;
+    if (!tensor || half_bytes > ds4_gpu_tensor_bytes(tensor)) { payload_set_err(err, errlen, "session tensor is smaller than the payload"); return 1; }
+    const size_t hcap = cap / 2u; uint16_t *hb = xmalloc(hcap);
+    uint64_t done = 0;
+    while (done < half_bytes) {
+        const size_t n = half_bytes - done > (uint64_t)hcap ? hcap : (size_t)(half_bytes - done);
+        if (payload_read_bytes(fp, buf, n * 2u, remaining, err, errlen) != 0) { free(hb); return 1; }
+        const float *fb = (const float *)buf; _Float16 *hv = (_Float16 *)hb;
+        for (size_t i = 0; i < n / 2u; i++) hv[i] = (_Float16)fb[i];   /* round to nearest even, as Metal's (half) cast */
+        if (ds4_gpu_tensor_write(tensor, done, hb, n) == 0) { free(hb); payload_set_err(err, errlen, "failed to restore accelerator session tensor"); return 1; }
+        done += n;
+    }
+    free(hb); return 0;
+}
+static float llms_e4m3_val(int i) { const int e = (i >> 3) & 15, mt = i & 7; return e == 0 ? (float)mt * 0.001953125f : (1.0f + (float)mt * 0.125f) * ldexpf(1.0f, e - 7); }   /* llms KV_FP4 */
+static const float llms_e2m1_val[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+static void llms_fp4_row_decode(const uint8_t *row, float *out) {   /* 288 bytes -> 512 floats */
+    for (int i = 0; i < 512; i++) { const unsigned code = (row[i >> 1] >> ((i & 1) * 4)) & 15u; const float v = llms_e2m1_val[code & 7u] * llms_e4m3_val(row[256 + (i >> 4)]); out[i] = (code & 8u) ? -v : v; }
+}
+static int llms_fp4_row_encode(const float *in, uint8_t *row) {
+
+
+    memset(row, 0, 288);
+    for (int b = 0; b < 32; b++) {
+        const float *v = in + b * 16; float vmax = 0.0f;
+        for (int j = 0; j < 16; j++) if (fabsf(v[j]) > vmax) vmax = fabsf(v[j]);
+        int sidx = 1, ok = vmax == 0.0f;
+        unsigned codes[16] = {0};
+        for (int mi = 7; mi >= 1 && !ok; mi--)
+            for (int i = 0; i < 127 && !ok; i++) {
+                const float sc = llms_e4m3_val(i);
+                if (llms_e2m1_val[mi] * sc != vmax) continue;
+                int all = 1;
+                for (int j = 0; j < 16 && all; j++) {
+                    const float a = fabsf(v[j]); int f = 0;
+                    for (unsigned k = 0; k < 8 && !f; k++) if (llms_e2m1_val[k] * sc == a) { codes[j] = k; f = 1; }
+                    all = f;
+                }
+                if (all) { sidx = i; ok = 1; }
+            }
+        if (!ok) return 0;
+        for (int j = 0; j < 16; j++) {
+            unsigned code = vmax == 0.0f ? 0u : codes[j];
+            if (signbit(v[j])) code |= 8u;
+            row[(b * 16 + j) >> 1] |= (uint8_t)(code << (((b * 16 + j) & 1) * 4));
+        }
+        row[256 + b] = (uint8_t)sidx;
+    }
+    return 1;
+}
+static int llms_payload_write_fp4_as_float(FILE *fp, const ds4_gpu_tensor *tensor, uint64_t float_bytes, char *err, size_t errlen) {
+    const uint64_t rows = float_bytes / (512u * 4u);
+    if (!tensor || rows * 288u > ds4_gpu_tensor_bytes(tensor)) { payload_set_err(err, errlen, "session tensor is smaller than the payload"); return 1; }
+    uint8_t pk[288]; float fl[512];
+    for (uint64_t r = 0; r < rows; r++) {
+        if (ds4_gpu_tensor_read(tensor, r * 288u, pk, 288) == 0) { payload_set_err(err, errlen, "failed to read accelerator session tensor"); return 1; }
+        llms_fp4_row_decode(pk, fl);
+        if (payload_write_bytes(fp, (const uint8_t *)fl, sizeof fl, err, errlen) != 0) return 1;
+    }
+    return 0;
+}
+static int llms_payload_read_float_as_fp4(FILE *fp, ds4_gpu_tensor *tensor, uint64_t float_bytes, uint64_t *remaining, char *err, size_t errlen) {
+    const uint64_t rows = float_bytes / (512u * 4u);
+    if (!tensor || rows * 288u > ds4_gpu_tensor_bytes(tensor)) { payload_set_err(err, errlen, "session tensor is smaller than the payload"); return 1; }
+    uint8_t pk[288]; float fl[512];
+    for (uint64_t r = 0; r < rows; r++) {
+        if (payload_read_bytes(fp, (uint8_t *)fl, sizeof fl, remaining, err, errlen) != 0) return 1;
+        if (!llms_fp4_row_encode(fl, pk)) { payload_set_err(err, errlen, "llms kv fp4: a stored row is not E2M1 x E4M3 per 16 values"); return 1; }
+        if (ds4_gpu_tensor_write(tensor, r * 288u, pk, 288) == 0) { payload_set_err(err, errlen, "failed to restore accelerator session tensor"); return 1; }
+    }
+    return 0;
+}
 static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
     ds41_state_span spans[54];
     const uint32_t n = ds41_state_spans(g, pos, spans);
@@ -63446,7 +68021,10 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     for (uint32_t i = 0; i < n && !rc; i++)
-        rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
+        rc = (llms_kv_fp4() && llms_span_is_compressed(g, spans[i].tensor)) ? llms_payload_write_fp4_as_float(fp, spans[i].tensor, spans[i].bytes, err, errlen) :   /* llms KV_FP4 */
+                 ((llms_kv_half() && llms_span_is_compressed(g, spans[i].tensor)) || (llms_idx_half() && llms_span_is_index(g, spans[i].tensor))) ?   /* llms KV_HALF / IDX_HALF payload */
+             llms_payload_write_half_as_float(fp, spans[i].tensor, spans[i].bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen) :
+             payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                         buf, DS4_SESSION_IO_CHUNK, err, errlen);
     free(buf);
     return rc;
@@ -63488,7 +68066,10 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         const uint32_t n = ds41_state_spans(g, pos, spans);
         uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
         for (uint32_t i = 0; i < n && !rc; i++)
-            rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
+            rc = (llms_kv_fp4() && llms_span_is_compressed(g, spans[i].tensor)) ? llms_payload_read_float_as_fp4(fp, spans[i].tensor, spans[i].bytes, &remaining, err, errlen) :   /* llms KV_FP4 */
+                 ((llms_kv_half() && llms_span_is_compressed(g, spans[i].tensor)) || (llms_idx_half() && llms_span_is_index(g, spans[i].tensor))) ?   /* llms KV_HALF / IDX_HALF payload */
+                 llms_payload_read_float_as_half(fp, spans[i].tensor, spans[i].bytes, buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen) :
+                 payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
         free(buf);
         if (!rc) {
@@ -63502,6 +68083,28 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     }
     ds4_tokens_free(&tokens);
     return rc;
+}
+/* llms CLONE (apply_clone.py): dst takes src's V4.1 state -- GPU copies of every state tensor plus what a payload load sets */
+int ds4_session_llms_clone(ds4_session *dst, ds4_session *src) {
+    if (!dst || !src || dst == src || !ds4_session_is_ds41(dst) || !ds4_session_is_ds41(src) || !dst->ds41_graph_ready || !src->ds41_graph_ready) return 1;
+    ds41_gpu_graph *gd = &dst->ds41_graph, *gs = &src->ds41_graph;
+    if (gd->ctx != gs->ctx || !ds4_gpu_synchronize()) return 1;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t i = 0; ok && i < 40; i++) ok = ds4_gpu_tensor_copy(gd->window[i], 0, gs->window[i], 0, ds4_gpu_tensor_bytes(gs->window[i])) != 0;
+    for (uint32_t i = 0; ok && i < 4; i++)
+        ok = ds4_gpu_tensor_copy(gd->compressed[i], 0, gs->compressed[i], 0, ds4_gpu_tensor_bytes(gs->compressed[i])) != 0 &&
+             ds4_gpu_tensor_copy(gd->index_cache[i], 0, gs->index_cache[i], 0, ds4_gpu_tensor_bytes(gs->index_cache[i])) != 0 &&
+             ds4_gpu_tensor_copy(gd->previous_kv[i], 0, gs->previous_kv[i], 0, ds4_gpu_tensor_bytes(gs->previous_kv[i])) != 0 &&
+             ds4_gpu_tensor_copy(gd->previous_score[i], 0, gs->previous_score[i], 0, ds4_gpu_tensor_bytes(gs->previous_score[i])) != 0;
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) return 1;
+    memcpy(dst->logits, src->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    ds41_graph_reset(gd);
+    gd->history = gs->history; gd->pos = gs->pos; gd->valid = gs->valid;
+    ds4_tokens_copy(&dst->checkpoint, &src->checkpoint);
+    dst->checkpoint_valid = src->checkpoint_valid;
+    return 0;
 }
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
@@ -69515,6 +74118,8 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                     (double)total_cache_bytes / 1073741824.0);
             prefill_headroom_bytes = fitted_headroom;
         }
+        { const char *llms_e = getenv("LLMS_DS4_NO_PREFILL_RESERVE");   /* llms NO_PREFILL_RESERVE (apply_ds4_no_prefill_reserve.py) */
+          if (llms_e && *llms_e && *llms_e != '0' && prefill_headroom_bytes) { fprintf(stderr, "llms: no prefill reserve (%.2f GiB kept as expert cache; decode-only)\n", (double)prefill_headroom_bytes / 1073741824.0); prefill_headroom_bytes = 0; } }
         budget_after_prefill_headroom =
             total_cache_bytes - prefill_headroom_bytes;
     }
@@ -71716,9 +76321,13 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
     return ds4_engine_open_internal(out, opt, gpu_cfg);
 }
 
+int llms_profile_check_assets(void);
+void ds4_gpu_llms_startup_mark(const char *label);   /* llms STARTUP_LOG */
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
+    ds4_gpu_llms_startup_mark("engine open: entry");
+    if (!opt->inspect_only && !llms_profile_check_assets()) { *out = NULL; return 78; }
     ds4_engine *e = xcalloc(1, sizeof(*e));
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     g_glm_rocm_guard_available_baseline = 0;
@@ -71851,6 +76460,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    ds4_gpu_llms_startup_mark("engine open: model opened");   /* llms STARTUP_LOG */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
         opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
         fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
@@ -71904,6 +76514,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         /* The agent may change directory before creating its first session.
          * Engram readers reopen this file and check it against model.fd. */
         e->model_path = realpath(opt->model_path, NULL);
+        { const char *gd = getenv("LLMS_DS4_GUARDS"); if (gd && *gd && *gd != '0' && e->model_path)
+              fprintf(stderr, "ds4: model %s -> %s: %u layers, %u routed experts, %u picks per token, embedding %u\n", opt->model_path, e->model_path, (unsigned)DS4_N_LAYER, (unsigned)DS4_N_EXPERT, (unsigned)DS4_N_EXPERT_USED, (unsigned)DS4_N_EMBD); }
         if (!e->model_path) {
             fprintf(stderr, "ds4: cannot resolve V4.1 model path: %s\n", strerror(errno));
             ds4_engine_close(e);
@@ -72103,7 +76715,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
         const uint32_t sessions = e->placement_session_count_hint > 0 ?
             (uint32_t)e->placement_session_count_hint : 1;
-        if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+        if (!ds41_memory_admit(e, llms_share_ws_on() ? llms_ds41_sessions_bytes(ctx, sessions) : ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -72127,6 +76739,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             if (ds4_backend_uses_graph(e->backend)) {
                 bool ready = ds4_gpu_init() &&
                     ds4_gpu_set_model_map(e->model.map, e->model.size);
+                ds4_gpu_llms_startup_mark("engine open: gpu ready");   /* llms STARTUP_LOG */
                 if (ready && getenv("DS4_QWEN4_GPU")) {
                     /* Use the normal file-backed CUDA cache, not per-tensor
                      * copies from pageable mmap during the first forward. */
@@ -72401,6 +77014,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        ds4_gpu_llms_startup_mark("engine open: mtp opened");   /* llms STARTUP_LOG */
         ds4_dspark_summary dspark = {0};
         e->support_kind =
             support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
@@ -72594,7 +77208,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
             const uint32_t sessions = e->placement_session_count_hint > 0 ?
                 (uint32_t)e->placement_session_count_hint : 1;
-            if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+            if (!ds41_memory_admit(e, llms_share_ws_on() ? llms_ds41_sessions_bytes(ctx, sessions) : ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -72623,7 +77237,27 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        ds4_gpu_llms_startup_mark("engine open: cache budget");   /* llms STARTUP_LOG */
+        (void)ds4_gpu_set_model_fd(e->model.fd);   /* llms SHM KEY (10-21 04:1x): before the cache's first slab, so the shm key carries the model
+                                                    file (the attach printed 'm0.0.0': it ran before the later call below) */
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+        ds4_gpu_llms_startup_mark("engine open: budget set");   /* llms STARTUP_LOG */
+
+
+        {
+            static int se = -1; if (se < 0) { const char *ev = getenv("LLMS_DS4_SEED_EARLY"); se = ev && *ev && *ev != '0';
+                if (se) fprintf(stderr, "llms: seed early (the slab stride and SLAB_BG start before the static weights' block)\n"); }
+            if (se && e->ssd_streaming) {
+                uint64_t sxb = 0;
+                if (ds4_streaming_routed_expert_bytes(&e->weights, &sxb)) {
+                    ds4_gpu_set_streaming_expert_cache_expert_bytes(sxb);
+                    for (uint32_t il_ = 0; il_ < DS4_N_LAYER; il_++) {
+                        const ds4_layer_weights *l_ = &e->weights.layer[il_]; uint64_t g_ = 0, d_ = 0, b_ = 0;
+                        if (l_->ffn_gate_exps && l_->ffn_up_exps && l_->ffn_down_exps && streaming_layer_routed_expert_bytes(l_, &b_) && b_ == sxb &&
+                            streaming_layer_gate_down_expert_bytes(l_, &g_, &d_)) { ds4_gpu_llms_slot_seed(g_, d_); ds4_gpu_llms_startup_mark("engine open: slot seeded EARLY"); break; } }
+                }
+            }
+        }
 #if defined(__APPLE__)
         /* Keep the weights used by every token from competing with streamed
          * experts in the file cache. These bytes are already in the model
@@ -72645,10 +77279,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 fprintf(stderr, "ds4: Metal SSD static weights remain pageable"
                         " to preserve runtime headroom\n");
             } else if (weights_model_map_decode_static_spans(
-                        &e->weights, true, true, &spans)) {
+                        &e->weights, !llms_embd_cpu(), true, &spans)) {   /* llms EMBD_CPU: token_embd not locked */
                 uint64_t locked = 0, failed = 0;
                 bool can_lock = true;
                 const size_t page = (size_t)getpagesize();
+                uint64_t llms_xlo[2 + 3 * DS4_N_LAYER + 1024], llms_xhi[2 + 3 * DS4_N_LAYER + 1024], llms_xbytes = 0; uint32_t llms_xn = 0, llms_xane = 0;   /* llms ANE_UNLOCK; + Q4L_UNLOCK */
+                llms_xane = llms_xn;
+                ds4_gpu_llms_startup_mark("static block: spans ready");   /* llms STARTUP_LOG */
+                { extern uint32_t llms_q4u_pages(uint64_t, uint64_t *, uint64_t *, uint32_t);   /* llms Q4L_UNLOCK (ds4_metal.m) */
+                  llms_xn += llms_q4u_pages((uint64_t)page, llms_xlo + llms_xn, llms_xhi + llms_xn, 1024u); }
+                ds4_gpu_llms_startup_mark("static block: q4u pages done");   /* llms STARTUP_LOG */
                 for (uint32_t i = 0; i < spans.len; i++) {
                     const uint64_t lo = spans.v[i].off / page * page;
                     const uint64_t hi = spans.v[i].end;
@@ -72658,6 +77298,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         uint64_t len = hi - off;
                         if (len > 256ull * 1024 * 1024)
                             len = 256ull * 1024 * 1024;
+                        bool llms_skip = false;   /* llms ANE_UNLOCK: jump over an ANE-held range; end a chunk where the next one starts */
+                        for (uint32_t xi = 0; xi < llms_xn && !llms_skip; xi++) {
+                            if (off >= llms_xlo[xi] && off < llms_xhi[xi]) { const uint64_t to = llms_xhi[xi] < hi ? llms_xhi[xi] : hi; llms_xbytes += to - off; off = to; llms_skip = true; }
+                            else if (llms_xlo[xi] > off && llms_xlo[xi] < off + len) len = llms_xlo[xi] - off;
+                        }
+                        if (llms_skip) continue;
                         if (can_lock &&
                             mlock(e->model.map + off, (size_t)len) == 0) {
                             locked += len;
@@ -72668,13 +77314,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         off += len;
                     }
                 }
+                ds4_gpu_llms_startup_mark("static block: mlock done");   /* llms STARTUP_LOG */
                 fprintf(stderr, "ds4: Metal SSD static weights locked %.2f GiB"
                         "; pageable %.2f GiB\n", locked / 1073741824.0,
                         failed / 1073741824.0);
+                if (llms_xn) fprintf(stderr, "llms: ANE_UNLOCK / Q4L_UNLOCK -- %.2f GiB left unlocked (%u ANE ranges, %u Q4L ranges)\n", llms_xbytes / 1073741824.0, llms_xane, llms_xn - llms_xane);   /* llms ANE_UNLOCK */
                 free(spans.v);
             }
         }
 #endif
+        ds4_gpu_llms_startup_mark("engine open: static block done");   /* llms STARTUP_LOG */
         if (e->ssd_streaming) {
             /*
              * Pin the expert cache's slab size class to the model's uniform
@@ -72685,6 +77334,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             uint64_t slab_expert_bytes = 0;
             if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
                 ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+                for (uint32_t il_ = 0; il_ < DS4_N_LAYER; il_++) {
+                    const ds4_layer_weights *l_ = &e->weights.layer[il_]; uint64_t g_ = 0, d_ = 0, b_ = 0;
+                    if (l_->ffn_gate_exps && l_->ffn_up_exps && l_->ffn_down_exps && streaming_layer_routed_expert_bytes(l_, &b_) && b_ == slab_expert_bytes &&
+                        streaming_layer_gate_down_expert_bytes(l_, &g_, &d_)) { ds4_gpu_llms_slot_seed(g_, d_); ds4_gpu_llms_startup_mark("engine open: slot seeded"); break; } }
                 uint32_t routed = 0, boosted = 0;
                 for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                     const ds4_layer_weights *l = &e->weights.layer[il];
@@ -74270,7 +78923,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         if (ctx_size > 1048576 ||
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
-                ds41_graph_bytes((uint32_t)ctx_size)), false) ||
+                ds41_graph_bytes((uint32_t)ctx_size) - (g_llms_ws_owner ? llms_ds41_shared_bytes((uint32_t)ctx_size) : 0)), false) ||
             !ds41_graph_alloc(&s->ds41_graph, &e->model, &e->weights,
                               e->model_path, (uint32_t)ctx_size, e->ssd_streaming)) {
             free(s);
@@ -76532,8 +81185,12 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    { static int llms_r0s; if (!llms_r0s) { llms_r0s = 1; extern void ds4_gpu_llms_r0_record(int); ds4_gpu_llms_r0_record(1); } }   /* llms R0PF: round 0 starts */
+    if (s && ds4_session_is_ds41(s) && !s->distributed && llms_dsp_wanted()) (void)llms_dsp_init();   /* llms DSP41_ADAPT: before the prefill, not in the first token */
+#endif
 #ifndef DS4_NO_GPU
-    if (s) s->dspark_rewind_end = 0;
+    if (s) s->dspark_rewind_end = 0;   /* upstream fc80bd6 */
 #endif
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
@@ -76698,7 +81355,12 @@ int ds4_session_sync_multimodal(
     return rc;
 }
 
+
+static FILE *g_llms_pl_f = (FILE *)1; static double g_llms_pl_sp, g_llms_pl_st, g_llms_pl_hd; static uint32_t g_llms_pl_spn, g_llms_pl_stn;
+static FILE *llms_pl_file(void) { if (g_llms_pl_f == (FILE *)1) { const char *p = getenv("LLMS_DS4_PHASE_LOG"); g_llms_pl_f = p && *p ? fopen(p, "w") : NULL; } return g_llms_pl_f; }
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    const double llms_pl_t0 = llms_pl_file() ? now_sec() : 0.0;   /* llms PHASE_LOG */
+    g_llms_pl_sp = g_llms_pl_st = g_llms_pl_hd = 0.0; g_llms_pl_spn = g_llms_pl_stn = 0;
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return 1;
@@ -76866,6 +81528,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = false;
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
+        const int llms_pl_r0 = s->checkpoint.len;   /* llms PHASE_LOG: the rows this sync computes */
         ds41_encoder_residency encoder = {0};
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
@@ -76877,6 +81540,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const uint32_t remaining = (uint32_t)(prompt->len - i);
             if (g->encoder_resident && remaining < 768u)
                 ds41_encoder_release(g, &e->model, &encoder);
+            g_llms_ced_end = (uint32_t)prompt->len;   /* llms CED_SP */
             const uint32_t short_count = decoder_pending ? 0u :
                 ds41_short_prefill_count(g, &e->weights, remaining);
             const uint32_t count = short_count ? short_count : g->encoder_resident ?
@@ -76889,6 +81553,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* Never add an encoder sweep just to defer the decoder. A short
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
+            const double llms_pt0 = g_llms_pl_f ? now_sec() : 0.0;   /* llms PHASE_LOG */
             const bool ok = short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
                 layer_major ?
@@ -76899,6 +81564,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  ds41_graph_prefill(g, &e->model, &e->weights, prompt->v + i, count,
                     s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
                 ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
+            if (g_llms_pl_f) { const double dt = (now_sec() - llms_pt0) * 1e3; if (!short_count && !layer_major) { g_llms_pl_st += dt; g_llms_pl_stn++; } else { g_llms_pl_sp += dt; g_llms_pl_spn++; } }   /* llms PHASE_LOG */
             if (!ok) {
                 ds41_encoder_release(g, &e->model, &encoder);
                 s->checkpoint_valid = false;
@@ -76928,7 +81594,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         /* Prefill needs only its final output head. An interrupted prefix must
          * still have matching logits before it can be saved or continued. */
         if (pending_logits) {
-            if (!ds41_graph_logits(g, &e->model, &e->weights, s->logits)) {
+            const double llms_ph0 = g_llms_pl_f ? now_sec() : 0.0;   /* llms PHASE_LOG */
+            const bool llms_phok = ds41_graph_logits(g, &e->model, &e->weights, s->logits);
+            if (g_llms_pl_f) { const double t1 = now_sec(); g_llms_pl_hd = (t1 - llms_ph0) * 1e3;
+                               fprintf(g_llms_pl_f, "S %.6f %.6f %d %.3f %u %.3f %u %.3f\n", llms_pl_t0, t1, prompt->len - llms_pl_r0, g_llms_pl_sp, g_llms_pl_spn, g_llms_pl_st, g_llms_pl_stn, g_llms_pl_hd); fflush(g_llms_pl_f); }
+            if (!llms_phok) {
                 g->valid = false;
                 snprintf(err, errlen, "V4.1 prefill output head failed");
                 return 1;
@@ -78021,6 +82691,33 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
+}
+
+
+
+
+void ds4_llms_tail_publish(int on) { g_llms_tail_publish = on; }
+int ds4_session_copy_tail_l39(int row, float *out) {   /* llms TAILFULL (apply_tailfull5.py): the last layer's inputs of batch row `row`; returns DS4_N_EMBD or 0 */
+    if (row < 0 || (uint32_t)row >= g_llms_tail_cap_rows || !g_llms_tail_cap[row] || !out) return 0;
+    const uint64_t D = DS4_N_EMBD, K = DS4_N_EXPERT_USED;
+    if (!ds4_gpu_tensor_read(g_llms_tail_cap[row], 0, out, (2u * D + 2u * K) * sizeof(float))) return 0;
+    return (int)D;
+}
+int ds4_session_copy_tail(ds4_session *s, int row, float *x, float *pre, float *split, float *f) {
+    (void)row;   /* apply_tailfull3.py: no row index -- the split is read from the session's own scratch, published by the producing step */
+    if (!s || !x || !pre || !ds4_session_is_ds41(s) || !s->ds41_graph_ready) return 0;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    if (!g->x || !g->pre) return 0;
+    if (!ds4_gpu_tensor_read(g->x, 0, x, (uint64_t)DS4_N_EMBD * sizeof(float)) || !ds4_gpu_tensor_read(g->pre, 0, pre, (uint64_t)DS4_N_HC * sizeof(float))) return 0;
+    if (split) {
+        if (!g_llms_tail_publish || !g->ffn_split) return 0;
+        if (!ds4_gpu_tensor_read(g->ffn_split, 0, split, 24u * sizeof(float))) return 0;
+    }
+    if (f) {
+        if (!g_llms_tail_publish || !g->block) return 0;
+        if (!ds4_gpu_tensor_read(g->block, 0, f, (uint64_t)DS4_N_EMBD * sizeof(float))) return 0;
+    }
+    return (int)DS4_N_EMBD;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
@@ -79145,7 +83842,74 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
-int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+/* llms VERIFY_ROWS: k causal rows of a V4.1 session with every row's logits (row_logits: k x vocab); the last row's into s->logits */
+/* llms SPEC_COPY: keep only the first `keep` rows of the last k-row verify step (k rows were pushed); the caller sets the logits */
+int ds4_session_rollback_rows(ds4_session *s, int keep, int k) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (!s || !ds4_session_is_ds41(s) || keep < 1 || keep > k || s->checkpoint.len < k) return 1;
+    if (keep == k) return 0;
+    if (!ds41_graph_verify_rollback(&s->ds41_graph, (uint32_t)keep)) { s->checkpoint_valid = false; return 1; }
+    s->checkpoint.len -= (k - keep);
+    return 0;
+#else
+    (void)s; (void)keep; (void)k; return 1;
+#endif
+}
+
+
+int ds4_session_llms_rerun_rows(ds4_session *s, const int *tokens, int k, float *row_logits) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (!s || !ds4_session_is_ds41(s) || !s->checkpoint_valid || !s->ds41_graph_ready || k < 2 || s->checkpoint.len < k) return 1;
+    ds4_engine *e = s->engine; ds41_gpu_graph *g = &s->ds41_graph;
+    if (!ds41_graph_verify_rollback_deep(g, 0u, 1)) { s->checkpoint_valid = false; return 2; }
+    s->checkpoint.len -= k;
+    if (g->pos != (uint32_t)s->checkpoint.len) { s->checkpoint_valid = false; return 3; }
+    if (!ds41_graph_verify_rows(g, &e->model, &e->weights, tokens, (uint32_t)k, row_logits)) { s->checkpoint_valid = false; return 4; }
+    for (int i = 0; i < k; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    memcpy(s->logits, row_logits + (size_t)(k - 1) * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+    return 0;
+#else
+    (void)s; (void)tokens; (void)k; (void)row_logits; return 1;
+#endif
+}
+int ds4_session_eval_rows(ds4_session *s, const int *tokens, int k, float *row_logits, char *err, size_t errlen) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (!s || !s->checkpoint_valid || !ds4_session_is_ds41(s) || !s->ds41_graph_ready || k < (llms_verify_one() ? 1 : 2) ||   /* llms VERIFY_ONE */
+        s->ds41_graph.pos != (uint32_t)s->checkpoint.len) { if (errlen) snprintf(err, errlen, "eval_rows: not a ready V4.1 session"); return 1; }
+    ds4_engine *e = s->engine;
+    if (!ds41_graph_verify_rows(&s->ds41_graph, &e->model, &e->weights, tokens, (uint32_t)k, row_logits)) {
+        s->checkpoint_valid = false; if (errlen) snprintf(err, errlen, "V4.1 verify rows failed at position %d", s->checkpoint.len); return 1;
+    }
+    for (int i = 0; i < k; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    memcpy(s->logits, row_logits + (size_t)(k - 1) * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+    s->checkpoint_valid = true;
+    return 0;
+#else
+    (void)s; (void)tokens; (void)k; (void)row_logits; if (errlen) snprintf(err, errlen, "eval_rows: no V4.1 GPU");
+    return 1;
+#endif
+}
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+static int llms_dsp41_plain(ds4_session *s, int token, char *err, size_t errlen);   /* llms DSP41 */
+static bool llms_dsp41_lazy_take(ds4_session *s, int token);
+static int g_dsp_raw;   /* llms DSP41_ADAPT */
+#endif
+int ds4_session_eval_tlimpl(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {   /* llms TL_PHASE wrapper: phase 4 */
+    uint32_t tl_pos, tl_rows; const uint32_t tl_ph = ds4_gpu_llms_tl_phase_get(&tl_pos, &tl_rows); ds4_gpu_llms_tl_phase(4u, (uint32_t)(0u), (uint32_t)(1u));
+    const int tl_ok = ds4_session_eval_tlimpl(s, token, err, errlen); ds4_gpu_llms_tl_phase(tl_ph, tl_pos, tl_rows); return tl_ok;
+}
+int ds4_session_eval_tlimpl(ds4_session *s, int token, char *err, size_t errlen) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (g_dsp_lazy_tok >= 0 && s && ds4_session_is_ds41(s)) {   /* llms DSP41_LAZY0 */
+        g_dsp_res_pend = 0;   /* llms DSP41_RESRAW */
+        if (llms_dsp41_lazy_take(s, token)) return 0;
+        snprintf(err, errlen, "dsp41: a pending keep-0 rewind met a different evaluation"); return 1;
+    }
+    if (!g_dsp_raw && s && ds4_session_is_ds41(s) && s->checkpoint_valid && s->ds41_graph_ready && !s->distributed && llms_dsp_wanted() && llms_dsp_init() &&   /* llms DSP41_ADAPT: g_dsp_raw */
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len)   /* llms DSP41 */
+        return llms_dsp41_plain(s, token, err, errlen);
+#endif
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -79800,7 +84564,8 @@ static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
         if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid || s->distributed ||
-            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) : s->ds41_graph.streaming) ||
+            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) :
+             (s->ds41_graph.streaming && !getenv("LLMS_DS4_STREAM_ROW_BATCH"))) ||   /* llms STREAM_ROW_BATCH */
             s->ds41_graph.imatrix || s->ds41_graph.quality ||
             !s->ds41_graph.valid || s->ds41_graph.image_count ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return false;
@@ -87067,12 +91832,842 @@ int ds4_session_eval_speculative_argmax_ignoring_eos(
         accepted, accepted_cap, err, errlen);
 }
 
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+/* llms DSP41 (apply_dsp41.py): one speculative cycle. t is the pending token (sampled, not yet evaluated) at position P. The ring must hold
+   the positions up to P - 1: the previous cycle's verified rows enter it first (from the capture). Draft d after [t] (EOS excluded), verify
+   [t, d] as one 2-row step with the capture on, accept d with probability min(1, p(d) / q(d)). On a rejection the state keeps row 0 and
+   s->logits becomes one-hot on a draw from max(0, p - q): the caller's next sample is that draw and the next cycle starts from it. No draft
+   (an empty ring, no room): a 1-row captured step. Returns the tokens committed. */
+/* llms DSP41_FASTQ (apply_dsp41_fastq.py): q from the entries within 16 x temp of the max logit; qp dense, zero elsewhere (the previous
+   cycle's entries cleared through the kept list); returns the draw (or -1) */
+static uint32_t g_dsp_fq_idx[4096], g_dsp_fq_n;
+static int llms_dsp_fq_cmp(const void *a, const void *b) {
+    const float x = g_dsp.ql[*(const uint32_t *)a], y = g_dsp.ql[*(const uint32_t *)b];
+    return x > y ? -1 : x < y ? 1 : (*(const uint32_t *)a < *(const uint32_t *)b ? -1 : 1);
+}
+static int llms_dsp_fast_q(const float *ql, float temp, int top_k, float top_p, float min_p, uint64_t *rng) {
+    static int zeroed; if (!zeroed) { memset(g_dsp.qp, 0, (size_t)DS4_N_VOCAB * sizeof(float)); zeroed = 1; }   /* qp came from malloc */
+    for (uint32_t k = 0; k < g_dsp_fq_n; k++) g_dsp.qp[g_dsp_fq_idx[k]] = 0.0f;
+    g_dsp_fq_n = 0;
+    float mx = -INFINITY;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) if (ql[i] > mx) mx = ql[i];
+    if (!isfinite(mx) || !(temp > 0.0f)) return -1;
+    const float lo = mx - 16.0f * temp;
+    for (uint32_t i = 0; i < DS4_N_VOCAB && g_dsp_fq_n < 4096u; i++) if (ql[i] >= lo) g_dsp_fq_idx[g_dsp_fq_n++] = i;
+    qsort(g_dsp_fq_idx, g_dsp_fq_n, sizeof(uint32_t), llms_dsp_fq_cmp);
+    uint32_t n = g_dsp_fq_n;
+    if (top_k > 0 && (uint32_t)top_k < n) n = (uint32_t)top_k;
+    double tot = 0.0; static double w[4096];
+    for (uint32_t k = 0; k < n; k++) { w[k] = exp((double)(ql[g_dsp_fq_idx[k]] - mx) / temp); tot += w[k]; }
+    uint32_t keep = 0; double cum = 0.0;
+    for (uint32_t k = 0; k < n; k++) {
+        if (k > 0 && min_p > 0.0f && w[k] < w[0] * min_p) break;
+        cum += w[k]; keep = k + 1;
+        if (top_p > 0.0f && top_p < 1.0f && cum / tot >= top_p) break;
+    }
+    if (keep == 0) return -1;
+    for (uint32_t k = 0; k < keep; k++) g_dsp.qp[g_dsp_fq_idx[k]] = (float)(w[k] / cum);
+    double r = (double)sample_rng_f32(rng) * cum;
+    for (uint32_t k = 0; k < keep; k++) { r -= w[k]; if (r <= 0.0) return (int)g_dsp_fq_idx[k]; }
+    return (int)g_dsp_fq_idx[keep - 1];
+}
+static bool llms_dsp41_rewind(ds4_session *s, int pos);   /* llms DSP41_TEST0: used before its definition */
+static double g_dsp_split_t3;   /* llms DSP41_SPLIT */
+static double g_dsp_ema = 1.0; static uint32_t g_dsp_plain_k; static uint64_t g_dsp_n_plain, g_dsp_n_probe, g_dsp_n_switch;   /* llms DSP41_ADAPT */
+static double g_dsp_rms, g_dsp_rtok, g_dsp_rplain; static uint64_t g_dsp_rtokn;   /* llms DSP41_RATE: EMAs -- drafted cycle ms, tokens; plain ms */
+static int llms_dsp_rate(void) {
+    static int r = -1;
+    if (r < 0) { const char *e = getenv("LLMS_DS4_DSP41_ADAPT"); r = e && !strcmp(e, "rate");
+                 if (r) { fprintf(stderr, "llms dsp41: adaptive by measured rate (each token to the cheaper mode, every 16th to the other)\n");
+                          atexit_b(^{ fprintf(stderr, "llms dsp41 rate: drafted %.2f ms per token (%.1f ms / %.3f tokens), plain %.2f ms; %llu plain steps\n",
+                              g_dsp_rtok > 0 ? g_dsp_rms / g_dsp_rtok : 0.0, g_dsp_rms, g_dsp_rtok, g_dsp_rplain, (unsigned long long)g_dsp_n_plain); }); } }
+    return r;
+}
+
+
+static float llms_dsp_adapt(void) {
+    static float th = -2.0f;
+    if (th < -1.0f) { const char *e = getenv("LLMS_DS4_DSP41_ADAPT"); th = e && *e && strcmp(e, "rate") ? strtof(e, NULL) : -1.0f;   /* llms DSP41_RATE: 'rate' is not a threshold */
+                      if (th > 0.0f) { fprintf(stderr, "llms dsp41: adaptive (plain one-token steps while the acceptance EMA < %.2f; a probe every 8th)\n", th);
+                                       atexit_b(^{ fprintf(stderr, "llms dsp41 adapt: %llu plain steps, %llu probes, %llu mode switches, final EMA %.3f\n",
+                                           (unsigned long long)g_dsp_n_plain, (unsigned long long)g_dsp_n_probe, (unsigned long long)g_dsp_n_switch, g_dsp_ema); }); } }
+    return th;
+}
+static double g_ad2_cyc, g_ad2_pl; static uint32_t g_ad2_gap = 8u; static int g_ad2_prev_plain, g_ad2_probe; static uint64_t g_ad2_nc, g_ad2_np, g_ad2_backoff;   /* llms DSP41_ADAPT2 */
+static uint32_t g_ad2_next = 0xFFFFFFFFu, g_ad2_warm_end; static uint64_t g_ad2_nwarm;   /* llms DSP41_WARM */
+static uint32_t llms_dsp_warm(void) { static int w = -1; if (w < 0) { const char *e = getenv("LLMS_DS4_DSP41_WARM"); w = e && *e ? atoi(e) : 32; if (w < 0) w = 0; } return (uint32_t)w; }
+
+
+
+static int llms_dsp_adapt2(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LLMS_DS4_DSP41_ADAPT2"); v = e && *e && *e != '0';
+                 if (v) { fprintf(stderr, "llms dsp41: adapt2 (threshold = measured drafted-cycle ms / plain-step ms - 1; probes back off to every 64th)\n");
+                          atexit_b(^{ fprintf(stderr, "llms dsp41 adapt2: steady cycle %.2f ms (%llu), plain step %.2f ms (%llu), threshold %.3f, probe gap %u, %llu back-offs, %llu warm-up steps\n",
+                              g_ad2_cyc, (unsigned long long)g_ad2_nc, g_ad2_pl, (unsigned long long)g_ad2_np,
+                              (g_ad2_cyc > 0.0 && g_ad2_pl > 0.0) ? g_ad2_cyc / g_ad2_pl - 1.0 : -1.0, g_ad2_gap, (unsigned long long)g_ad2_backoff, (unsigned long long)g_ad2_nwarm); }); } }
+    return v;
+}
+static float llms_dsp_th(void) {   /* llms DSP41_ADAPT2: the threshold in force */
+    const float th = llms_dsp_adapt();
+    if (th <= 0.0f || !llms_dsp_adapt2() || !(g_ad2_cyc > 0.0) || !(g_ad2_pl > 0.0)) return th;
+    float d = (float)(g_ad2_cyc / g_ad2_pl - 1.0);
+    return d < 0.5f ? 0.5f : d > 0.97f ? 0.97f : d;
+}
+static int g_llms_sched_on; static float *g_llms_sched_vcost;   /* llms DSP41_SCHED */
+static int llms_dsp_block(void) {   /* llms DSP41_BLOCK */
+    static int b = -1;
+    if (b < 0) { const char *e = getenv("LLMS_DS4_DSP41_BLOCK"); b = e && *e ? atoi(e) : 1; if (b < 1) b = 1; if (b > LLMS_DSP_BMAX) b = LLMS_DSP_BMAX;
+                 if (b >= 2) fprintf(stderr, "llms dsp41: block %d (%d drafts per cycle, one %d-row verify, exact chain acceptance; needs LLMS_DS4_DEEPRB=1)\n", b, b, b + 1); }
+    return b;
+}
+static float *g_dspb_hl;   /* host copy of the block's logits */
+static uint32_t g_dspb_ci[LLMS_DSP_BMAX][64]; static float g_dspb_cq[LLMS_DSP_BMAX][64]; static uint32_t g_dspb_cn[LLMS_DSP_BMAX];
+static uint64_t g_dspb_hist[LLMS_DSP_BMAX + 2];   /* accepted drafts per cycle */
+/* q_k over row k's 64 highest raw logits plus the Markov bias of prev (host: w1[prev] . w2[c]); returns the draw (or argmax when greedy) */
+static int llms_dspb_q(uint32_t k, const float *raw, int prev, float temp, int top_k, float top_p, float min_p, uint64_t *rng) {
+    uint32_t ci[64]; float cv[64]; uint32_t n = 0;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        const float v = raw[i];
+        if (n < 64u) { uint32_t j = n++; while (j > 0 && cv[j - 1] < v) { cv[j] = cv[j - 1]; ci[j] = ci[j - 1]; j--; } cv[j] = v; ci[j] = i; }
+        else if (v > cv[63]) { uint32_t j = 63; while (j > 0 && cv[j - 1] < v) { cv[j] = cv[j - 1]; ci[j] = ci[j - 1]; j--; } cv[j] = v; ci[j] = i; }
+    }
+    const uint8_t *base = g_llms_dsp_host ? (const uint8_t *)g_llms_dsp_host - g_dsp.m.tensor_data_pos : g_dsp.m.map;
+    const uint8_t *w1 = base + g_dsp.mk_w1->abs_offset + (uint64_t)prev * (LLMS_DSP_RANK / 32u) * 34u;
+    float e[LLMS_DSP_RANK];
+    for (uint32_t b = 0; b < LLMS_DSP_RANK / 32u; b++) { uint16_t hb; memcpy(&hb, w1 + b * 34u, 2); const float d = f16_to_f32(hb); const int8_t *qs = (const int8_t *)(w1 + b * 34u + 2u);
+                                                          for (uint32_t i = 0; i < 32u; i++) e[b * 32u + i] = d * (float)qs[i]; }
+    for (uint32_t j = 0; j < n; j++) {
+        const uint8_t *w2 = base + g_dsp.mk_w2->abs_offset + (uint64_t)ci[j] * (LLMS_DSP_RANK / 32u) * 34u; float acc = 0.0f;
+        for (uint32_t b = 0; b < LLMS_DSP_RANK / 32u; b++) { uint16_t hb; memcpy(&hb, w2 + b * 34u, 2); const float d = f16_to_f32(hb); const int8_t *qs = (const int8_t *)(w2 + b * 34u + 2u);
+                                                              float sb = 0.0f; for (uint32_t i = 0; i < 32u; i++) sb += e[b * 32u + i] * (float)qs[i]; acc += d * sb; }
+        cv[j] += acc;
+    }
+    for (uint32_t a = 1; a < n; a++) { const float v = cv[a]; const uint32_t ix = ci[a]; uint32_t j = a; while (j > 0 && cv[j - 1] < v) { cv[j] = cv[j - 1]; ci[j] = ci[j - 1]; j--; } cv[j] = v; ci[j] = ix; }
+    g_dspb_cn[k] = 0;
+    if (!(temp > 0.0f)) { g_dspb_ci[k][0] = ci[0]; g_dspb_cq[k][0] = 1.0f; g_dspb_cn[k] = 1; return (int)ci[0]; }
+    uint32_t m = n; if (top_k > 0 && (uint32_t)top_k < m) m = (uint32_t)top_k;
+    double w[64], tot = 0.0; for (uint32_t j = 0; j < m; j++) { w[j] = exp((double)(cv[j] - cv[0]) / temp); tot += w[j]; }
+    uint32_t keep = 0; double cum = 0.0;
+    for (uint32_t j = 0; j < m; j++) { if (j > 0 && min_p > 0.0f && w[j] < w[0] * min_p) break; cum += w[j]; keep = j + 1; if (top_p > 0.0f && top_p < 1.0f && cum / tot >= top_p) break; }
+    double r = (double)sample_rng_f32(rng) * cum; int pick = (int)ci[keep - 1];
+    for (uint32_t j = 0; j < keep; j++) { g_dspb_ci[k][j] = ci[j]; g_dspb_cq[k][j] = (float)(w[j] / cum); }
+    g_dspb_cn[k] = keep;
+    for (uint32_t j = 0; j < keep; j++) { r -= w[j]; if (r <= 0.0) { pick = (int)ci[j]; break; } }
+    return pick;
+}
+static float llms_dspb_qof(uint32_t k, int tok) { for (uint32_t j = 0; j < g_dspb_cn[k]; j++) if ((int)g_dspb_ci[k][j] == tok) return g_dspb_cq[k][j]; return 0.0f; }
+static int llms_dsp41_cycle_body(ds4_session *s, int t, int max_tokens, int eos, float temp, int top_k, float top_p, float min_p,
+                                 uint64_t *rng, int *acc, int acc_cap, char *err, size_t errlen);
+static int g_dsp_cycle_drafted;   /* llms DSP41_RATE: the body set it when this call was a drafted cycle (not a plain step) */
+static int g_dsp_lk_last; static float *g_dsp_lk_rows;   /* llms LOOKUP rewind: the last step was a lookup step; its row logits */
+static int g_llms_lk = -1, g_llms_lkmin = 4;   /* llms LOOKUP v2 (apply_lookup_gate.py) */
+static uint32_t llms_lookup_propose(const ds4_session *s, int t, uint32_t P, uint32_t K, int *dr) {   /* the most recent earlier (prev, t) with agreement >= MIN */
+    if (g_llms_lk < 0) { const char *e = getenv("LLMS_DS4_LOOKUP"); g_llms_lk = e && *e ? atoi(e) : 0; if (g_llms_lk < 0) g_llms_lk = 0; if (g_llms_lk > 8) g_llms_lk = 8;
+                         const char *mn = getenv("LLMS_DS4_LOOKUP_MIN"); if (mn && *mn) g_llms_lkmin = atoi(mn) < 2 ? 2 : atoi(mn); }
+    if (!g_llms_lk || K == 0 || P < 2u) return 0;
+    const int *cv = s->checkpoint.v; const int prev = cv[P - 1u]; uint32_t nd = 0;
+    for (uint32_t m = P - 1u; m >= 1u && nd == 0; m--) {
+        if (cv[m] != t || cv[m - 1u] != prev || m + 1u >= P) continue;
+        uint32_t agree = 2;
+        while (agree < 64u && m >= agree && P - 1u >= agree && cv[m - agree] == cv[P - agree]) agree++;
+        if ((int)agree < g_llms_lkmin) continue;
+        for (uint32_t k = 0; k < K && m + 1u + k < P; k++) dr[nd++] = cv[m + 1u + k];
+    }
+    return nd;
+}
+
+
+static int g_llms_hint_tok = -1, g_llms_hint_cyc; static int64_t g_llms_hint_pos = -1;   /* 12:5x: the hint is for ONE position (the lookup / plain paths skip the block-1 cycle; an untagged hint leaked into a later cycle) */
+static uint64_t g_llms_hint_set, g_llms_hint_used, g_llms_hint_changed, g_llms_hint_dropped, g_llms_hint_stale, g_llms_hint_acc, g_llms_hint_chg_acc;
+void ds4_session_set_draft_hint(ds4_session *s, int token) {
+    static int once;
+    if (!once++) atexit_b(^{ fprintf(stderr, "llms dsml hint (engine): %llu hints received, %llu used as the draft (%llu changed the drafter's token), %llu dropped (no greedy drafting cycle), %llu stale (the call took another path); "
+                                             "accepted: %llu of the hinted drafts, %llu of the changed ones (each changed+accepted draft = one cycle saved)\n",
+                                     (unsigned long long)g_llms_hint_set, (unsigned long long)g_llms_hint_used, (unsigned long long)g_llms_hint_changed, (unsigned long long)g_llms_hint_dropped, (unsigned long long)g_llms_hint_stale,
+                                     (unsigned long long)g_llms_hint_acc, (unsigned long long)g_llms_hint_chg_acc); });
+    g_llms_hint_tok = token; g_llms_hint_pos = (int64_t)s->checkpoint.len; g_llms_hint_set++;
+}
+
+
+
+static int g_llms_ghint[3], g_llms_ghint_n; static int64_t g_llms_ghint_pos = -1;
+static uint64_t g_llms_gd_set, g_llms_gd_cyc, g_llms_gd_prop, g_llms_gd_acc, g_llms_gd_stale;
+static uint64_t g_llms_gd_g_elig, g_llms_gd_g_pre, g_llms_gd_g_byp, g_llms_gd_overw;   /* llms GDPRE (apply_gdpre.py): the ADAPT gate's view */
+
+
+static int llms_gdepth(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_GRAMMAR_DEPTH"); on = !e || !*e || *e == '0' ? 0 : (*e == '2' ? 2 : 1);
+                  if (on) { fprintf(stderr, on == 2 ? "llms: grammar depth -- CANARY: the second hinted token replaced by 13\n"
+                                                    : "llms: grammar depth (the DSML grammar's fixed tokens as the drafts of one k-row verify)\n");
+                            atexit_b(^{ fprintf(stderr, "llms grammar depth: %llu sequence hints, %llu cycles, %llu tokens proposed, %llu accepted, %llu stale; "
+                                "at the ADAPT gate %llu eligible, %llu pre-empted, %llu bypassed; %llu overwritten unconsumed\n",
+                                (unsigned long long)g_llms_gd_set, (unsigned long long)g_llms_gd_cyc, (unsigned long long)g_llms_gd_prop,
+                                (unsigned long long)g_llms_gd_acc, (unsigned long long)g_llms_gd_stale, (unsigned long long)g_llms_gd_g_elig,
+                                (unsigned long long)g_llms_gd_g_pre, (unsigned long long)g_llms_gd_g_byp, (unsigned long long)g_llms_gd_overw); }); } }
+    return on;
+}
+void ds4_session_set_draft_hint_seq(ds4_session *s, const int *tokens, int n) {
+    if (!llms_gdepth() || !tokens || n < 2) return;
+    if (g_llms_ghint_n >= 2) g_llms_gd_overw++;   /* llms GDPRE: the previous hint was never consumed nor found stale */
+    if (n > 3) n = 3;
+    for (int i = 0; i < n; i++) g_llms_ghint[i] = tokens[i];
+    if (llms_gdepth() == 2) g_llms_ghint[1] = 13;
+    g_llms_ghint_n = n; g_llms_ghint_pos = (int64_t)s->checkpoint.len; g_llms_gd_set++;
+}
+static uint32_t llms_gd_kg(const ds4_session *s, uint32_t P, int t, int max_tokens, int acc_cap, int eos, float temp) {
+    /* llms GDPRE: the ONE eligibility predicate of a grammar-depth proposal at position P -- tag, greedy, EOS, DSP41_FORCE, capacity,
+       context, vocabulary; returns the proposal length (>= 2) or 0. Used by the ADAPT gate and by the LOOKUP block that consumes it. */
+    static int frc = -1; if (frc < 0) { const char *f = getenv("LLMS_DS4_DSP41_FORCE"); frc = f && (!strcmp(f, "junk") || !strcmp(f, "nodraft") || !strcmp(f, "bare")); }
+    if (g_llms_ghint_n < 2 || g_llms_ghint_pos != (int64_t)P || !llms_gdepth() || temp > 0.0f || t == eos || frc) return 0u;
+    uint32_t Kg = (uint32_t)g_llms_ghint_n; if ((int)Kg + 1 > max_tokens) Kg = max_tokens > 1 ? (uint32_t)max_tokens - 1u : 0u; if ((int)Kg + 1 > acc_cap) Kg = acc_cap > 1 ? (uint32_t)acc_cap - 1u : 0u;
+    if ((int)(P + Kg + 1u) > s->ctx_size) Kg = 0;
+    for (uint32_t k = 0; k < Kg; k++) if (g_llms_ghint[k] < 0 || g_llms_ghint[k] >= (int)DS4_N_VOCAB || g_llms_ghint[k] == eos) { Kg = k; break; }
+    return Kg >= 2u ? Kg : 0u;
+}
+static int llms_dsp41_cycle(ds4_session *s, int t, int max_tokens, int eos, float temp, int top_k, float top_p, float min_p,
+                            uint64_t *rng, int *acc, int acc_cap, char *err, size_t errlen) {   /* llms DSP41_RATE: the measuring wrapper */
+
+    { static int llms_r0e, llms_r0k = -1; if (llms_r0k < 0) { const char *e = getenv("LLMS_DS4_R0PF_DEC"); llms_r0k = e && atoi(e) > 0 ? atoi(e) : 0;   /* llms R0PF_DEC (apply_r0pfdec.py) */
+                                                        if (llms_r0k) fprintf(stderr, "llms: r0pf dec (round 0's recording runs through its first %d decode cycles)\n", llms_r0k); }
+      if (llms_r0e <= llms_r0k) { if (llms_r0e++ == llms_r0k) { extern void ds4_gpu_llms_r0_record(int); ds4_gpu_llms_r0_record(0); } } }   /* llms R0PF: round 0 ends (at cycle K + 1) */
+    const double tc = now_sec(); g_dsp_cycle_drafted = 0;
+    const uint32_t llms_pl_P = (uint32_t)s->checkpoint.len;   /* llms PHASE_LOG */
+    extern uint64_t ds4_gpu_llms_stream_misses(void); const uint64_t llms_pl_m0 = g_llms_pl_f && g_llms_pl_f != (FILE *)1 ? ds4_gpu_llms_stream_misses() : 0;   /* llms PHASE_LOG: + the cycle's installs */
+    const int n = llms_dsp41_cycle_body(s, t, max_tokens, eos, temp, top_k, top_p, min_p, rng, acc, acc_cap, err, errlen);
+    if (g_llms_pl_f && g_llms_pl_f != (FILE *)1 && n > 0) { const double t1 = now_sec(); char ids[96]; int k = 0; ids[0] = 0;   /* llms PHASE_LOG: + the emitted token ids */
+        for (int i = 0; i < n && i < 8 && k < (int)sizeof ids - 16; i++) k += snprintf(ids + k, sizeof ids - (size_t)k, "%s%d", i ? "," : "", acc[i]);
+        fprintf(g_llms_pl_f, "C %.6f %u %d %.3f %d %s %llu\n", t1, llms_pl_P, n, (t1 - tc) * 1e3, g_dsp_cycle_drafted, ids, (unsigned long long)(ds4_gpu_llms_stream_misses() - llms_pl_m0)); fflush(g_llms_pl_f); }
+    if (n > 0) g_ad2_next = (uint32_t)s->checkpoint.len;   /* llms DSP41_WARM: where the next call should start */
+    if (n > 0 && g_dsp_cycle_drafted && llms_dsp_rate()) {
+        const double ms = (now_sec() - tc) * 1e3;
+        if (g_dsp_rtok > 0.0) { g_dsp_rms = 0.9 * g_dsp_rms + 0.1 * ms; g_dsp_rtok = 0.9 * g_dsp_rtok + 0.1 * (double)n; }
+        else { g_dsp_rms = ms; g_dsp_rtok = (double)n; }
+    }
+    return n;
+}
+static int llms_dsp41_cycle_body(ds4_session *s, int t, int max_tokens, int eos, float temp, int top_k, float top_p, float min_p,
+                                 uint64_t *rng, int *acc, int acc_cap, char *err, size_t errlen) {
+    { static int llms_ltf = -1; if (llms_ltf < 0) { llms_ltf = getenv("LLMS_DS4_LEDGER_LAYER") != NULL;  } if (llms_ltf) ds4_gpu_llms_set_ledger_tag(2, 1, 41); }   /* llms LEDGER_LAYER: the drafter cycle: the draft phase until the verify's layer loop */
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    const uint32_t P = (uint32_t)s->checkpoint.len;
+    const size_t vb = (size_t)DS4_N_VOCAB * sizeof(float);
+    g_dsp_lk_last = 0;   /* llms LOOKUP rewind */
+    if (llms_dsp_rate()) {   /* llms DSP41_RATE */
+        g_dsp_rtokn++;
+        bool plain = g_dsp_rplain > 0.0 ? (g_dsp_rtok > 0.0 && g_dsp_rplain < g_dsp_rms / g_dsp_rtok) : (g_dsp_rtokn == 5u || g_dsp_rtokn == 6u);
+        if (g_dsp_rplain > 0.0 && g_dsp_rtokn % 16u == 0u) plain = !plain;
+        if (plain) {
+            const double tp = now_sec();
+            g_dsp.last_valid = 0; g_dsp_n_plain++;
+            g_dsp_raw = 1; g_llms_dsp_one_cap = 1;
+            const int rc = ds4_session_eval(s, t, err, errlen);
+            g_llms_dsp_one_cap = 0; g_dsp_raw = 0;
+            if (rc != 0) return -1;
+            const double ms = (now_sec() - tp) * 1e3;
+            g_dsp_rplain = g_dsp_rplain > 0.0 ? 0.9 * g_dsp_rplain + 0.1 * ms : ms;
+            acc[0] = t; return 1;
+        }
+    }
+    {
+        static int dw = -1; static uint64_t dsml_plain, dsml_draft;
+        if (dw < 0) { const char *e = getenv("LLMS_DS4_DSP41_DSML"); dw = e && *e ? atoi(e) : 0; if (dw < 0) dw = 0;
+                      if (dw) { fprintf(stderr, "llms dsp41: drafting only within %d tokens of a DSML marker (plain captured steps elsewhere; marker id %d)\n", dw, s->engine->vocab.dsml_id);
+                                atexit_b(^{ fprintf(stderr, "llms dsp41 dsml: %llu plain steps, %llu drafting calls\n", (unsigned long long)dsml_plain, (unsigned long long)dsml_draft); }); } }
+        if (dw > 0) {
+            const int did = s->engine->vocab.dsml_id;
+            static int bar = -2, tds = -2, tml = -2;   /* llms DSP41_DSML2: the model writes the marker as '<' '｜' 'DS' 'ML' '｜', not as the special token */
+            if (bar == -2) {   /* ids by tokenizing the pieces (the table holds byte-level strings) */
+                const char *pc[3] = { "｜", "DS", "ML" }; int id[3] = { -1, -1, -1 };
+                for (int q = 0; q < 3; q++) { ds4_tokens tk = {0}; ds4_tokenize_text(s->engine, pc[q], &tk); if (tk.len == 1) id[q] = tk.v[0]; ds4_tokens_free(&tk); }
+                bar = id[0]; tds = id[1]; tml = id[2];
+                             fprintf(stderr, "llms dsp41 dsml: marker pieces %d %d %d (special %d)\n", bar, tds, tml, did); }
+            const int *v = s->checkpoint.v; const int n = s->checkpoint.len;
+            bool near = (did >= 0 && t == did) || (t == tml && n >= 2 && v[n - 1] == tds && v[n - 2] == bar);
+            for (int i = n - 1; !near && i >= 0 && i >= n - dw; i--)
+                near = (did >= 0 && v[i] == did) || (bar >= 0 && v[i] == bar && i + 2 < n + 1 && ((i + 1 < n ? v[i + 1] : t) == tds) && ((i + 2 < n ? v[i + 2] : (i + 2 == n ? t : -1)) == tml));
+            if (!near) {
+                g_dsp.last_valid = 0; g_dsp_n_plain++; dsml_plain++;
+                g_dsp_raw = 1; g_llms_dsp_one_cap = 1;
+                const int rc = ds4_session_eval(s, t, err, errlen);
+                g_llms_dsp_one_cap = 0; g_dsp_raw = 0;
+                if (rc != 0) return -1;
+                acc[0] = t; return 1;
+            }
+            dsml_draft++;
+        }
+    }
+    {   /* llms DSP41_ADAPT: below the threshold, the engine's one-token step (captured), except a probe every 8th */
+        const float th = llms_dsp_th();   /* llms DSP41_ADAPT2: the measured threshold when set */
+        const uint32_t gap = llms_dsp_adapt2() ? g_ad2_gap : 8u;
+        if (llms_dsp_adapt2() && P != g_ad2_next) g_ad2_warm_end = P + llms_dsp_warm();   /* llms DSP41_WARM: a new prompt or an appended turn */
+        const int warm = llms_dsp_adapt2() && P < g_ad2_warm_end;
+        int lkd[8]; const uint32_t lkK = g_llms_lk > 0 ? (uint32_t)g_llms_lk : 0u;   /* llms LOOKUP v2: a proposal pre-empts the plain step */
+        const bool lk_has = t != eos && max_tokens >= 3 && acc_cap >= 3 && (int)(P + lkK + 1u) <= s->ctx_size && llms_lookup_propose(s, t, P, lkK < 8u ? lkK : 8u, lkd) > 0;
+        const bool gd_has = llms_gd_kg(s, P, t, max_tokens, acc_cap, eos, temp) >= 2u && !ds4_gpu_llms_alt_off("gdepth");
+        const bool gd_pre = gd_has && !ds4_gpu_llms_alt_off("gdpre");   /* ALT 'gdpre': the pre-emption off per step (measurement) */
+        int gd_preempted = 0; if (gd_has) g_llms_gd_g_elig++;
+        if (!lk_has && th > 0.0f && (warm || (g_dsp_ema < th && (++g_dsp_plain_k % gap) != 0u))) {
+          if (gd_pre) { g_llms_gd_g_pre++; gd_preempted = 1; }   /* llms GDPRE: the eligible grammar proposal pre-empts the plain return, as a lookup proposal does */
+          else {
+            if (gd_has) g_llms_gd_g_byp++;
+            const double tp = now_sec();
+            g_dsp.last_valid = 0; g_dsp_n_plain++;
+            g_dsp_raw = 1; g_llms_dsp_one_cap = 1;
+            const int rc = ds4_session_eval(s, t, err, errlen);
+            g_llms_dsp_one_cap = 0; g_dsp_raw = 0;
+            if (rc != 0) return -1;
+            if (llms_dsp_adapt2()) { const double ms = (now_sec() - tp) * 1e3; g_ad2_prev_plain = 1;
+                                     if (warm) g_ad2_nwarm++; else { g_ad2_pl = g_ad2_pl > 0.0 ? 0.9 * g_ad2_pl + 0.1 * ms : ms; g_ad2_np++; } }   /* llms DSP41_WARM */
+            acc[0] = t; return 1;
+          }
+        }
+        g_ad2_probe = !gd_preempted && th > 0.0f && g_dsp_ema < th;   /* llms GDPRE: a pre-empted step is not a probe */
+        if (!gd_preempted && th > 0.0f && g_dsp_ema < th) g_dsp_n_probe++;
+    }
+    g_dsp_res_pend = 0;   /* llms DSP41_RESRAW */
+    if (g_dsp_lazy_tok >= 0) { g_dsp_lazy_tok = -1; g_dsp_lazy_miss++; s->checkpoint_valid = false;   /* llms DSP41_LAZY0 */
+                               snprintf(err, errlen, "dsp41: a pending keep-0 rewind was not followed by the re-evaluation"); return -1; }
+    g_dsp.cycles++;
+    { static FILE *cl = (FILE *)1; if (cl == (FILE *)1) { const char *e = getenv("LLMS_DS4_CYC_LOG"); cl = e && *e ? fopen(e, "w") : NULL; }   /* llms CYC_LOG (apply_cyc_log.py) */
+      { extern void ds4_gpu_llms_cache_trace(uint32_t, uint32_t, uint32_t); ds4_gpu_llms_cache_trace(3, (uint32_t)P >> 16, (uint32_t)P & 0xffffu); }   /* llms CACHE_TRACE */
+      if (cl) { extern uint64_t ds4_gpu_llms_stream_misses(void); fprintf(cl, "%.6f %u %llu\n", now_sec(), (unsigned)P, (unsigned long long)ds4_gpu_llms_stream_misses()); fflush(cl); } }
+    g_dsp.last_valid = 0;
+    const uint32_t expect = g_dsp.pend_rows ? g_dsp.pend_pos + g_dsp.pend_rows : g_dsp.ring_next;
+    uint32_t llms_pc_from = 0, llms_pc_to = 0;   /* llms DSP41_PROMPT: positions [from, to) to load from the prompt capture */
+    if (expect != P && g_llms_dsp_pc && g_llms_dsp_pc_hi == P && g_llms_dsp_pc_hi > g_llms_dsp_pc_lo) {
+        if ((g_dsp.ring_n || g_dsp.pend_rows) && expect >= g_llms_dsp_pc_lo && expect < P) { llms_pc_from = expect; llms_pc_to = P; }   /* append */
+        else { g_dsp.ring_n = 0; g_dsp.pend_rows = 0; g_dsp.ring_resets++; llms_pc_from = g_llms_dsp_pc_lo; llms_pc_to = P; }   /* restart from the prompt */
+    } else
+    if ((g_dsp.ring_n || g_dsp.pend_rows) && expect != P) { g_dsp.ring_n = 0; g_dsp.pend_rows = 0; g_dsp.ring_resets++; }   /* a jump: restart the ring */
+    static int llms_force = -1;   /* llms DSP41_FORCE: junk (skip the drafter, propose token 13) or nodraft */
+    if (llms_force < 0) { const char *f = getenv("LLMS_DS4_DSP41_FORCE"); llms_force = !f ? 0 : !strcmp(f, "junk") ? 1 : !strcmp(f, "nodraft") ? 2 : !strcmp(f, "bare") ? 3 : 0;
+                          if (llms_force) fprintf(stderr, "llms dsp41: FORCE %s (a test arm)\n", f); }
+    const bool draft = llms_force == 0 && (g_dsp.ring_n || g_dsp.pend_rows || llms_pc_to > llms_pc_from) && max_tokens >= 2 && acc_cap >= 2 && t != eos && (int)P + 2 <= s->ctx_size;
+    const double t0 = now_sec();
+    {
+        static int lk = -1, lkmin = 4; static uint64_t lk_cyc, lk_prop, lk_acc, lk_rej[10];
+        if (lk < 0) { const char *e = getenv("LLMS_DS4_LOOKUP"); lk = e && *e ? atoi(e) : 0; if (lk < 0) lk = 0; if (lk > 8) lk = 8;
+                      const char *mn = getenv("LLMS_DS4_LOOKUP_MIN"); if (mn && *mn) lkmin = atoi(mn) < 2 ? 2 : atoi(mn);
+                      if (lk) { fprintf(stderr, "llms: lookup drafting (up to %d tokens from the context, backward agreement >= %d; DSpark otherwise)\n", lk, lkmin);
+                                atexit_b(^{ fprintf(stderr, "llms lookup: %llu cycles, %llu proposed, %llu accepted; kept-row histogram", (unsigned long long)lk_cyc, (unsigned long long)lk_prop, (unsigned long long)lk_acc);
+                                            for (int i = 0; i <= 8; i++) fprintf(stderr, " %d:%llu", i, (unsigned long long)lk_rej[i]); fprintf(stderr, "\n"); }); } }
+        const int *cv = s->checkpoint.v;
+        uint32_t K = (uint32_t)lk; if ((int)K + 1 > max_tokens) K = max_tokens > 1 ? (uint32_t)max_tokens - 1u : 0u; if ((int)K + 1 > acc_cap) K = acc_cap > 1 ? (uint32_t)acc_cap - 1u : 0u;
+        if ((int)(P + K + 1u) > s->ctx_size) K = 0;
+        int dr[8]; uint32_t nd = 0;
+        if (lk && K > 0 && t != eos && P >= 2u && llms_force == 0) nd = llms_lookup_propose(s, t, P, K, dr);   /* llms LOOKUP v2 */
+        int llms_gd_now = 0;   /* llms GRAMMAR_DEPTH: the grammar's fixed tokens when no lookup draft was proposed */
+        if (g_llms_ghint_n >= 2) {
+            if (g_llms_ghint_pos != (int64_t)P) g_llms_gd_stale++;
+            else if (nd == 0) {   /* llms GDPRE: the ONE predicate (llms_gd_kg), the same proposal the ADAPT gate saw */
+                const uint32_t Kg = llms_gd_kg(s, P, t, max_tokens, acc_cap, eos, temp);
+                if (Kg >= 2u && !ds4_gpu_llms_alt_off("gdepth")) {   /* ALT 'gdepth': per-step paired measurement (ALTW) */
+                    for (uint32_t k = 0; k < Kg; k++) dr[k] = g_llms_ghint[k];
+                    nd = Kg; llms_gd_now = 1; g_llms_gd_cyc++; g_llms_gd_prop += nd; g_llms_hint_tok = -1;   /* the single hint never also runs */
+                }
+            }
+            g_llms_ghint_n = 0;
+        }
+        (void)cv; (void)lkmin;
+        if (nd > 0) {
+            int toks[9]; toks[0] = t; for (uint32_t k = 0; k < nd; k++) toks[k + 1] = dr[k];
+            const uint32_t kr = nd + 1u;
+            if (!llms_gd_now) { lk_cyc++; lk_prop += nd; }   /* llms GRAMMAR_DEPTH: its own counters */
+            g_dsp_cycle_drafted = 1; g_dsp.cycles--;   /* not a DSpark cycle in its counters */
+            const double lt1 = now_sec();
+            g_llms_dsp_cap_on = 1; g_llms_dsp_cap_rows = 0; g_llms_rb_force = 1;
+            const bool vok = ds41_graph_verify_rows(g, &e->model, &e->weights, toks, kr, g_dsp.row_logits);
+            g_llms_dsp_cap_on = 0; g_llms_rb_force = 0;
+            g_dsp.verify_ms += (now_sec() - lt1) * 1e3;
+            if (!vok || g_llms_dsp_cap_rows != kr) { s->checkpoint_valid = false; snprintf(err, errlen, "lookup: the verify step failed at position %u", P); return -1; }
+            token_vec_push(&s->checkpoint, t); g_dsp.last_valid = 0; acc[0] = t;
+            uint32_t i = 1;
+            for (; i <= nd; i++) {
+                const float *row = g_dsp.row_logits + (size_t)(i - 1u) * DS4_N_VOCAB;
+                bool accept;
+                if (temp <= 0.0f) accept = sample_argmax(row, DS4_N_VOCAB) == dr[i - 1];
+                else {
+                    if (!sample_build_probabilities(row, DS4_N_VOCAB, temp, top_k, top_p, min_p, s->sample_probs)) { s->checkpoint_valid = false; snprintf(err, errlen, "lookup: target failed"); return -1; }
+                    const float pd = s->sample_probs[dr[i - 1]];
+                    accept = pd >= 1.0f || sample_rng_f32(rng) < pd;   /* q = delta(d): accept with probability p(d) */
+                }
+                if (!accept) break;
+                token_vec_push(&s->checkpoint, dr[i - 1]); acc[i] = dr[i - 1]; if (llms_gd_now) g_llms_gd_acc++; else lk_acc++;
+            }
+            const uint32_t keep = i;
+            if (!llms_gd_now) lk_rej[keep - 1u < 8u ? keep - 1u : 8u]++;
+            g_dsp.pend_rows = keep; g_dsp.pend_pos = P;
+            if (!g_dsp_lk_rows) g_dsp_lk_rows = malloc((size_t)LLMS_DSP_CAPR * DS4_N_VOCAB * sizeof(float));   /* llms LOOKUP rewind */
+            if (g_dsp_lk_rows) memcpy(g_dsp_lk_rows, g_dsp.row_logits, (size_t)kr * vb);
+            g_dsp.last_valid = g_dsp_lk_rows != NULL; g_dsp.last_P = P; g_dsp.last_k = keep; g_dsp_lk_last = 1;
+            if (keep < kr) {
+                if (!ds41_graph_verify_rollback_deep(g, keep, 1)) { s->checkpoint_valid = false; snprintf(err, errlen, "lookup: the rollback failed at %u", P); return -1; }
+                g_llms_rb_valid = 1;   /* llms LOOKUP rewind: the snapshot stays usable for a smaller keep */
+                const float *row = g_dsp.row_logits + (size_t)(keep - 1u) * DS4_N_VOCAB;
+                if (temp <= 0.0f) memcpy(s->logits, row, vb);
+                else {   /* residual max(p - delta(d), 0): p with the rejected token removed */
+                    memcpy(g_dsp.res, s->sample_probs, vb); g_dsp.res[dr[keep - 1u]] = 0.0f;
+                    const int r = sample_probabilities(g_dsp.res, DS4_N_VOCAB, rng);
+                    if (r < 0) { s->checkpoint_valid = false; snprintf(err, errlen, "lookup: the residual draw failed at %u", P); return -1; }
+                    for (uint32_t v = 0; v < DS4_N_VOCAB; v++) s->logits[v] = -INFINITY;
+                    s->logits[r] = 0.0f;
+                    memcpy(g_dsp.row_logits, row, vb); g_dsp_res_pend = 1; g_dsp_res_P = P + keep - 1u;   /* llms DSP41_RESRAW */
+                }
+            } else memcpy(s->logits, g_dsp.row_logits + (size_t)(kr - 1u) * DS4_N_VOCAB, vb);
+            return (int)keep;
+        }
+    }
+    int d = -1;
+    if (draft && llms_dsp_block() >= 2 && max_tokens >= 3 && acc_cap >= 3 && (int)P + 4 <= s->ctx_size) {   /* llms DSP41_BLOCK */
+        static FILE *bl = (FILE *)1; if (bl == (FILE *)1) { const char *p = getenv("LLMS_DS4_DSP41_BLOG"); bl = p && *p ? fopen(p, "w") : NULL; }
+        uint32_t B = (uint32_t)llms_dsp_block(); if ((int)B + 1 > max_tokens) B = (uint32_t)max_tokens - 1u; if ((int)B + 1 > acc_cap) B = (uint32_t)acc_cap - 1u;
+        if (!g_dspb_hl) g_dspb_hl = malloc((size_t)LLMS_DSP_BMAX * DS4_N_VOCAB * sizeof(float));
+        bool ok = g_dspb_hl && llms_dsp_markov_row(t);
+        g_dsp.hist0 = g->history;
+        ds4_gpu_llms_q4l_bypass(1);
+        ok = ok && ds4_gpu_begin_commands() != 0 && llms_dsp_ring_rows();
+        for (uint32_t q0 = llms_pc_from; ok && q0 < llms_pc_to; q0 += llms_dsp_ring_chunk()) { const uint32_t nq = llms_pc_to - q0 < llms_dsp_ring_chunk() ? llms_pc_to - q0 : llms_dsp_ring_chunk(); ok = llms_dsp_ring_load(g_llms_dsp_pc, 1, q0, nq); }   /* llms DSP41_RING */
+        if (llms_pc_to > llms_pc_from) g_llms_dsp_pc_fills++;
+        ok = ok && llms_dsp_forward_blk(&e->model, &e->weights, t, P, B);
+        ds4_gpu_llms_q4l_bypass(0);
+        ok = ds4_gpu_end_commands() != 0 && ok;
+        if (ok) ok = ds4_gpu_tensor_read(g_dspb_logits, 0, g_dspb_hl, (uint64_t)B * DS4_N_VOCAB * sizeof(float)) != 0;
+        if (!ok) { snprintf(err, errlen, "dsp41 block: the drafter failed at position %u", P); return -1; }
+        int dr[LLMS_DSP_BMAX]; uint32_t nd = 0;
+        memcpy(g_dsp.ql, g_dspb_hl, vb);
+        if (eos >= 0 && eos < (int)DS4_N_VOCAB) g_dsp.ql[eos] = -INFINITY;
+        int d1 = temp <= 0.0f ? sample_argmax(g_dsp.ql, DS4_N_VOCAB) : llms_dsp_fast_q(g_dsp.ql, temp, top_k, top_p, min_p, rng);
+        if (d1 >= 0 && d1 != eos && (temp <= 0.0f || g_dsp.qp[d1] > 0.0f)) dr[nd++] = d1;
+        for (uint32_t k = 1; nd == k && k < B; k++) {
+            float *raw = g_dspb_hl + (size_t)k * DS4_N_VOCAB;
+            if (eos >= 0 && eos < (int)DS4_N_VOCAB) raw[eos] = -INFINITY;
+            const int dk = llms_dspb_q(k, raw, dr[k - 1], temp, top_k, top_p, min_p, rng);
+            if (dk >= 0 && dk != eos) dr[nd++] = dk;
+        }
+        g_dsp.draft_ms += (now_sec() - t0) * 1e3;
+        const double t1 = now_sec();
+        if (nd == 0) { g_dsp.no_draft++; }
+        {
+            static int sc = -1; static float vcost[LLMS_DSP_BMAX + 2]; static float dcost = 10.0f; static uint64_t hist[LLMS_DSP_BMAX + 1];
+            if (sc < 0) { const char *e = getenv("LLMS_DS4_DSP41_SCHED"); sc = e && *e && *e != '0';
+                          vcost[0] = vcost[1] = 50.0f; vcost[2] = 71.0f; if (LLMS_DSP_BMAX + 1 >= 3) vcost[3] = 105.0f; if (LLMS_DSP_BMAX + 1 >= 4) vcost[4] = 130.0f;
+                          if (sc) { fprintf(stderr, "llms dsp41: SCHED (verify length by draft confidence x measured verify cost)\n");
+                                    atexit_b(^{ fprintf(stderr, "llms dsp41 sched: k* histogram"); for (int i = 1; i <= LLMS_DSP_BMAX; i++) fprintf(stderr, " %d:%llu", i, (unsigned long long)hist[i]);
+                                                fprintf(stderr, "; verify cost EMA ms"); for (int i = 2; i <= LLMS_DSP_BMAX + 1; i++) fprintf(stderr, " %d:%.1f", i, vcost[i]); fprintf(stderr, "\n"); }); } }
+            g_llms_sched_on = sc && temp > 0.0f;
+            if (g_llms_sched_on && nd >= 1u) {
+                const float dms_now = (float)((now_sec() - t0) * 1e3); dcost = 0.8f * dcost + 0.2f * dms_now;
+                float surv = 1.0f, E = 1.0f, best_v = -1.0f; uint32_t best = 1;
+                for (uint32_t k = 1; k <= nd; k++) {
+                    const float c = k == 1u ? g_dsp.qp[dr[0]] : llms_dspb_qof(k - 1u, dr[k - 1]);
+                    surv *= c > 0.0f ? (c < 1.0f ? c : 1.0f) : 0.0f; E += surv;
+                    const float v = E / (dcost + vcost[k + 1u]);
+                    if (v > best_v) { best_v = v; best = k; }
+                }
+                nd = best; hist[best]++;
+            }
+            g_llms_sched_vcost = vcost;
+        }
+        int toks[LLMS_DSP_BMAX + 1]; toks[0] = t; for (uint32_t k = 0; k < nd; k++) toks[k + 1] = dr[k];
+        const uint32_t kr = nd + 1u;
+        g_dsp.drafts += nd; g_dsp_cycle_drafted = nd > 0;
+        g_llms_dsp_cap_on = 1; g_llms_dsp_cap_rows = 0;
+        const bool vok = kr >= 2u ? ds41_graph_verify_rows(g, &e->model, &e->weights, toks, kr, g_dsp.row_logits) : false;
+        g_llms_dsp_cap_on = 0;
+        g_dsp.verify_ms += (now_sec() - t1) * 1e3;
+        const double dms = (t1 - t0) * 1e3, vms = (now_sec() - t1) * 1e3;
+        if (g_llms_sched_on && kr <= (uint32_t)LLMS_DSP_BMAX + 1u && g_llms_sched_vcost) g_llms_sched_vcost[kr] = 0.8f * g_llms_sched_vcost[kr] + 0.2f * (float)vms;   /* llms DSP41_SCHED */
+        if (!vok || g_llms_dsp_cap_rows != kr) { s->checkpoint_valid = false; snprintf(err, errlen, "dsp41 block: the verify step failed at position %u", P); return -1; }
+        token_vec_push(&s->checkpoint, t);
+        acc[0] = t;
+        uint32_t i = 1;
+        for (; i <= nd; i++) {   /* row i-1 is the target for draft i */
+            const float *row = g_dsp.row_logits + (size_t)(i - 1u) * DS4_N_VOCAB;
+            bool accept;
+            if (temp <= 0.0f) accept = sample_argmax(row, DS4_N_VOCAB) == dr[i - 1];
+            else {
+                if (!sample_build_probabilities(row, DS4_N_VOCAB, temp, top_k, top_p, min_p, s->sample_probs)) { s->checkpoint_valid = false; snprintf(err, errlen, "dsp41 block: target failed"); return -1; }
+                const float pd = s->sample_probs[dr[i - 1]], qd = i == 1 ? g_dsp.qp[dr[0]] : llms_dspb_qof(i - 1u, dr[i - 1]);
+                accept = pd >= qd || sample_rng_f32(rng) * qd < pd;
+            }
+            if (!accept) break;
+            token_vec_push(&s->checkpoint, dr[i - 1]); acc[i] = dr[i - 1]; g_dsp.accepts++;
+        }
+        const uint32_t keep = i;   /* rows kept: t and the accepted drafts */
+        g_dspb_hist[keep - 1u < LLMS_DSP_BMAX + 1u ? keep - 1u : LLMS_DSP_BMAX + 1u]++;
+        g_dsp.pend_rows = keep; g_dsp.pend_pos = P;
+        {   /* llms BLK_REWIND (apply_blk_rewind.py): rewindable like a LOOKUP step -- the row logits before any overwrite, the step registered */
+            if (!g_dsp_lk_rows) g_dsp_lk_rows = malloc((size_t)LLMS_DSP_CAPR * DS4_N_VOCAB * sizeof(float));
+            if (g_dsp_lk_rows) memcpy(g_dsp_lk_rows, g_dsp.row_logits, (size_t)kr * vb);
+            g_dsp.last_valid = g_dsp_lk_rows != NULL && llms_deeprb(); g_dsp.last_P = P; g_dsp.last_k = keep; g_dsp_lk_last = 1;
+        }
+        if (keep < kr) {
+            if (!ds41_graph_verify_rollback_deep(g, keep, 1)) { s->checkpoint_valid = false; snprintf(err, errlen, "dsp41 block: the rollback failed at %u", P); return -1; }
+            g_llms_rb_valid = 1;   /* llms BLK_REWIND: the snapshot stays usable for a smaller keep (as the LOOKUP step) */
+            const float *row = g_dsp.row_logits + (size_t)(keep - 1u) * DS4_N_VOCAB;
+            if (temp <= 0.0f) memcpy(s->logits, row, vb);
+            else {   /* the residual draw at the first rejection: max(0, p - q) */
+                memcpy(g_dsp.res, s->sample_probs, vb);
+                if (keep == 1u) { for (uint32_t v = 0; v < DS4_N_VOCAB; v++) { const float x = g_dsp.res[v] - g_dsp.qp[v]; g_dsp.res[v] = x > 0.0f ? x : 0.0f; } }
+                else for (uint32_t j = 0; j < g_dspb_cn[keep - 1u]; j++) { const uint32_t v = g_dspb_ci[keep - 1u][j]; const float x = g_dsp.res[v] - g_dspb_cq[keep - 1u][j]; g_dsp.res[v] = x > 0.0f ? x : 0.0f; }
+                const int r = sample_probabilities(g_dsp.res, DS4_N_VOCAB, rng);
+                if (r < 0) { s->checkpoint_valid = false; snprintf(err, errlen, "dsp41 block: the residual draw failed at %u", P); return -1; }
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++) s->logits[v] = -INFINITY;
+                s->logits[r] = 0.0f;
+                memcpy(g_dsp.row_logits, row, vb); g_dsp_res_pend = 1; g_dsp_res_P = P + keep - 1u;   /* llms DSP41_RESRAW: row 0 slot holds the raw logits */
+            }
+        } else memcpy(s->logits, g_dsp.row_logits + (size_t)(kr - 1u) * DS4_N_VOCAB, vb);
+        if (bl) { fprintf(bl, "%u %u %u %.3f %.3f %u -1 %.3f\n", P, nd, keep - 1u, dms, vms, g_dsp.ring_n, (now_sec() - t0) * 1e3); fflush(bl); }
+        return (int)keep;
+    }
+    if (llms_force == 3) g_dsp.pend_rows = 0;   /* llms DSP41_FORCE bare: no drafter batch at all (1-row captured steps only) */
+    else
+    {   /* one batch before the verify step: the state a rewind of both rows restores, the ring rows, the draft */
+        bool ok = !draft || llms_dsp_markov_row(t);
+        if (draft && llms_dsp_sl_init()) {   /* llms DSP41_SHORT: the context's new ids into V'; -inf outside V' after a full head */
+            const int *cv = s->checkpoint.v; const uint32_t cn = (uint32_t)s->checkpoint.len;
+            if (g_dsp_sl_scan > cn) g_dsp_sl_scan = cn;
+            for (; g_dsp_sl_scan < cn; g_dsp_sl_scan++) llms_dsp_sl_add(cv[g_dsp_sl_scan]);
+            llms_dsp_sl_add(t);
+            if (g_dsp_sl_dirty) { static float *ninf; if (!ninf) { ninf = malloc(vb); for (uint32_t i = 0; i < DS4_N_VOCAB; i++) ninf[i] = -INFINITY; }
+                                  ok = ok && ds4_gpu_tensor_write(g_dsp.logits, 0, ninf, vb) != 0; g_dsp_sl_dirty = 0; }
+        }
+        g_dsp.hist0 = g->history;
+        ds4_gpu_llms_q4l_bypass(1);
+        ok = ok && ds4_gpu_begin_commands() != 0 &&
+             llms_dsp_ring_rows();
+        for (uint32_t q0 = llms_pc_from; ok && q0 < llms_pc_to; q0 += llms_dsp_ring_chunk()) {   /* llms DSP41_PROMPT; llms DSP41_RING */
+            const uint32_t nq = llms_pc_to - q0 < llms_dsp_ring_chunk() ? llms_pc_to - q0 : llms_dsp_ring_chunk();
+            ok = llms_dsp_ring_load(g_llms_dsp_pc, 1, q0, nq);
+        }
+        if (llms_pc_to > llms_pc_from) g_llms_dsp_pc_fills++;
+        ok = ok && (!draft || llms_dsp_forward(&e->model, &e->weights, t, P));
+        ds4_gpu_llms_q4l_bypass(0);
+        const double llms_s1 = now_sec();   /* llms DSP41_SPLIT */
+        ok = ds4_gpu_end_commands() != 0 && ok;
+        const double llms_s2 = now_sec();
+        if (ok && draft) ok = ds4_gpu_tensor_read(g_dsp.logits, 0, g_dsp.ql, vb) != 0;
+        if (ok && draft && g_dsp_selh) {   /* llms DSP41_BANK: LLMS_DS4_DSP41_COUNT */
+            int32_t hsel[12];
+            if (ds4_gpu_tensor_read(g_dsp_selh, 0, hsel, sizeof hsel)) {
+                for (uint32_t s = 0; s < 3u; s++) for (uint32_t k = 0; k < (uint32_t)LLMS_DSP_USED; k++) { const int32_t e = hsel[s * 4u + k]; if (e >= 0 && e < 128) g_dsp_cnt[s][e]++; }
+                g_dsp_cnt_cycles++;
+            }
+        }
+        const double llms_s3 = now_sec();
+        static int llms_sp = -1; static double llms_sa[4]; static uint64_t llms_sn;
+        if (llms_sp < 0) { llms_sp = getenv("LLMS_DS4_DSP41_SPLIT") != NULL;
+                           if (llms_sp) atexit_b(^{ if (llms_sn) fprintf(stderr, "llms dsp41 split: %llu drafted cycles; ms per cycle: encode %.3f, gpu %.3f, read %.3f, q %.3f\n",
+                               (unsigned long long)llms_sn, llms_sa[0] / llms_sn, llms_sa[1] / llms_sn, llms_sa[2] / llms_sn, llms_sa[3] / llms_sn); }); }
+        if (llms_sp && draft) { llms_sa[0] += (llms_s1 - t0) * 1e3; llms_sa[1] += (llms_s2 - llms_s1) * 1e3; llms_sa[2] += (llms_s3 - llms_s2) * 1e3; llms_sn++; }
+        g_dsp_split_t3 = llms_s3;
+        if (!ok) { snprintf(err, errlen, "dsp41: the drafter failed at position %u", P); return -1; }
+        if (draft) {
+            if (eos >= 0 && eos < (int)DS4_N_VOCAB) g_dsp.ql[eos] = -INFINITY;
+            if (temp <= 0.0f) d = sample_argmax(g_dsp.ql, DS4_N_VOCAB);
+            else {   /* llms DSP41_QTEMP: q at temp * tau */
+                static float qt = -1.0f; if (qt < 0.0f) { const char *e = getenv("LLMS_DS4_DSP41_QTEMP"); qt = e && *e ? strtof(e, NULL) : 1.0f; if (!(qt > 0.0f) || qt > 4.0f) qt = 1.0f;
+                                                       if (qt != 1.0f) fprintf(stderr, "llms dsp41: draft distribution at temperature x %.3f\n", qt); }
+                static int fullq = -1; if (fullq < 0) fullq = getenv("LLMS_DS4_DSP41_FULLQ") != NULL;   /* llms DSP41_FASTQ */
+                if (fullq) { if (sample_build_probabilities(g_dsp.ql, DS4_N_VOCAB, temp * qt, top_k, top_p, min_p, g_dsp.qp)) d = sample_probabilities(g_dsp.qp, DS4_N_VOCAB, rng); }
+                else d = llms_dsp_fast_q(g_dsp.ql, temp * qt, top_k, top_p, min_p, rng);
+            }
+            if (d == eos || (temp > 0.0f && d >= 0 && !(g_dsp.qp[d] > 0.0f))) d = -1;
+            if (g_dsp_shadow && d >= 0 && temp > 0.0f) {   /* llms DSP41_SHADOW: the bank on the identical state */
+                ds4_gpu_llms_q4l_bypass(1);
+                bool sok = ds4_gpu_begin_commands() != 0;
+                g_dsp_bank_on = 1; sok = sok && llms_dsp_forward(&e->model, &e->weights, t, P); g_dsp_bank_on = 0;
+                ds4_gpu_llms_q4l_bypass(0);
+                sok = ds4_gpu_end_commands() != 0 && sok;
+                if (sok) sok = ds4_gpu_tensor_read(g_dsp.logits, 0, g_dsp_ql2, vb) != 0;
+                if (!sok) { snprintf(err, errlen, "dsp41: the shadow drafter failed at position %u", P); return -1; }
+                if (eos >= 0 && eos < (int)DS4_N_VOCAB) g_dsp_ql2[eos] = -INFINITY;
+                static float sqt = -1.0f; if (sqt < 0.0f) { const char *e2 = getenv("LLMS_DS4_DSP41_QTEMP"); sqt = e2 && *e2 ? strtof(e2, NULL) : 1.0f; if (!(sqt > 0.0f) || sqt > 4.0f) sqt = 1.0f; }
+                llms_dsp_q2_build(temp * sqt, top_k, top_p, min_p);
+            } else g_dsp_q2_n = 0;
+        }
+    }
+    if (g_llms_hint_tok >= 0) {   /* llms DSML_HINT: one shot; greedy drafting cycles only */
+        if (g_llms_hint_pos != (int64_t)P) g_llms_hint_stale++;
+        else if (draft && temp <= 0.0f && g_llms_hint_tok != eos && g_llms_hint_tok < (int)DS4_N_VOCAB) { g_llms_hint_used++; g_llms_hint_cyc = 1; if (d != g_llms_hint_tok) { g_llms_hint_changed++; g_llms_hint_cyc = 2; } d = g_llms_hint_tok; }
+        else g_llms_hint_dropped++;
+        g_llms_hint_tok = -1;
+    }
+    if (llms_force == 1 && temp <= 0.0f && max_tokens >= 2 && acc_cap >= 2 && (int)P + 2 <= s->ctx_size) d = t == 13 ? 14 : 13;   /* llms DSP41_FORCE junk */
+    { static int llms_sp2 = -1; static double llms_qa; static uint64_t llms_qn; if (llms_sp2 < 0) { llms_sp2 = getenv("LLMS_DS4_DSP41_SPLIT") != NULL;
+        if (llms_sp2) atexit_b(^{ if (llms_qn) fprintf(stderr, "llms dsp41 split: q (sample_build_probabilities + draw) %.3f ms per drafted cycle\n", llms_qa / llms_qn); }); }
+      if (llms_sp2 && d >= 0) { llms_qa += (now_sec() - g_dsp_split_t3) * 1e3; llms_qn++; } }   /* llms DSP41_SPLIT */
+    g_dsp.draft_ms += (now_sec() - t0) * 1e3;
+    const double t1 = now_sec();
+    const int toks[2] = { t, d };
+    const uint32_t k = d >= 0 ? 2u : 1u;
+    if (d >= 0) g_dsp.drafts++; else g_dsp.no_draft++;
+    g_dsp_cycle_drafted = d >= 0;   /* llms DSP41_RATE */
+    g_llms_dsp_cap_on = 1; g_llms_dsp_cap_rows = 0;
+    const bool vok = ds41_graph_verify_rows(g, &e->model, &e->weights, toks, k, g_dsp.row_logits);
+    g_llms_dsp_cap_on = 0;
+    g_dsp.verify_ms += (now_sec() - t1) * 1e3;
+    static FILE *llms_dl = (FILE *)1; if (llms_dl == (FILE *)1) { const char *lp = getenv("LLMS_DS4_DSP41_LOG"); llms_dl = lp && *lp ? fopen(lp, "w") : NULL; }   /* llms DSP41_LOG */
+    const double llms_dms = (t1 - t0) * 1e3, llms_vms = (now_sec() - t1) * 1e3;
+    if (!vok || g_llms_dsp_cap_rows != k) { s->checkpoint_valid = false; snprintf(err, errlen, "dsp41: the verify step failed at position %u", P); return -1; }
+    {   /* llms DEEPRB test: keep-0 deep rollback + an identical re-run must reproduce the row logits bit for bit (=canary: no slot restore) */
+        static int dt = -1; static uint64_t dteq, dtne, dtfail; static double dtmax; static float *dts;
+        if (dt < 0) { const char *e = getenv("LLMS_DS4_DEEPRB_TEST"); dt = !e || !*e ? 0 : !strcmp(e, "canary") ? 2 : 1;
+                      if (dt) { dts = malloc((size_t)2 * DS4_N_VOCAB * sizeof(float));
+                                atexit_b(^{ fprintf(stderr, "llms deeprb test%s: %llu keep-0 re-runs bit-equal, %llu differ (max |d| %.3g), %llu failed\n", dt == 2 ? " (CANARY: no restore)" : "",
+                                    (unsigned long long)dteq, (unsigned long long)dtne, dtmax, (unsigned long long)dtfail); }); } }
+        if (dt && dts && k == 2u && (g_dsp.cycles % 4u) == 0u) {
+            memcpy(dts, g_dsp.row_logits, (size_t)2 * DS4_N_VOCAB * sizeof(float));
+            g_llms_dsp_cap_on = 1; g_llms_dsp_cap_rows = 0;
+            const bool re = ds41_graph_verify_rollback_deep(g, 0u, dt == 1) && ds41_graph_verify_rows(g, &e->model, &e->weights, toks, 2u, g_dsp.row_logits);
+            g_llms_dsp_cap_on = 0;
+            if (!re || g_llms_dsp_cap_rows != 2u) { dtfail++; s->checkpoint_valid = false; snprintf(err, errlen, "deeprb test: the re-run failed at %u", P); return -1; }
+            double mx = 0.0; for (size_t i = 0; i < (size_t)2 * DS4_N_VOCAB; i++) { const double dd = fabs((double)dts[i] - (double)g_dsp.row_logits[i]); if (dd > mx) mx = dd; }
+            if (mx == 0.0) dteq++; else dtne++;
+            if (mx > dtmax) dtmax = mx;
+        }
+    }
+    {   /* llms DSP41_RLOG */
+        static FILE *rl = (FILE *)1; if (rl == (FILE *)1) { const char *p = getenv("LLMS_DS4_DSP41_RLOG"); rl = p && *p ? fopen(p, "w") : NULL; }
+        if (rl) {
+            fprintf(rl, "%u %u %d %d", P, k, t, d);
+            for (uint32_t r = 0; r < k; r++) {
+                const float *rw = g_dsp.row_logits + (size_t)r * DS4_N_VOCAB; uint32_t am = 0; double cs = 0.0;
+                for (uint32_t i = 0; i < DS4_N_VOCAB; i++) { if (rw[i] > rw[am]) am = i; cs += (double)rw[i] * (double)(i % 97u + 1u); }
+                fprintf(rl, " %u %.9g %.17g", am, (double)rw[am], cs);
+            }
+            fputc('\n', rl); fflush(rl);
+        }
+    }
+    token_vec_push(&s->checkpoint, t);
+    const float *row0 = g_dsp.row_logits, *row1 = g_dsp.row_logits + DS4_N_VOCAB;
+    g_dsp.pend_rows = 1; g_dsp.pend_pos = P;
+    g_dsp.last_valid = 1; g_dsp.last_P = P; g_dsp.last_k = k;
+    if (k == 1) { memcpy(s->logits, row0, vb); acc[0] = t; if (llms_dl) { fprintf(llms_dl, "%u -1 0 %.3f %.3f %u -1 %.3f\n", P, llms_dms, llms_vms, g_dsp.ring_n, (now_sec() - t0) * 1e3); fflush(llms_dl); } return 1; }
+    bool accept;
+    if (temp <= 0.0f) { accept = sample_argmax(row0, DS4_N_VOCAB) == d; if (g_llms_hint_cyc) { g_llms_hint_acc += accept; if (g_llms_hint_cyc == 2) g_llms_hint_chg_acc += accept; } g_llms_hint_cyc = 0; }   /* llms DSML_HINT */
+    else {
+        if (!sample_build_probabilities(row0, DS4_N_VOCAB, temp, top_k, top_p, min_p, s->sample_probs)) {
+            s->checkpoint_valid = false; snprintf(err, errlen, "dsp41: the target distribution failed at position %u", P); return -1;
+        }
+        const float pd = s->sample_probs[d], qd = g_dsp.qp[d];
+        accept = pd >= qd || sample_rng_f32(rng) * qd < pd;
+        {   /* llms LENIENT_PROBE (apply_lenient_probe.py): expected acceptance and KL(p || e_lam) of the lenient rule, exactly, per cycle */
+            static int lp = -1; static double lA[5], lK[5]; static uint64_t ln; static const double lam[5] = { 1.0, 1.25, 1.5, 2.0, 3.0 };
+            if (lp < 0) { lp = getenv("LLMS_DS4_LENIENT_PROBE") != NULL;
+                          if (lp) atexit_b(^{ fprintf(stderr, "llms lenient probe: %llu cycles; lam: mean acceptance / mean KL(p||e) nats:", (unsigned long long)ln);
+                                              for (int k = 0; k < 5; k++) fprintf(stderr, " %.2f: %.4f / %.5f |", lam[k], ln ? lA[k] / ln : 0.0, ln ? lK[k] / ln : 0.0); fprintf(stderr, "\n"); }); }
+            if (lp) {
+                const float *P = s->sample_probs, *Q = g_dsp.qp;
+                for (int k = 0; k < 5; k++) {
+                    double A = 0.0, R = 0.0;
+                    for (uint32_t v = 0; v < DS4_N_VOCAB; v++) { const double a = fmin((double)Q[v], lam[k] * P[v]); A += a; const double r = (double)P[v] - a; if (r > 0.0) R += r; }
+                    double K = 0.0;
+                    for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+                        if (!(P[v] > 0.0f)) continue;
+                        const double a = fmin((double)Q[v], lam[k] * P[v]); const double r = (double)P[v] - a;
+                        const double e = a + (R > 0.0 ? (1.0 - A) * (r > 0.0 ? r : 0.0) / R : 0.0);
+                        if (e > 0.0) K += P[v] * log(P[v] / e); else K += P[v] * 50.0;
+                    }
+                    lA[k] += A; lK[k] += K;
+                }
+                ln++;
+            }
+        }
+    }
+    if (g_llms_dsp_dump && temp > 0.0f) {   /* llms DSP41_DUMP: the cycle -- the drafter's top-64 logits and the target's p */
+        uint32_t ti[64]; float tl[64]; double mx = -1e30, se = 0.0;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) if (isfinite(g_dsp.ql[i]) && g_dsp.ql[i] > mx) mx = g_dsp.ql[i];
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) if (isfinite(g_dsp.ql[i])) se += exp((double)g_dsp.ql[i] - mx);
+        const float lse = (float)(mx + log(se));
+        for (int k2 = 0; k2 < 64; k2++) { ti[k2] = 0; tl[k2] = -INFINITY; }
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) { const float v = g_dsp.ql[i]; if (!(v > tl[63])) continue;
+            int k2 = 63; while (k2 > 0 && tl[k2 - 1] < v) { tl[k2] = tl[k2 - 1]; ti[k2] = ti[k2 - 1]; k2--; } tl[k2] = v; ti[k2] = i; }
+        uint32_t pn = 0; static uint32_t pi[512]; static float pv[512];
+        for (uint32_t i = 0; i < DS4_N_VOCAB && pn < 512; i++) if (s->sample_probs[i] > 0.0f) { pi[pn] = i; pv[pn] = s->sample_probs[i]; pn++; }
+        const uint32_t hd[7] = {2u, P, (uint32_t)t, (uint32_t)d, (uint32_t)accept, g_dsp.ring_n, pn};
+        fwrite(hd, 4, 7, g_llms_dsp_dump); fwrite(&lse, 4, 1, g_llms_dsp_dump); fwrite(ti, 4, 64, g_llms_dsp_dump); fwrite(tl, 4, 64, g_llms_dsp_dump);
+        fwrite(pi, 4, pn, g_llms_dsp_dump); fwrite(pv, 4, pn, g_llms_dsp_dump); fflush(g_llms_dsp_dump);
+    }
+    if (g_dsp_shadow && g_dsp_q2_n && temp > 0.0f && d >= 0) {   /* llms DSP41_SHADOW */
+        double a1 = 0.0, a2 = 0.0;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) { const float pp = s->sample_probs[i], q1 = g_dsp.qp[i], q2 = g_dsp_q2[i]; a1 += pp < q1 ? pp : q1; a2 += pp < q2 ? pp : q2; }
+        g_dsp_sh_a1 += a1; g_dsp_sh_a2 += a2; g_dsp_sh_d2 += (a2 - a1) * (a2 - a1); g_dsp_sh_n++;
+        if (g_dsp_sh_log) { fprintf(g_dsp_sh_log, "%u %.6f %.6f\n", P, a1, a2); fflush(g_dsp_sh_log); }
+    }
+    if (llms_dl) {   /* llms DSP41_LOG; llms DSP41_ALPHA: the expected acceptance and the cycle's wall ms */
+        double al = -1.0;
+        if (temp > 0.0f) { al = 0.0; for (uint32_t i = 0; i < DS4_N_VOCAB; i++) { const float a1 = s->sample_probs[i], b1 = g_dsp.qp[i]; al += a1 < b1 ? a1 : b1; } }
+        fprintf(llms_dl, "%u %d %d %.3f %.3f %u %.5f %.3f\n", P, d, (int)accept, llms_dms, llms_vms, g_dsp.ring_n, al, (now_sec() - t0) * 1e3); fflush(llms_dl);
+    }
+    {   /* llms DSP41_ADAPT: the cycle's acceptance into the EMA */
+        const float th = llms_dsp_th();   /* llms DSP41_ADAPT2 */
+        if (th > 0.0f) {
+            double al = accept ? 1.0 : 0.0;
+            if (temp > 0.0f) { al = 0.0; for (uint32_t i = 0; i < DS4_N_VOCAB; i++) { const float a1 = s->sample_probs[i], b1 = g_dsp.qp[i]; al += a1 < b1 ? a1 : b1; } }
+            if (llms_dsp_adapt2()) {   /* llms DSP41_ADAPT2 */
+                const double cms = (now_sec() - t0) * 1e3;
+                if (!g_ad2_probe && !g_ad2_prev_plain) { g_ad2_cyc = g_ad2_cyc > 0.0 ? 0.9 * g_ad2_cyc + 0.1 * cms : cms; g_ad2_nc++; }
+                if (g_ad2_probe) {
+                    if (al < (double)th - 0.1) { if (g_ad2_gap < 16u) {   /* llms DSP41_WARM: cap 16 */ g_ad2_gap *= 2u; g_dsp_plain_k = 0; g_ad2_backoff++; } }
+                    else if (g_ad2_gap != 8u) { g_ad2_gap = 8u; g_dsp_plain_k = 0; }
+                }
+                g_ad2_prev_plain = 0;
+            }
+            const int was = g_dsp_ema >= th; g_dsp_ema = 0.85 * g_dsp_ema + 0.15 * al;
+            if (was != (g_dsp_ema >= th)) { g_dsp_n_switch++; g_dsp_plain_k = 0; }
+        }
+    }
+    {   /* llms DSP41_TEST0 (apply_dsp41_lazy0.py): every 4th accepted greedy cycle goes through the agent's keep-0 path */
+        static int t0on = -1; static uint64_t t0n;
+        if (t0on < 0) { t0on = getenv("LLMS_DS4_DSP41_TEST0") != NULL; if (t0on) atexit_b(^{ fprintf(stderr, "llms dsp41 test0: %llu keep-0 rewinds + re-evaluations\n", (unsigned long long)t0n); }); }
+        if (t0on && accept && temp <= 0.0f && (g_dsp.cycles % 4u) == 0u) {
+            token_vec_push(&s->checkpoint, d);
+            g_dsp.pend_rows = 2; g_dsp.last_valid = 1; g_dsp.last_P = P; g_dsp.last_k = 2u;
+            ds4_session_rewind(s, (int)P);
+            if (!s->checkpoint_valid || ds4_session_eval(s, t, err, errlen) != 0) { snprintf(err, errlen, "dsp41 test0: the keep-0 path failed at %u", P); return -1; }
+            t0n++; acc[0] = t; return 1;   /* the caller's greedy sample picks d again from row 0 */
+        }
+    }
+    if (accept && g_llms_dsp_dump && temp > 0.0f) {   /* llms DSP41_DUMP1: row 1's target distribution (position P + 1) */
+        static float *p1; static uint32_t i1[512]; static float v1[512]; if (!p1) p1 = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (p1 && sample_build_probabilities(row1, DS4_N_VOCAB, temp, top_k, top_p, min_p, p1)) {
+            uint32_t n1 = 0;
+            for (uint32_t i = 0; i < DS4_N_VOCAB && n1 < 512; i++) if (p1[i] > 0.0f) { i1[n1] = i; v1[n1] = p1[i]; n1++; }
+            const uint32_t h1[4] = {3u, P + 1u, (uint32_t)d, n1};
+            fwrite(h1, 4, 4, g_llms_dsp_dump); fwrite(i1, 4, n1, g_llms_dsp_dump); fwrite(v1, 4, n1, g_llms_dsp_dump); fflush(g_llms_dsp_dump);
+        }
+    }
+    if (accept && temp <= 0.0f) {   /* llms DEEPRB2 tests B (keep 1 of 3, deep) and C (keep 1 of 2, the existing rollback: control) */
+        static int bt = -1; static uint64_t beq[2], bne[2], bfail; static double bmax[2]; static float *bsave, *b3;
+        if (bt < 0) { const char *e2 = getenv("LLMS_DS4_DEEPRB_TEST"); bt = e2 && !strcmp(e2, "1");
+                      if (bt) { bsave = malloc((size_t)2 * DS4_N_VOCAB * sizeof(float)); b3 = malloc((size_t)3 * DS4_N_VOCAB * sizeof(float));
+                                atexit_b(^{ fprintf(stderr, "llms deeprb test B (keep 1 of 3, deep): %llu bit-equal, %llu differ (max |d| %.3g); C (keep 1 of 2, control): %llu bit-equal, %llu differ (max |d| %.3g); %llu failed\n",
+                                    (unsigned long long)beq[0], (unsigned long long)bne[0], bmax[0], (unsigned long long)beq[1], (unsigned long long)bne[1], bmax[1], (unsigned long long)bfail); }); } }
+        const uint32_t cm = (uint32_t)(g_dsp.cycles % 4u);
+        if (bt && bsave && b3 && (cm == 2u || cm == 3u)) {
+            const int B = cm == 2u ? 0 : 1, j1 = d == 13 ? 14 : 13, j2 = j1 == 13 ? 14 : 13;
+            memcpy(bsave, g_dsp.row_logits, (size_t)2 * DS4_N_VOCAB * sizeof(float));
+            const int tx[3] = { t, j1, j2 }, ty[2] = { d, j2 };
+            bool okb = ds41_graph_verify_rollback_deep(g, 0u, 1);
+            okb = okb && ds41_graph_verify_rows(g, &e->model, &e->weights, tx, B == 0 ? 3u : 2u, b3);
+            okb = okb && (B == 0 ? ds41_graph_verify_rollback_deep(g, 1u, 1) : ds41_graph_verify_rollback(g, 1u));
+            okb = okb && ds41_graph_verify_rows(g, &e->model, &e->weights, ty, 2u, b3);
+            okb = okb && ds41_graph_verify_rollback(g, 1u);   /* the state ends at S + t + d */
+            if (!okb) { bfail++; s->checkpoint_valid = false; snprintf(err, errlen, "deeprb test B/C failed at %u", P); return -1; }
+            double mx = 0.0; for (size_t i = 0; i < (size_t)DS4_N_VOCAB; i++) { const double dd = fabs((double)bsave[DS4_N_VOCAB + i] - (double)b3[i]); if (dd > mx) mx = dd; }
+            if (mx == 0.0) beq[B]++; else bne[B]++;
+            if (mx > bmax[B]) bmax[B] = mx;
+            memcpy(g_dsp.row_logits, bsave, (size_t)2 * DS4_N_VOCAB * sizeof(float));
+        }
+    }
+    if (accept) {
+        token_vec_push(&s->checkpoint, d);
+        memcpy(s->logits, row1, vb);
+        g_dsp.pend_rows = 2; g_dsp.accepts++;
+        acc[0] = t; acc[1] = d; return 2;
+    }
+    g_dsp.last_valid = 0;
+    if (!ds41_graph_verify_rollback(g, 1)) { s->checkpoint_valid = false; snprintf(err, errlen, "dsp41: the rollback failed at position %u", P); return -1; }
+    if (temp <= 0.0f) { memcpy(s->logits, row0, vb); acc[0] = t; return 1; }
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) { const float v = s->sample_probs[i] - g_dsp.qp[i]; g_dsp.res[i] = v > 0.0f ? v : 0.0f; }
+    const int r = sample_probabilities(g_dsp.res, DS4_N_VOCAB, rng);
+    if (r < 0) { s->checkpoint_valid = false; snprintf(err, errlen, "dsp41: the residual draw failed at position %u", P); return -1; }
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) s->logits[i] = -INFINITY;
+    s->logits[r] = 0.0f;
+    g_dsp_res_pend = 1; g_dsp_res_P = P;   /* llms DSP41_RESRAW: row 0 (g_dsp.row_logits) holds the raw logits for P + 1 */
+    acc[0] = t; return 1;
+}
+
+
+
+int ds4_session_dsp41_sample_row(ds4_session *s, int pos, int row, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    /* 10:2x: the block-1 path keeps its rows in g_dsp.row_logits (slot 0 = row 0 after an accept -- the buffer LAZY0's lazy_take reads); the
+       lookup / block paths copy theirs into g_dsp_lk_rows (g_dsp_lk_last). The first gate run read only the latter: 12 of 12 flips invalid. */
+    const float *rows = g_dsp_lk_last && g_dsp_lk_rows ? g_dsp_lk_rows : g_dsp.row_logits;
+    if (!s || !s->checkpoint_valid || !g_dsp.last_valid || !rows || row < 0 || pos < 0 || (uint32_t)pos != g_dsp.last_P ||
+        (uint32_t)row >= g_dsp.last_k || s->checkpoint.len != (int)(g_dsp.last_P + g_dsp.last_k)) return -1;
+    return sample_top_p_min_p(rows + (size_t)row * DS4_N_VOCAB, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng, s->sample_probs);
+}
+bool ds4_session_dsp41_restore_raw(ds4_session *s) {   /* llms DSP41_RESRAW */
+    if (!g_dsp_res_pend || !s || s->checkpoint.len != (int)g_dsp_res_P + 1 || !g_dsp.row_logits) { g_dsp_res_pend = 0; return false; }
+    memcpy(s->logits, g_dsp.row_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    g_dsp_res_pend = 0; g_dsp_res_restored++;
+    return true;
+}
+/* llms DSP41: ds4_session_rewind into the last verify step -- its second row (keep 1) or both (the state saved before it) */
+static bool llms_dsp41_rewind(ds4_session *s, int pos) {
+    if (!g_dsp.last_valid || !s->ds41_graph_ready || s->checkpoint.len != (int)(g_dsp.last_P + g_dsp.last_k) || pos < (int)g_dsp.last_P ||
+        pos >= s->checkpoint.len) return false;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    g_dsp.last_valid = 0;
+    if (g_dsp_lk_last && g_dsp_lk_rows) {   /* llms LOOKUP rewind: into a multi-row lookup step */
+        g_dsp_lk_last = 0;
+        const uint32_t j = (uint32_t)pos - g_dsp.last_P;   /* rows to keep: 0 .. last_k - 1 */
+        const size_t vb = (size_t)DS4_N_VOCAB * sizeof(float);
+        if (j >= 1u) {
+            if (!ds41_graph_verify_rollback_deep(g, j, 1)) return false;
+            memcpy(s->logits, g_dsp_lk_rows + (size_t)(j - 1u) * DS4_N_VOCAB, vb);
+            g_dsp.pend_rows = j; g_dsp.pend_pos = g_dsp.last_P; g_dsp.rewinds++; g_dsp_res_pend = 0;
+            return true;
+        }
+        if (!ds41_graph_verify_rollback_deep(g, 1u, 1)) return false;   /* pos == P: the LAZY0 hold of t */
+        memcpy(g_dsp.row_logits, g_dsp_lk_rows, vb);
+        g_dsp_lazy_tok = s->checkpoint.v[g_dsp.last_P]; g_dsp_lazy_P = g_dsp.last_P;
+        g_dsp.pend_rows = 1; g_dsp.pend_pos = g_dsp.last_P; g_dsp.rewinds++; g_dsp_res_pend = 0;
+        return true;
+    }
+    if (pos == (int)g_dsp.last_P + 1) {
+        if (!ds41_graph_verify_rollback(g, 1)) return false;
+        memcpy(s->logits, g_dsp.row_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+        g_dsp.pend_rows = 1; g_dsp.rewinds++;
+        return true;
+    }
+    /* llms DSP41_LAZY0: back to the step's start -- the exact keep-1 state, t held as processed until the caller re-evaluates it */
+    if (!ds41_graph_verify_rollback(g, 1)) return false;
+    g_dsp_lazy_tok = s->checkpoint.v[g_dsp.last_P]; g_dsp_lazy_P = g_dsp.last_P;
+    g_dsp.pend_rows = 1; g_dsp.pend_pos = g_dsp.last_P; g_dsp.rewinds++;
+    return true;
+}
+/* llms DSP41_LAZY0: the caller re-evaluates the token at the rewound step's start -- already processed; row 0's logits answer */
+static bool llms_dsp41_lazy_take(ds4_session *s, int token) {
+    const bool hit = s->checkpoint_valid && s->checkpoint.len == (int)g_dsp_lazy_P && token == g_dsp_lazy_tok && s->ds41_graph.pos == g_dsp_lazy_P + 1u;
+    g_dsp_lazy_tok = -1;
+    if (!hit) { g_dsp_lazy_miss++; s->checkpoint_valid = false; return false; }
+    token_vec_push(&s->checkpoint, token);
+    memcpy(s->logits, g_dsp.row_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    g_dsp_lazy_hits++;
+    return true;
+}
+/* llms DSP41: a plain ds4_session_eval through the 1-row captured step, so the ring stays continuous */
+static int llms_dsp41_plain(ds4_session *s, int token, char *err, size_t errlen) {
+    int acc[2];
+    const uint64_t cyc0 = g_dsp.cycles;   /* llms DSP41_CNTFIX: uncount only a cycle the call counted */
+    g_dsp.plain++;
+    const int n = llms_dsp41_cycle(s, token, 1, -1, 0.0f, 0, 1.0f, 0.0f, NULL, acc, 1, err, errlen);
+    if (g_dsp.cycles != cyc0) g_dsp.cycles--;
+    return n == 1 ? 0 : 1;
+}
+#endif
+#if !(defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU))
+bool ds4_session_dsp41_restore_raw(ds4_session *s) { (void)s; return false; }   /* llms DSP41_RESRAW */
+int ds4_session_dsp41_sample_row(ds4_session *s, int pos, int row, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {   /* llms FLIPKEEP */
+    (void)s; (void)pos; (void)row; (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng; return -1; }
+#endif
 int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  int max_tokens, int eos_token,
                                  float temperature, int top_k,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (s && accepted && max_tokens > 0 && accepted_cap > 0 && (rng || temperature <= 0.0f) && ds4_session_is_ds41(s) && s->checkpoint_valid &&
+        s->ds41_graph_ready && !s->distributed && llms_dsp_wanted() && llms_dsp_init())   /* llms DSP41 */
+        return llms_dsp41_cycle(s, first_token, max_tokens, eos_token, temperature, top_k, top_p, min_p, rng, accepted, accepted_cap, err, errlen);
+#endif
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,
@@ -87378,6 +92973,9 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    g_dsp_res_pend = 0;   /* llms DSP41_RESRAW */
+#endif
     if (!s) return;
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
@@ -87424,6 +93022,9 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
+#endif
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (!state_ok && s->checkpoint_valid && ds4_session_is_ds41(s) && llms_dsp41_rewind(s, pos)) state_ok = true;   /* llms DSP41 */
 #endif
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row

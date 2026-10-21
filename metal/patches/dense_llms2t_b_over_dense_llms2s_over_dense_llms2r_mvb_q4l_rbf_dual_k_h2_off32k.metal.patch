@@ -1,0 +1,1554 @@
+--- a/dense_llms2t_b_over_dense_llms2s_over_dense_llms2r_mvb_q4l_rbf_dual_k_h2_off32k.metal
++++ b/dense_llms2t_b_over_dense_llms2s_over_dense_llms2r_mvb_q4l_rbf_dual_k_h2_off32k.metal
+@@ -4561,3 +4561,1551 @@
+     (void)src0;
+     if ((int)i < args.ne00) { const float v = ((device const float *) src1)[i]; ((device float *) dst)[i] += v * v; }
+ }
++
++
++
++#ifdef DS4_METAL_HC_STABLE
++static inline float4 llms_d2_sigmoid(float4 z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
++static inline float4 llms_d2_twice_sigmoid(float4 z) { return 1.0f + tanh(0.5f * z); }
++#else
++static inline float4 llms_d2_sigmoid(float4 z)  { return 1.0f / (1.0f + exp(-z)); }
++static inline float4 llms_d2_twice_sigmoid(float4 z) { return 2.0f / (1.0f + exp(-z)); }
++#endif
++struct llms_q4l2_args { uint ga, gb, sk, canary; int iters; float eps; };
++[[host_name("kernel_llms_q4l_mv_b2")]]
++kernel void kernel_llms_q4l_mv_b2(constant ds4_metal_args_mul_mv & aa [[buffer(0)]], device const char * wa [[buffer(1)]], device const char * src1 [[buffer(2)]],
++        device char * da [[buffer(3)]], constant ds4_metal_args_mul_mv & ab [[buffer(4)]], device const char * wb [[buffer(5)]], device char * db [[buffer(6)]],
++        constant llms_q4l2_args & p [[buffer(7)]], device const float * mix [[buffer(8)]], device const float * scale [[buffer(9)]],
++        device const float * base [[buffer(10)]], device float * out [[buffer(11)]],
++        threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]],
++        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    if (tgpig.x < p.ga) { llms_q4l_mv_impl<4, true>(aa, wa, src1, da, shmem, tgpig, tiisg, sgitg); return; }
++    if (tgpig.x < p.ga + p.gb) { llms_q4l_mv_impl<4, true>(ab, wb, src1, db, shmem, uint3(tgpig.x - p.ga, tgpig.y, tgpig.z), tiisg, sgitg); return; }
++    if (!p.sk || sgitg != 0 || tiisg != 0) return;
++    /* kernel_dsv4_hc_split_sinkhorn, HC = 4, one row */
++    const float epsv = p.eps, pre_scale = scale[0], post_scale = scale[1], comb_scale = scale[2];
++    const float4 pre_z = *((device const float4 *) mix) * pre_scale + *((device const float4 *) base);
++    *((device float4 *) out) = llms_d2_sigmoid(pre_z) + epsv;
++    const float4 post_z = *((device const float4 *) (mix + 4)) * post_scale + *((device const float4 *) (base + 4));
++    *((device float4 *) (out + 4)) = llms_d2_twice_sigmoid(post_z);
++    float4 r0 = *((device const float4 *) (mix +  8)) * comb_scale + *((device const float4 *) (base +  8));
++    float4 r1 = *((device const float4 *) (mix + 12)) * comb_scale + *((device const float4 *) (base + 12));
++    float4 r2 = *((device const float4 *) (mix + 16)) * comb_scale + *((device const float4 *) (base + 16));
++    float4 r3 = *((device const float4 *) (mix + 20)) * comb_scale + *((device const float4 *) (base + 20));
++    const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
++    const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
++    const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
++    const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
++    r0 = exp(r0 - m0);
++    r1 = exp(r1 - m1);
++    r2 = exp(r2 - m2);
++    r3 = exp(r3 - m3);
++    r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
++    r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
++    r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
++    r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
++    float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++    r0 *= col_inv;
++    r1 *= col_inv;
++    r2 *= col_inv;
++    r3 *= col_inv;
++    const int iters = p.canary ? p.iters / 2 : p.iters;
++    for (int iter = 1; iter < iters; ++iter) {
++        r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
++        r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
++        r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
++        r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
++        col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++        r0 *= col_inv;
++        r1 *= col_inv;
++        r2 *= col_inv;
++        r3 *= col_inv;
++    }
++    *((device float4 *) (out +  8)) = r0;
++    *((device float4 *) (out + 12)) = r1;
++    *((device float4 *) (out + 16)) = r2;
++    *((device float4 *) (out + 20)) = r3;
++}
++
++
++
++// weight word once (llms_q4l_dot8's exact expression per column) and accumulates every column; NR0 rows per threadgroup; per column the
++// same lane order, the same block stride and the same reduction / bf16 store as kernel_llms_q4l_mv_b: bit-identical column by column. ----
++template<short NR0, short KC, bool RB>
++static inline void llms_q4l_mv_k_impl(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++                                      threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++    const int K = args.ne00, nb = K / 32;
++    const int r0 = tgpig.x * NR0;
++    device const uint * wq[NR0]; device const half * ws[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const int r = min(r0 + row, args.ne01 - 1);
++        device const char * rp = src0 + (ulong)r * args.nb01;
++        wq[row] = (device const uint *) rp; ws[row] = (device const half *) (rp + K / 2);
++    }
++    float sumf[KC][NR0];
++    FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[c][row] = 0.f;
++    const short ix = tiisg / 4, il = tiisg % 4;
++    for (int ib = sgitg * 8 + ix; ib < nb; ib += NSG * 8) {
++        float4 ya[KC], yb[KC];
++        FOR_UNROLL (short c = 0; c < KC; ++c) {
++            device const float * y = (device const float *) (src1 + (ulong)c * args.nb11);
++            ya[c] = *((device const float4 *) (y + ib * 32 + il * 8));
++            yb[c] = *((device const float4 *) (y + ib * 32 + il * 8 + 4));
++        }
++        FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const uint w = wq[row][ib * 4 + il];
++            const float sc = (float) ws[row][ib];
++            const half2 h0 = as_type<half2>(( w        & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h1 = as_type<half2>(((w >>  4) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h2 = as_type<half2>(((w >>  8) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h3 = as_type<half2>(((w >> 12) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++#if LLMS_Q4L_HALF2   /* apply_half2.py: the products in half2 (kh_bench 02:41), a compile-time switch from LLMS_DS4_Q4L_HALF2 */
++            FOR_UNROLL (short c = 0; c < KC; ++c) {
++                const float4 a = ya[c], b = yb[c];
++                half2 p = h0 * half2((half)a.x, (half)b.x);
++                p = fma(h1, half2((half)a.y, (half)b.y), p);
++                p = fma(h2, half2((half)a.z, (half)b.z), p);
++                p = fma(h3, half2((half)a.w, (half)b.w), p);
++                sumf[c][row] += ((float)p.x + (float)p.y) * sc;
++            }
++#else
++            FOR_UNROLL (short c = 0; c < KC; ++c) {
++                const float4 a = ya[c], b = yb[c];
++                const float d8 = ((float)h0.x * a.x + (float)h1.x * a.y) + ((float)h2.x * a.z + (float)h3.x * a.w)
++                               + ((float)h0.y * b.x + (float)h1.y * b.y) + ((float)h2.y * b.z + (float)h3.y * b.w);
++                sumf[c][row] += d8 * sc;
++            }
++#endif
++        }
++    }
++#ifndef LLMS_Q4L_CE3
++#define LLMS_Q4L_CE3 0
++#endif
++#ifndef LLMS_Q4L_HALF2
++#define LLMS_Q4L_HALF2 0
++#endif
++#if LLMS_Q4L_CE
++
++    if (NSG == 2 && RB && ((NR0 == 4 && KC == 2) || (LLMS_Q4L_CE3 && ((NR0 == 4 && KC == 4) || (NR0 == 8 && KC == 3))))) {
++        threadgroup float *partial = (threadgroup float *)shmem;
++        device float *dst_f = (device float *)dst;
++        FOR_UNROLL (short c = 0; c < KC; ++c) {
++            if (c) threadgroup_barrier(mem_flags::mem_threadgroup);
++            FOR_UNROLL (short row = 0; row < NR0; ++row) {
++                float v = simd_sum(sumf[c][row]);
++                if (tiisg == 0) partial[row * NSG + sgitg] = v;
++            }
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            if (sgitg == 0) FOR_UNROLL (short row = 0; row < NR0; ++row) {
++                float v = tiisg < NSG ? partial[row * NSG + tiisg] : 0.f;
++                float tot = simd_sum(v);
++                if (tiisg == 0 && r0 + row < args.ne01) {
++                    if (RB) { uint bits = as_type<uint>(tot); if ((bits & 0x7f800000u) != 0x7f800000u) bits += LLMS_MVB16_CANARY ? 0u : (0x7fffu + ((bits >> 16u) & 1u)); tot = as_type<float>(bits & 0xffff0000u); }
++                    dst_f[(ulong)c * (ulong)args.ne01 + (ulong)(r0 + row)] = tot;
++                }
++            }
++        }
++        return;
++    }
++#endif
++    FOR_UNROLL (short c = 0; c < KC; ++c) {
++        if (c) threadgroup_barrier(mem_flags::mem_threadgroup);
++        device float * dc = (device float *) (dst + (ulong)c * (ulong)args.ne01 * 4u);
++        if (RB) llms_mv_reduce_and_write_b<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++        else    helper_mv_reduce_and_write<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++    }
++}
++// ---- llms Q4L_HX (apply_hx.py): the two-row kernels on HALF x with the half2 products (kx_bench 02:56) ----
++template<short NR0, short KC, bool RB>
++static inline void llms_q4l_mv_kxh_impl(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++                                      threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg & 0xFF; const bool LEAN = (FC_mul_mv_nsg & 0x100) != 0;   /* llms Q4L_LEAN2: the flag rides the NSG constant */
++    const int K = args.ne00, nb = K / 32;
++    const int r0 = tgpig.x * NR0;
++    device const uint * wq[NR0]; device const half * ws[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const int r = min(r0 + row, args.ne01 - 1);
++        device const char * rp = src0 + (ulong)r * args.nb01;
++        wq[row] = (device const uint *) rp; ws[row] = (device const half *) (rp + K / 2);
++    }
++    float sumf[KC][NR0];
++    FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[c][row] = 0.f;
++    const short ix = tiisg / 4, il = tiisg % 4;
++    for (int ib = sgitg * 8 + ix; ib < nb; ib += NSG * 8) {
++        float4 ya[KC], yb[KC];
++        FOR_UNROLL (short c = 0; c < KC; ++c) {
++            device const half * y = (device const half *) src1 + (ulong)c * (ulong)args.ne00;   /* x as half: the f32->f16 copy's row stride = ne00 halves (apply_hx.py) */
++            ya[c] = float4(*((device const half4 *) (y + ib * 32 + il * 8)));
++            yb[c] = float4(*((device const half4 *) (y + ib * 32 + il * 8 + 4)));
++        }
++        FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const uint w = wq[row][ib * 4 + il];
++            const float sc = (float) ws[row][ib];
++            const half2 h0 = as_type<half2>(( w        & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h1 = as_type<half2>(((w >>  4) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h2 = as_type<half2>(((w >>  8) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h3 = as_type<half2>(((w >> 12) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            FOR_UNROLL (short c = 0; c < KC; ++c) {
++                const float4 a = ya[c], b = yb[c];
++                half2 p = h0 * half2((half)a.x, (half)b.x);
++                p = fma(h1, half2((half)a.y, (half)b.y), p);
++                p = fma(h2, half2((half)a.z, (half)b.z), p);
++                p = fma(h3, half2((half)a.w, (half)b.w), p);
++                sumf[c][row] += ((float)p.x + (float)p.y) * sc;
++            }
++        }
++    }
++#ifndef LLMS_Q4L_LEAN2_OFF
++    if (LEAN && NSG == 2) {
++        threadgroup float * part = (threadgroup float *) shmem;
++        FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const float v = simd_sum(sumf[c][row]);
++            if (sgitg == 1 && tiisg == 0) part[c * NR0 + row] = v;
++            sumf[c][row] = v;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg == 0 && tiisg == 0) FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            if (r0 + row >= args.ne01) continue;
++            float tot = (sumf[c][row] + part[c * NR0 + row]) + 0.0f;
++            if (RB) { uint bits = as_type<uint>(tot); if ((bits & 0x7f800000u) != 0x7f800000u) bits += LLMS_MVB16_CANARY ? 0u : (0x7fffu + ((bits >> 16u) & 1u)); tot = as_type<float>(bits & 0xffff0000u); }
++            ((device float *) (dst + (ulong)c * (ulong)args.ne01 * 4u))[r0 + row] = tot;
++        }
++        return;
++    }
++#endif
++    FOR_UNROLL (short c = 0; c < KC; ++c) {
++        if (c) threadgroup_barrier(mem_flags::mem_threadgroup);
++        device float * dc = (device float *) (dst + (ulong)c * (ulong)args.ne01 * 4u);
++        if (RB) llms_mv_reduce_and_write_b<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++        else    helper_mv_reduce_and_write<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++    }
++}
++#define LLMS_Q4KBXH(NR, KCOL) \
++[[host_name("kernel_llms_q4l_mv_k" #KCOL "_r" #NR "_bxh")]] \
++kernel void kernel_llms_q4l_mv_k##KCOL##_r##NR##_bxh(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst, \
++    threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4l_mv_kxh_impl<NR, KCOL, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++LLMS_Q4KBXH(4, 2)
++LLMS_Q4KBXH(8, 2)
++LLMS_Q4KBXH(4, 3)
++LLMS_Q4KBXH(8, 3)
++
++kernel void kernel_llms_f32_to_f16_rows(device const float4 * src [[buffer(0)]], device half4 * dst [[buffer(1)]], constant uint * cv [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
++    const uint n4 = cv[0], rs4 = cv[1], rows = cv[2];
++    if (gid >= n4 * rows) return;
++    const uint r = gid / n4, i = gid - r * n4;
++    dst[r * n4 + i] = half4(clamp(src[r * rs4 + i], -65504.0f, 65504.0f));   /* the engine's PREHALF conversion clamps the same way (kernel_llms_f32_to_half_clamp) */
++}
++
++// kernel_mul_mv_{f16,bf16}_f32_4 runs one threadgroup per (row block, token), so two-row verifies read the weights TWICE; this kernel
++// walks each weight row once for KC token rows (the q4l k-family's loop with half4 / bfloat4 weight loads), unrounded float output. ----
++template<typename W4, short NR0, short KC>
++static inline void llms_f16_mv_k_impl(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++                                      threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++    const int K = args.ne00, nb = K / 32;
++    const int r0 = tgpig.x * NR0;
++    device const W4 * wr[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const int r = min(r0 + row, args.ne01 - 1);
++        wr[row] = (device const W4 *) (src0 + (ulong)r * args.nb01);
++    }
++    float sumf[KC][NR0];
++    FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[c][row] = 0.f;
++    const short ix = tiisg / 4, il = tiisg % 4;
++    for (int ib = sgitg * 8 + ix; ib < nb; ib += NSG * 8) {
++        float4 ya[KC], yb[KC];
++        FOR_UNROLL (short c = 0; c < KC; ++c) {
++            device const float * y = (device const float *) (src1 + (ulong)c * args.nb11);
++            ya[c] = *((device const float4 *) (y + ib * 32 + il * 8));
++            yb[c] = *((device const float4 *) (y + ib * 32 + il * 8 + 4));
++        }
++        FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const float4 wa = float4(wr[row][ib * 8 + il * 2]), wb = float4(wr[row][ib * 8 + il * 2 + 1]);
++            FOR_UNROLL (short c = 0; c < KC; ++c) sumf[c][row] += dot(wa, ya[c]) + dot(wb, yb[c]);
++        }
++    }
++    FOR_UNROLL (short c = 0; c < KC; ++c) {
++        if (c) threadgroup_barrier(mem_flags::mem_threadgroup);
++        device float * dc = (device float *) (dst + (ulong)c * (ulong)args.ne01 * 4u);
++        helper_mv_reduce_and_write<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++    }
++}
++#define LLMS_F16K(T, W4, NR, KCOL) \
++[[host_name("kernel_llms_" #T "_mv_k" #KCOL "_r" #NR)]] \
++kernel void kernel_llms_##T##_mv_k##KCOL##_r##NR(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst, \
++        threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    llms_f16_mv_k_impl<W4, NR, KCOL>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++LLMS_F16K(f16, half4, 2, 2)
++LLMS_F16K(f16, half4, 4, 2)
++LLMS_F16K(f16, half4, 8, 2)
++LLMS_F16K(bf16, bfloat4, 2, 2)
++LLMS_F16K(bf16, bfloat4, 4, 2)
++LLMS_F16K(bf16, bfloat4, 8, 2)
++LLMS_F16K(f16, half4, 2, 3)
++LLMS_F16K(bf16, bfloat4, 2, 3)
++#undef LLMS_F16K
++#define LLMS_Q4K(NR, KCOL) \
++[[host_name("kernel_llms_q4l_mv_k" #KCOL "_r" #NR "_b")]] \
++kernel void kernel_llms_q4l_mv_k##KCOL##_r##NR##_b(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst, \
++        threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4l_mv_k_impl<NR, KCOL, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++LLMS_Q4K(4, 2)
++LLMS_Q4K(4, 3)
++LLMS_Q4K(4, 4)
++LLMS_Q4K(8, 2)
++LLMS_Q4K(8, 3)
++LLMS_Q4K(8, 4)
++#undef LLMS_Q4K
++#define LLMS_Q4KF(NR, KCOL) \
++[[host_name("kernel_llms_q4l_mv_k" #KCOL "_r" #NR "_f")]] \
++kernel void kernel_llms_q4l_mv_k##KCOL##_r##NR##_f(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst, \
++        threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4l_mv_k_impl<NR, KCOL, false>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++LLMS_Q4KF(4, 4)
++LLMS_Q4KF(8, 2)
++LLMS_Q4KF(8, 3)
++#undef LLMS_Q4KF
++
++
++// threadgroup z (weights src0 + g * nb02, input src1 + g * nb11, output dst + g * ne01 floats), row c's input at + c * nb12 bytes and its
++// output at + c * nb13 bytes; the bf16 store (the low projection is rounded before attn_output_b reads it). ----
++template<short NR0, short KC>
++static inline void llms_q4l_mv_kg_impl(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++                                       threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++    const int K = args.ne00, nb = K / 32, g = (int)tgpig.z;
++    const int r0 = tgpig.x * NR0;
++    device const char * wg = src0 + (ulong)g * args.nb02;
++    device const uint * wq[NR0]; device const half * ws[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const int r = min(r0 + row, args.ne01 - 1);
++        device const char * rp = wg + (ulong)r * args.nb01;
++        wq[row] = (device const uint *) rp; ws[row] = (device const half *) (rp + K / 2);
++    }
++    float sumf[KC][NR0];
++    FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[c][row] = 0.f;
++    const short ix = tiisg / 4, il = tiisg % 4;
++    for (int ib = sgitg * 8 + ix; ib < nb; ib += NSG * 8) {
++        float4 ya[KC], yb[KC];
++        FOR_UNROLL (short c = 0; c < KC; ++c) {
++            device const float * y = (device const float *) (src1 + (ulong)g * args.nb11 + (ulong)c * args.nb12);
++            ya[c] = *((device const float4 *) (y + ib * 32 + il * 8));
++            yb[c] = *((device const float4 *) (y + ib * 32 + il * 8 + 4));
++        }
++        FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const uint w = wq[row][ib * 4 + il];
++            const float sc = (float) ws[row][ib];
++            const half2 h0 = as_type<half2>(( w        & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h1 = as_type<half2>(((w >>  4) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h2 = as_type<half2>(((w >>  8) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h3 = as_type<half2>(((w >> 12) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            FOR_UNROLL (short c = 0; c < KC; ++c) {
++                const float4 a = ya[c], b = yb[c];
++                const float d8 = ((float)h0.x * a.x + (float)h1.x * a.y) + ((float)h2.x * a.z + (float)h3.x * a.w)
++                               + ((float)h0.y * b.x + (float)h1.y * b.y) + ((float)h2.y * b.z + (float)h3.y * b.w);
++                sumf[c][row] += d8 * sc;
++            }
++        }
++    }
++    FOR_UNROLL (short c = 0; c < KC; ++c) {
++        if (c) threadgroup_barrier(mem_flags::mem_threadgroup);
++        device float * dc = (device float *) (dst + (ulong)c * args.nb13) + (ulong)g * args.ne01;
++        llms_mv_reduce_and_write_b<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++    }
++}
++#define LLMS_Q4KG(KCOL) \
++[[host_name("kernel_llms_q4l_mv_kg" #KCOL)]] \
++kernel void kernel_llms_q4l_mv_kg##KCOL(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst, \
++        threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4l_mv_kg_impl<4, KCOL>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++LLMS_Q4KG(2)
++LLMS_Q4KG(3)
++LLMS_Q4KG(4)
++#undef LLMS_Q4KG
++
++
++struct llms_q4g_args { int K; int R; int C; int rb; };
++kernel void kernel_llms_q4g64(constant llms_q4g_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]],
++        device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint tgx [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const int K = a.K, nb = K / 32, r0 = (int)tgx * 64, C = a.C; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [32 k][64 tokens]
++    simdgroup_float8x8 acc[8];
++    for (int t = 0; t < 8; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    for (int b = 0; b < nb; b++) {
++        { const uint w = wq[b * 4 + wl]; const float sc = (float)ws[b];
++          threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((w >> (8 * j)) & 15u) - 8.f) * sc; o[2 * j + 1] = ((float)(int)((w >> (8 * j + 4)) & 15u) - 8.f) * sc; } }
++        for (int i = tid; i < 32 * 64; i += 256) { const int c = i >> 5, k = i & 31; Xs[k * 64 + c] = c < C ? x[(ulong)c * K + b * 32 + k] : 0.f; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < 8; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + kk * 8 * 64 + t * 8, 64); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < 8; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < 64 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) {
++            float v = sh[c * 64 + r];
++            if (a.rb) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * a.R + r0 + r] = v;
++        }
++    }
++}
++
++
++struct llms_q4gs_args { int K; int R; int C; int rb; int xs; int xg; int ds; int pad; ulong wg; };
++kernel void kernel_llms_q4g64s(constant llms_q4gs_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x0 [[buffer(2)]],
++        device float * dst0 [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint3 tgp [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const int K = a.K, nb = K / 32, r0 = (int)tgp.x * 64, C = a.C, g = (int)tgp.z; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    device const char * src = src0 + (ulong)g * a.wg; device const float * x = x0 + (ulong)g * (ulong)a.xg; device float * dst = dst0 + (ulong)g * (ulong)a.R;
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [32 k][64 tokens]
++    simdgroup_float8x8 acc[8];
++    for (int t = 0; t < 8; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    for (int b = 0; b < nb; b++) {
++        { const uint w = wq[b * 4 + wl]; const float sc = (float)ws[b];
++          threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((w >> (8 * j)) & 15u) - 8.f) * sc; o[2 * j + 1] = ((float)(int)((w >> (8 * j + 4)) & 15u) - 8.f) * sc; } }
++        for (int i = tid; i < 32 * 64; i += 256) { const int c = i >> 5, k = i & 31; Xs[k * 64 + c] = c < C ? x[(ulong)c * (ulong)a.xs + b * 32 + k] : 0.f; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < 8; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + kk * 8 * 64 + t * 8, 64); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < 8; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < 64 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) {
++            float v = sh[c * 64 + r];
++            if (a.rb) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * (ulong)a.ds + r0 + r] = v;
++        }
++    }
++}
++
++// Bounded relative offsets; exact F32 attention-output owner only.
++template<short NR0, short KC, bool RB>
++static inline void astra_offset32_impl(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++                                      threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++    const int K = args.ne00, nb = K / 32;
++    const int r0 = tgpig.x * NR0;
++    uint rowoff[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        rowoff[row] = uint(min(r0 + row, args.ne01 - 1)) * uint(args.nb01);
++    }
++    float sumf[KC][NR0];
++    FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[c][row] = 0.f;
++    const short ix = tiisg / 4, il = tiisg % 4;
++    for (int ib = sgitg * 8 + ix; ib < nb; ib += NSG * 8) {
++        float4 ya[KC], yb[KC];
++        FOR_UNROLL (short c = 0; c < KC; ++c) {
++            device const float * y = (device const float *) (src1 + (ulong)c * args.nb11);
++            ya[c] = *((device const float4 *) (y + ib * 32 + il * 8));
++            yb[c] = *((device const float4 *) (y + ib * 32 + il * 8 + 4));
++        }
++        FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const uint w = *((device const uint *)(src0 + (ulong)(rowoff[row] + uint(ib * 16 + il * 4))));
++            const float sc = (float)*((device const half *)(src0 + (ulong)(rowoff[row] + uint(K / 2 + ib * 2))));
++            const half2 h0 = as_type<half2>(( w        & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h1 = as_type<half2>(((w >>  4) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h2 = as_type<half2>(((w >>  8) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h3 = as_type<half2>(((w >> 12) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            FOR_UNROLL (short c = 0; c < KC; ++c) {
++                const float4 a = ya[c], b = yb[c];
++                const float d8 = ((float)h0.x * a.x + (float)h1.x * a.y) + ((float)h2.x * a.z + (float)h3.x * a.w)
++                               + ((float)h0.y * b.x + (float)h1.y * b.y) + ((float)h2.y * b.z + (float)h3.y * b.w);
++                sumf[c][row] += d8 * sc;
++            }
++        }
++    }
++    FOR_UNROLL (short c = 0; c < KC; ++c) {
++        if (c) threadgroup_barrier(mem_flags::mem_threadgroup);
++        device float * dc = (device float *) (dst + (ulong)c * (ulong)args.ne01 * 4u);
++        if (RB) llms_mv_reduce_and_write_b<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++        else    helper_mv_reduce_and_write<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++    }
++}
++kernel void kernel_astra_q4l_off32_f(constant ds4_metal_args_mul_mv &a [[buffer(0)]], device const char *w [[buffer(1)]],device const char *x [[buffer(2)]],device char *y [[buffer(3)]],threadgroup char *s [[threadgroup(0)]],uint3 t [[threadgroup_position_in_grid]],ushort l [[thread_index_in_simdgroup]],ushort g [[simdgroup_index_in_threadgroup]]){astra_offset32_impl<8,4,false>(a,w,x,y,s,t,l,g);}
++
++
++kernel void kernel_astra_off32_k2_r8_b(constant ds4_metal_args_mul_mv &a [[buffer(0)]], device const char *w [[buffer(1)]],device const char *x [[buffer(2)]],device char *y [[buffer(3)]],threadgroup char *s [[threadgroup(0)]],uint3 t [[threadgroup_position_in_grid]],ushort l [[thread_index_in_simdgroup]],ushort g [[simdgroup_index_in_threadgroup]]) { astra_offset32_impl<8,2,true>(a,w,x,y,s,t,l,g); }
++kernel void kernel_astra_off32_k2_r8_f(constant ds4_metal_args_mul_mv &a [[buffer(0)]], device const char *w [[buffer(1)]],device const char *x [[buffer(2)]],device char *y [[buffer(3)]],threadgroup char *s [[threadgroup(0)]],uint3 t [[threadgroup_position_in_grid]],ushort l [[thread_index_in_simdgroup]],ushort g [[simdgroup_index_in_threadgroup]]) { astra_offset32_impl<8,2,false>(a,w,x,y,s,t,l,g); }
++kernel void kernel_astra_off32_k3_r8_b(constant ds4_metal_args_mul_mv &a [[buffer(0)]], device const char *w [[buffer(1)]],device const char *x [[buffer(2)]],device char *y [[buffer(3)]],threadgroup char *s [[threadgroup(0)]],uint3 t [[threadgroup_position_in_grid]],ushort l [[thread_index_in_simdgroup]],ushort g [[simdgroup_index_in_threadgroup]]) { astra_offset32_impl<8,3,true>(a,w,x,y,s,t,l,g); }
++kernel void kernel_astra_off32_k3_r8_f(constant ds4_metal_args_mul_mv &a [[buffer(0)]], device const char *w [[buffer(1)]],device const char *x [[buffer(2)]],device char *y [[buffer(3)]],threadgroup char *s [[threadgroup(0)]],uint3 t [[threadgroup_position_in_grid]],ushort l [[thread_index_in_simdgroup]],ushort g [[simdgroup_index_in_threadgroup]]) { astra_offset32_impl<8,3,false>(a,w,x,y,s,t,l,g); }
++kernel void kernel_astra_off32_k4_r8_b(constant ds4_metal_args_mul_mv &a [[buffer(0)]], device const char *w [[buffer(1)]],device const char *x [[buffer(2)]],device char *y [[buffer(3)]],threadgroup char *s [[threadgroup(0)]],uint3 t [[threadgroup_position_in_grid]],ushort l [[thread_index_in_simdgroup]],ushort g [[simdgroup_index_in_threadgroup]]) { astra_offset32_impl<8,4,true>(a,w,x,y,s,t,l,g); }
++kernel void kernel_astra_off32_k4_r8_f(constant ds4_metal_args_mul_mv &a [[buffer(0)]], device const char *w [[buffer(1)]],device const char *x [[buffer(2)]],device char *y [[buffer(3)]],threadgroup char *s [[threadgroup(0)]],uint3 t [[threadgroup_position_in_grid]],ushort l [[thread_index_in_simdgroup]],ushort g [[simdgroup_index_in_threadgroup]]) { astra_offset32_impl<8,4,false>(a,w,x,y,s,t,l,g); }
++
++
++
++// partials to part[(s * C + c) * R + r] (buffer 4), summed by kernel_llms_q4g64_ksr with the rb rounding. The X tile is staged as [token][k]
++// (conflict-free stores, loaded transposed); everything else is kernel_llms_q4g64's arithmetic. S = 1 is the layout change alone.
++struct llms_q4g_ks_args { int K; int R; int C; int rb; int S; };
++kernel void kernel_llms_q4g64_ks(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]],
++        device coherent(device) float * part [[buffer(4)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [64 tokens][32 k]
++    simdgroup_float8x8 acc[8];
++    for (int t = 0; t < 8; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    for (int b = b0; b < b1; b++) {
++        { const uint w = wq[b * 4 + wl]; const float sc = (float)ws[b];
++          threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((w >> (8 * j)) & 15u) - 8.f) * sc; o[2 * j + 1] = ((float)(int)((w >> (8 * j + 4)) & 15u) - 8.f) * sc; } }
++        for (int i = tid; i < 32 * 64; i += 256) { const int c = i >> 5, k = i & 31; Xs[c * 32 + k] = c < C ? x[(ulong)c * K + b * 32 + k] : 0.f; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < 8; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < 8; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < 64 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[((ulong)s * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++}
++// kernel_llms_q4g64_ksc: the same with the token-tile loop bounded by ceil(C / 8) (the x tile beyond C stays zero-filled)
++kernel void kernel_llms_q4g64_ksc(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]],
++        device coherent(device) float * part [[buffer(4)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int nt = (C + 7) / 8;   // only the token tiles that exist: the MMA count scales with C
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [64 tokens][32 k]
++    simdgroup_float8x8 acc[8];
++    for (int t = 0; t < 8; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    for (int b = b0; b < b1; b++) {
++        { const uint w = wq[b * 4 + wl]; const float sc = (float)ws[b];
++          threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((w >> (8 * j)) & 15u) - 8.f) * sc; o[2 * j + 1] = ((float)(int)((w >> (8 * j + 4)) & 15u) - 8.f) * sc; } }
++        for (int i = tid; i < 32 * 64; i += 256) { const int c = i >> 5, k = i & 31; Xs[c * 32 + k] = c < C ? x[(ulong)c * K + b * 32 + k] : 0.f; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < nt; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < 8; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < 64 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[((ulong)s * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++}
++kernel void kernel_llms_q4g64_ksr(constant llms_q4g_ks_args & a [[buffer(0)]], device const float * part [[buffer(4)]], device float * dst [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
++    const ulong n = (ulong)a.C * a.R; if (gid >= n) return;
++    float v = 0.f; for (int s = 0; s < a.S; s++) v += part[(ulong)s * n + gid];
++    if (a.rb) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++    dst[gid] = v;
++}
++// 18:4x: the STATIC token-tile variants (the runtime bound in _ksc spilled acc[] to memory: 3.6-9.6x slower at C = 64): NT = ceil(C / 8) tiles, picked by the host
++template<int NT>
++static inline void llms_q4g64_ks_impl(constant llms_q4g_ks_args & a, device const char * src0, device const float * x, device coherent(device) float * part, threadgroup float * sh, uint2 tg, ushort tid, ushort sg) {
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [64 tokens][32 k]
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    for (int b = b0; b < b1; b++) {
++        { const uint w = wq[b * 4 + wl]; const float sc = (float)ws[b];
++          threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((w >> (8 * j)) & 15u) - 8.f) * sc; o[2 * j + 1] = ((float)(int)((w >> (8 * j + 4)) & 15u) - 8.f) * sc; } }
++        for (int i = tid; i < 32 * NT * 8; i += 256) { const int c = i >> 5, k = i & 31; Xs[c * 32 + k] = c < C ? x[(ulong)c * K + b * 32 + k] : 0.f; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < NT; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[((ulong)s * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++}
++kernel void kernel_llms_q4g64_ks_nt1(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device coherent(device) float * part [[buffer(4)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ks_impl<1>(a, src0, x, part, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ks_nt2(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device coherent(device) float * part [[buffer(4)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ks_impl<2>(a, src0, x, part, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ks_nt3(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device coherent(device) float * part [[buffer(4)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ks_impl<3>(a, src0, x, part, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ks_nt4(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device coherent(device) float * part [[buffer(4)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ks_impl<4>(a, src0, x, part, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ks_nt8(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device coherent(device) float * part [[buffer(4)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ks_impl<8>(a, src0, x, part, sh, tg, tid, sg); }
++// 19:0x: the DIRECT S = 1 variants (ks_bench2: qb wants no split -- its bound is the x-tile traffic, which NT cuts -- so the partial + reduce pair is pure overhead there)
++template<int NT>
++static inline void llms_q4g64_ksd_impl(constant llms_q4g_ks_args & a, device const char * src0, device const float * x, device float * dst, threadgroup float * sh, uint2 tg, ushort tid, ushort sg) {   // S = 1, DIRECT: no partials, no reduce pass; the rb rounding here
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [64 tokens][32 k]
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    for (int b = b0; b < b1; b++) {
++        { const uint w = wq[b * 4 + wl]; const float sc = (float)ws[b];
++          threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((w >> (8 * j)) & 15u) - 8.f) * sc; o[2 * j + 1] = ((float)(int)((w >> (8 * j + 4)) & 15u) - 8.f) * sc; } }
++        for (int i = tid; i < 32 * NT * 8; i += 256) { const int c = i >> 5, k = i & 31; Xs[c * 32 + k] = c < C ? x[(ulong)c * K + b * 32 + k] : 0.f; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < NT; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) { float v = sh[c * 64 + r]; if (a.rb) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); } dst[(ulong)c * a.R + r0 + r] = v; }
++    }
++}
++kernel void kernel_llms_q4g64_ksd_nt1(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksd_impl<1>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksd_nt2(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksd_impl<2>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksd_nt3(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksd_impl<3>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksd_nt4(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksd_impl<4>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksd_nt8(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksd_impl<8>(a, src0, x, dst, sh, tg, tid, sg); }
++// 19:5x: the ATOMIC-COUNTER variants (ks_tl 19:51: in the engine's concurrent encoder the reduce pass's buffer barrier drains unrelated in-flight work -- sg 1345 -> 1291 us and sd 619 -> 1457 against the bench's 795 -> 448 / 465 -> 436; qa and kv_a gained as benched). One dispatch, grid (tiles, S): each split writes its partial, the last to arrive (an atomic per tile, buffer 5; reset by the reducer) sums and writes. Threadgroup memory: 64 x 64 floats + 1 uint.
++template<int NT>
++static inline void llms_q4g64_ksa_impl(constant llms_q4g_ks_args & a, device const char * src0, device const float * x, device float * dst, device coherent(device) float * part, device atomic_uint * cnt, threadgroup float * sh, uint2 tg, ushort tid, ushort sg) {   // ONE dispatch: the last-arriving split threadgroup of a tile sums the partials (no reduce pass, no encoder barrier)
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [64 tokens][32 k]
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    for (int b = b0; b < b1; b++) {
++        { const uint w = wq[b * 4 + wl]; const float sc = (float)ws[b];
++          threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((w >> (8 * j)) & 15u) - 8.f) * sc; o[2 * j + 1] = ((float)(int)((w >> (8 * j + 4)) & 15u) - 8.f) * sc; } }
++        for (int i = tid; i < 32 * NT * 8; i += 256) { const int c = i >> 5, k = i & 31; Xs[c * 32 + k] = c < C ? x[(ulong)c * K + b * 32 + k] : 0.f; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < NT; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[((ulong)s * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++    threadgroup_barrier(mem_flags::mem_device);   // this threadgroup's partial is visible device-wide before the arrival is counted
++    threadgroup uint * last = (threadgroup uint *)(sh + 64 * 64);
++    if (tid == 0) { atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++                    const uint prev = atomic_fetch_add_explicit(cnt + tg.x, 1u, memory_order_relaxed); *last = prev == (uint)(S - 1);
++                    if (*last) atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); }   // acquire every split's partial after the winning RMW
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (!*last) return;
++    if (tid == 0) atomic_store_explicit(cnt + tg.x, 0u, memory_order_relaxed);   // the counter is reusable without a fill
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) {
++            float v = 0.f; for (int q = 0; q < S - ((a.rb >> 1) & 1); q++) v += part[((ulong)q * C + c) * a.R + r0 + r];   /* rb bit 1: the CANARY */
++            if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * a.R + r0 + r] = v;
++        }
++    }
++}
++kernel void kernel_llms_q4g64_ksa_nt1(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksa_impl<1>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksa_nt2(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksa_impl<2>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksa_nt3(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksa_impl<3>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksa_nt4(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksa_impl<4>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksa_nt8(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksa_impl<8>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++
++
++// 5120) as an atomic one-dispatch K-split with the token tile bounded by C (NT = ceil(C / 8)): grid (R / 64 tiles, S splits, groups); split s
++// sums 32-blocks [nb s / S, nb (s + 1) / S); partials part[((g S + s) C + c) R + r] (coherent(device): the 15:1x fix); the last split of each
++// (group, tile) to arrive reduces into dst[c ds + g R + r] with the original's bf16 rounding. Same Q4L row layout as q4g64s.
++struct llms_q4gs_ks_args { int K; int R; int C; int rb; int S; int xs; int xg; int ds; ulong wg; };
++template<int NT>
++static inline void llms_q4gs_ksa_impl(constant llms_q4gs_ks_args & a, device const char * src0, device const float * x0, device float * dst0,
++        device coherent(device) float * part, device atomic_uint * cnt, threadgroup float * sh, uint3 tg, ushort tid, ushort sg) {
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y, g = (int)tg.z; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    device const char * src = src0 + (ulong)g * a.wg; device const float * x = x0 + (ulong)g * (ulong)a.xg; device float * dst = dst0 + (ulong)g * (ulong)a.R;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [NT * 8 tokens][32 k]
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    for (int b = b0; b < b1; b++) {
++        { const uint w = wq[b * 4 + wl]; const float sc = (float)ws[b];
++          threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((w >> (8 * j)) & 15u) - 8.f) * sc; o[2 * j + 1] = ((float)(int)((w >> (8 * j + 4)) & 15u) - 8.f) * sc; } }
++        for (int i = tid; i < 32 * NT * 8; i += 256) { const int c = i >> 5, k = i & 31; Xs[c * 32 + k] = c < C ? x[(ulong)c * (ulong)a.xs + b * 32 + k] : 0.f; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < NT; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (S == 1) {   // no split: the token-bounded tile writes dst directly (no partials, no counter)
++        for (int i = tid; i < NT * 8 * 64; i += 256) {
++            const int c = i >> 6, r = i & 63;
++            if (c < C && r0 + r < a.R) { float v = sh[c * 64 + r];
++                if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++                dst[(ulong)c * (ulong)a.ds + r0 + r] = v; }
++        }
++        return;
++    }
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[(((ulong)g * S + s) * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++    threadgroup_barrier(mem_flags::mem_device);
++    threadgroup uint * last = (threadgroup uint *)(sh + 64 * 64);
++    const uint ntiles = ((uint)a.R + 63u) / 64u;
++    if (tid == 0) { atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++                    const uint prev = atomic_fetch_add_explicit(cnt + (ulong)g * ntiles + tg.x, 1u, memory_order_relaxed); *last = prev == (uint)(S - 1);
++                    if (*last) atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); }
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (!*last) return;
++    if (tid == 0) atomic_store_explicit(cnt + (ulong)g * ntiles + tg.x, 0u, memory_order_relaxed);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) {
++            float v = 0.f; for (int q = 0; q < S - ((a.rb >> 1) & 1); q++) v += part[(((ulong)g * S + q) * C + c) * a.R + r0 + r];   /* rb bit 1: the CANARY */
++            if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * (ulong)a.ds + r0 + r] = v;
++        }
++    }
++}
++#define LLMS_Q4GS_KSA(NT) \
++kernel void kernel_llms_q4g64s_ksa_nt##NT(constant llms_q4gs_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x0 [[buffer(2)]], \
++        device float * dst0 [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], \
++        uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4gs_ksa_impl<NT>(a, src0, x0, dst0, part, cnt, sh, tg, tid, sg); }
++LLMS_Q4GS_KSA(1)
++LLMS_Q4GS_KSA(2)
++LLMS_Q4GS_KSA(3)
++LLMS_Q4GS_KSA(4)
++LLMS_Q4GS_KSA(5)
++LLMS_Q4GS_KSA(6)
++LLMS_Q4GS_KSA(7)
++LLMS_Q4GS_KSA(8)
++#undef LLMS_Q4GS_KSA
++
++
++// REGISTER PREFETCH of the next K block -- each thread loads block b+1's weight word, scale and 8 token values into registers before block b's
++// MMAs and writes them to the tiles after the next barrier. The live arithmetic, tiles, MMA order and output staging (bit-identical). ----
++static inline void llms_q4pf_body(const int K, const int R, const int C, const int rb, device const char * src, device const float * x, const ulong xs,
++                                  device float * dst, const ulong ds, threadgroup float * sh, const int r0, const ushort tid, const ushort sg) {
++    const int nb = K / 32; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [32 k][64 tokens]
++    simdgroup_float8x8 acc[8];
++    for (int t = 0; t < 8; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src + (ulong)min(r0 + wr, R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    uint wn = wq[wl]; float scn = (float)ws[0]; float xn[8];
++    for (int j = 0; j < 8; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * xs + k] : 0.f; }
++    for (int b = 0; b < nb; b++) {
++        { threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((wn >> (8 * j)) & 15u) - 8.f) * scn; o[2 * j + 1] = ((float)(int)((wn >> (8 * j + 4)) & 15u) - 8.f) * scn; } }
++        for (int j = 0; j < 8; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; Xs[k * 64 + c] = xn[j]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (b + 1 < nb) { wn = wq[(b + 1) * 4 + wl]; scn = (float)ws[b + 1];
++                          for (int j = 0; j < 8; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * xs + (b + 1) * 32 + k] : 0.f; } }
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < 8; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + kk * 8 * 64 + t * 8, 64); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < 8; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < 64 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < R) {
++            float v = sh[c * 64 + r];
++            if (rb) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * ds + r0 + r] = v;
++        }
++    }
++}
++kernel void kernel_llms_q4g64pf(constant llms_q4g_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]],
++        device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint tgx [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    llms_q4pf_body(a.K, a.R, a.C, a.rb, src0, x, (ulong)a.K, dst, (ulong)a.R, sh, (int)tgx * 64, tid, sg);
++}
++kernel void kernel_llms_q4g64spf(constant llms_q4gs_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x0 [[buffer(2)]],
++        device float * dst0 [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint3 tgp [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const int g = (int)tgp.z;
++    llms_q4pf_body(a.K, a.R, a.C, a.rb, src0 + (ulong)g * a.wg, x0 + (ulong)g * (ulong)a.xg, (ulong)a.xs, dst0 + (ulong)g * (ulong)a.R, (ulong)a.ds, sh, (int)tgp.x * 64, tid, sg);
++}
++
++
++template<int NT>
++static inline void llms_q4g64_ksdpf_impl(constant llms_q4g_ks_args & a, device const char * src0, device const float * x, device float * dst, threadgroup float * sh, uint2 tg, ushort tid, ushort sg) {   // S = 1, DIRECT: no partials, no reduce pass; the rb rounding here
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [64 tokens][32 k]
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    uint wn = 0u; float scn = 0.f; float xn[NT];   /* llms Q4G_PF: block b+1 prefetched into registers before block b's MMAs */
++    if (b0 < b1) { wn = wq[b0 * 4 + wl]; scn = (float)ws[b0]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * K + b0 * 32 + k] : 0.f; } }
++    for (int b = b0; b < b1; b++) {
++        { threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((wn >> (8 * j)) & 15u) - 8.f) * scn; o[2 * j + 1] = ((float)(int)((wn >> (8 * j + 4)) & 15u) - 8.f) * scn; } }
++        for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; Xs[c * 32 + k] = xn[j]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (b + 1 < b1) { wn = wq[(b + 1) * 4 + wl]; scn = (float)ws[b + 1]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * K + (b + 1) * 32 + k] : 0.f; } }
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < NT; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) { float v = sh[c * 64 + r]; if (a.rb) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); } dst[(ulong)c * a.R + r0 + r] = v; }
++    }
++}
++template<int NT>
++static inline void llms_q4g64_ksapf_impl(constant llms_q4g_ks_args & a, device const char * src0, device const float * x, device float * dst, device coherent(device) float * part, device atomic_uint * cnt, threadgroup float * sh, uint2 tg, ushort tid, ushort sg) {   // ONE dispatch: the last-arriving split threadgroup of a tile sums the partials (no reduce pass, no encoder barrier)
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [64 tokens][32 k]
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    uint wn = 0u; float scn = 0.f; float xn[NT];   /* llms Q4G_PF: block b+1 prefetched into registers before block b's MMAs */
++    if (b0 < b1) { wn = wq[b0 * 4 + wl]; scn = (float)ws[b0]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * K + b0 * 32 + k] : 0.f; } }
++    for (int b = b0; b < b1; b++) {
++        { threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((wn >> (8 * j)) & 15u) - 8.f) * scn; o[2 * j + 1] = ((float)(int)((wn >> (8 * j + 4)) & 15u) - 8.f) * scn; } }
++        for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; Xs[c * 32 + k] = xn[j]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (b + 1 < b1) { wn = wq[(b + 1) * 4 + wl]; scn = (float)ws[b + 1]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * K + (b + 1) * 32 + k] : 0.f; } }
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < NT; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[((ulong)s * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++    threadgroup_barrier(mem_flags::mem_device);   // this threadgroup's partial is visible device-wide before the arrival is counted
++    threadgroup uint * last = (threadgroup uint *)(sh + 64 * 64);
++    if (tid == 0) { atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++                    const uint prev = atomic_fetch_add_explicit(cnt + tg.x, 1u, memory_order_relaxed); *last = prev == (uint)(S - 1);
++                    if (*last) atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); }   // acquire every split's partial after the winning RMW
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (!*last) return;
++    if (tid == 0) atomic_store_explicit(cnt + tg.x, 0u, memory_order_relaxed);   // the counter is reusable without a fill
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) {
++            float v = 0.f; for (int q = 0; q < S - ((a.rb >> 1) & 1); q++) v += part[((ulong)q * C + c) * a.R + r0 + r];   /* rb bit 1: the CANARY */
++            if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * a.R + r0 + r] = v;
++        }
++    }
++}
++kernel void kernel_llms_q4g64_ksdpf_nt1(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdpf_impl<1>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksdpf_nt2(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdpf_impl<2>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksdpf_nt3(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdpf_impl<3>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksdpf_nt4(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdpf_impl<4>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksdpf_nt8(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdpf_impl<8>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksapf_nt1(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksapf_impl<1>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksapf_nt2(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksapf_impl<2>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksapf_nt3(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksapf_impl<3>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksapf_nt4(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksapf_impl<4>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksapf_nt8(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksapf_impl<8>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++
++
++static inline void llms_q4hpf_body(const int K, const int R, const int C, const int rb, device const char * src, device const float * x, const ulong xs,
++                                  device float * dst, const ulong ds, threadgroup float * sh, const int r0, const ushort tid, const ushort sg) {
++    const int nb = K / 32; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    threadgroup half * Ws = (threadgroup half *)sh;   // [64 rows][40] half (padded)
++    threadgroup half * Xs = Ws + 64 * 40;             // [32 k][72] half (padded)
++    simdgroup_float8x8 acc[8];
++    for (int t = 0; t < 8; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src + (ulong)min(r0 + wr, R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    uint wn = wq[wl]; float scn = (float)ws[0]; float xn[8];
++    for (int j = 0; j < 8; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * xs + k] : 0.f; }
++    for (int b = 0; b < nb; b++) {
++        { threadgroup half * o = Ws + wr * 40 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = (half)(((float)(int)((wn >> (8 * j)) & 15u) - 8.f) * scn); o[2 * j + 1] = (half)(((float)(int)((wn >> (8 * j + 4)) & 15u) - 8.f) * scn); } }
++        for (int j = 0; j < 8; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; Xs[k * 72 + c] = (half)xn[j]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (b + 1 < nb) { wn = wq[(b + 1) * 4 + wl]; scn = (float)ws[b + 1];
++                          for (int j = 0; j < 8; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * xs + (b + 1) * 32 + k] : 0.f; } }
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_half8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 40 + kk * 8, 40);
++            for (int t = 0; t < 8; t++) { simdgroup_half8x8 Bm; simdgroup_load(Bm, Xs + kk * 8 * 72 + t * 8, 72); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < 8; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < 64 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < R) {
++            float v = sh[c * 64 + r];
++            if (rb) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * ds + r0 + r] = v;
++        }
++    }
++}
++kernel void kernel_llms_q4g64hpf(constant llms_q4g_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]],
++        device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint tgx [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    llms_q4hpf_body(a.K, a.R, a.C, a.rb, src0, x, (ulong)a.K, dst, (ulong)a.R, sh, (int)tgx * 64, tid, sg);
++}
++kernel void kernel_llms_q4g64shpf(constant llms_q4gs_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x0 [[buffer(2)]],
++        device float * dst0 [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint3 tgp [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const int g = (int)tgp.z;
++    llms_q4hpf_body(a.K, a.R, a.C, a.rb, src0 + (ulong)g * a.wg, x0 + (ulong)g * (ulong)a.xg, (ulong)a.xs, dst0 + (ulong)g * (ulong)a.R, (ulong)a.ds, sh, (int)tgp.x * 64, tid, sg);
++}
++template<int NT>
++static inline void llms_q4g64_ksdhpf_impl(constant llms_q4g_ks_args & a, device const char * src0, device const float * x, device float * dst, threadgroup float * sh, uint2 tg, ushort tid, ushort sg) {   // S = 1, DIRECT: no partials, no reduce pass; the rb rounding here
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup half * Ws = (threadgroup half *)sh;   // [64 rows][40] half (padded)
++    threadgroup half * Xs = Ws + 64 * 40;             // [64 tokens][40] half (padded)
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    uint wn = 0u; float scn = 0.f; float xn[NT];   /* llms Q4G_PF: block b+1 prefetched into registers before block b's MMAs */
++    if (b0 < b1) { wn = wq[b0 * 4 + wl]; scn = (float)ws[b0]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * K + b0 * 32 + k] : 0.f; } }
++    for (int b = b0; b < b1; b++) {
++        { threadgroup half * o = Ws + wr * 40 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = (half)(((float)(int)((wn >> (8 * j)) & 15u) - 8.f) * scn); o[2 * j + 1] = (half)(((float)(int)((wn >> (8 * j + 4)) & 15u) - 8.f) * scn); } }
++        for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; Xs[c * 40 + k] = (half)xn[j]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (b + 1 < b1) { wn = wq[(b + 1) * 4 + wl]; scn = (float)ws[b + 1]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * K + (b + 1) * 32 + k] : 0.f; } }
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_half8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 40 + kk * 8, 40);
++            for (int t = 0; t < NT; t++) { simdgroup_half8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 40 + kk * 8, 40, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) { float v = sh[c * 64 + r]; if (a.rb) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); } dst[(ulong)c * a.R + r0 + r] = v; }
++    }
++}
++template<int NT>
++static inline void llms_q4g64_ksahpf_impl(constant llms_q4g_ks_args & a, device const char * src0, device const float * x, device float * dst, device coherent(device) float * part, device atomic_uint * cnt, threadgroup float * sh, uint2 tg, ushort tid, ushort sg) {   // ONE dispatch: the last-arriving split threadgroup of a tile sums the partials (no reduce pass, no encoder barrier)
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup half * Ws = (threadgroup half *)sh;   // [64 rows][40] half (padded)
++    threadgroup half * Xs = Ws + 64 * 40;             // [64 tokens][40] half (padded)
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src0 + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    uint wn = 0u; float scn = 0.f; float xn[NT];   /* llms Q4G_PF: block b+1 prefetched into registers before block b's MMAs */
++    if (b0 < b1) { wn = wq[b0 * 4 + wl]; scn = (float)ws[b0]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * K + b0 * 32 + k] : 0.f; } }
++    for (int b = b0; b < b1; b++) {
++        { threadgroup half * o = Ws + wr * 40 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = (half)(((float)(int)((wn >> (8 * j)) & 15u) - 8.f) * scn); o[2 * j + 1] = (half)(((float)(int)((wn >> (8 * j + 4)) & 15u) - 8.f) * scn); } }
++        for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; Xs[c * 40 + k] = (half)xn[j]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (b + 1 < b1) { wn = wq[(b + 1) * 4 + wl]; scn = (float)ws[b + 1]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * K + (b + 1) * 32 + k] : 0.f; } }
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_half8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 40 + kk * 8, 40);
++            for (int t = 0; t < NT; t++) { simdgroup_half8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 40 + kk * 8, 40, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[((ulong)s * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++    threadgroup_barrier(mem_flags::mem_device);   // this threadgroup's partial is visible device-wide before the arrival is counted
++    threadgroup uint * last = (threadgroup uint *)(sh + 64 * 64);
++    if (tid == 0) { atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++                    const uint prev = atomic_fetch_add_explicit(cnt + tg.x, 1u, memory_order_relaxed); *last = prev == (uint)(S - 1);
++                    if (*last) atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); }   // acquire every split's partial after the winning RMW
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (!*last) return;
++    if (tid == 0) atomic_store_explicit(cnt + tg.x, 0u, memory_order_relaxed);   // the counter is reusable without a fill
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) {
++            float v = 0.f; for (int q = 0; q < S - ((a.rb >> 1) & 1); q++) v += part[((ulong)q * C + c) * a.R + r0 + r];   /* rb bit 1: the CANARY */
++            if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * a.R + r0 + r] = v;
++        }
++    }
++}
++kernel void kernel_llms_q4g64_ksdhpf_nt1(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdhpf_impl<1>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksdhpf_nt2(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdhpf_impl<2>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksdhpf_nt3(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdhpf_impl<3>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksdhpf_nt4(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdhpf_impl<4>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksdhpf_nt8(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksdhpf_impl<8>(a, src0, x, dst, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksahpf_nt1(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksahpf_impl<1>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksahpf_nt2(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksahpf_impl<2>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksahpf_nt3(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksahpf_impl<3>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksahpf_nt4(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksahpf_impl<4>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++kernel void kernel_llms_q4g64_ksahpf_nt8(constant llms_q4g_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { llms_q4g64_ksahpf_impl<8>(a, src0, x, dst, part, cnt, sh, tg, tid, sg); }
++
++
++template<int NT>
++static inline void llms_q4gs_ksapf_impl(constant llms_q4gs_ks_args & a, device const char * src0, device const float * x0, device float * dst0,
++        device coherent(device) float * part, device atomic_uint * cnt, threadgroup float * sh, uint3 tg, ushort tid, ushort sg) {
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y, g = (int)tg.z; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    device const char * src = src0 + (ulong)g * a.wg; device const float * x = x0 + (ulong)g * (ulong)a.xg; device float * dst = dst0 + (ulong)g * (ulong)a.R;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup float * Ws = sh;            // [64 rows][32 k]
++    threadgroup float * Xs = sh + 64 * 32;  // [NT * 8 tokens][32 k]
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    uint wn = 0u; float scn = 0.f; float xn[NT];   /* llms Q4G_PF3: block b+1 prefetched into registers before block b's MMAs */
++    if (b0 < b1) { wn = wq[b0 * 4 + wl]; scn = (float)ws[b0]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * (ulong)a.xs + b0 * 32 + k] : 0.f; } }
++    for (int b = b0; b < b1; b++) {
++        { threadgroup float * o = Ws + wr * 32 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = ((float)(int)((wn >> (8 * j)) & 15u) - 8.f) * scn; o[2 * j + 1] = ((float)(int)((wn >> (8 * j + 4)) & 15u) - 8.f) * scn; } }
++        for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; Xs[c * 32 + k] = xn[j]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (b + 1 < b1) { wn = wq[(b + 1) * 4 + wl]; scn = (float)ws[b + 1]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * (ulong)a.xs + (b + 1) * 32 + k] : 0.f; } }
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_float8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 32 + kk * 8, 32);
++            for (int t = 0; t < NT; t++) { simdgroup_float8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 32 + kk * 8, 32, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (S == 1) {   // no split: the token-bounded tile writes dst directly (no partials, no counter)
++        for (int i = tid; i < NT * 8 * 64; i += 256) {
++            const int c = i >> 6, r = i & 63;
++            if (c < C && r0 + r < a.R) { float v = sh[c * 64 + r];
++                if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++                dst[(ulong)c * (ulong)a.ds + r0 + r] = v; }
++        }
++        return;
++    }
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[(((ulong)g * S + s) * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++    threadgroup_barrier(mem_flags::mem_device);
++    threadgroup uint * last = (threadgroup uint *)(sh + 64 * 64);
++    const uint ntiles = ((uint)a.R + 63u) / 64u;
++    if (tid == 0) { atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++                    const uint prev = atomic_fetch_add_explicit(cnt + (ulong)g * ntiles + tg.x, 1u, memory_order_relaxed); *last = prev == (uint)(S - 1);
++                    if (*last) atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); }
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (!*last) return;
++    if (tid == 0) atomic_store_explicit(cnt + (ulong)g * ntiles + tg.x, 0u, memory_order_relaxed);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) {
++            float v = 0.f; for (int q = 0; q < S - ((a.rb >> 1) & 1); q++) v += part[(((ulong)g * S + q) * C + c) * a.R + r0 + r];   /* rb bit 1: the CANARY */
++            if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * (ulong)a.ds + r0 + r] = v;
++        }
++    }
++}
++#define LLMS_Q4GS_KSAPF(NT) \
++kernel void kernel_llms_q4g64s_ksapf_nt##NT(constant llms_q4gs_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x0 [[buffer(2)]], \
++        device float * dst0 [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], \
++        uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4gs_ksapf_impl<NT>(a, src0, x0, dst0, part, cnt, sh, tg, tid, sg); }
++LLMS_Q4GS_KSAPF(1)
++LLMS_Q4GS_KSAPF(2)
++LLMS_Q4GS_KSAPF(3)
++LLMS_Q4GS_KSAPF(4)
++LLMS_Q4GS_KSAPF(5)
++LLMS_Q4GS_KSAPF(6)
++LLMS_Q4GS_KSAPF(7)
++LLMS_Q4GS_KSAPF(8)
++#undef LLMS_Q4GS_KSAPF
++
++// ---- llms Q4G_PF3 + HPF: the half-padded twin ----
++template<int NT>
++static inline void llms_q4gs_ksahpf_impl(constant llms_q4gs_ks_args & a, device const char * src0, device const float * x0, device float * dst0,
++        device coherent(device) float * part, device atomic_uint * cnt, threadgroup float * sh, uint3 tg, ushort tid, ushort sg) {
++    const int K = a.K, nb = K / 32, r0 = (int)tg.x * 64, C = a.C, S = a.S, s = (int)tg.y, g = (int)tg.z; const ulong rowb = (ulong)K / 2 + (ulong)nb * 2;
++    device const char * src = src0 + (ulong)g * a.wg; device const float * x = x0 + (ulong)g * (ulong)a.xg; device float * dst = dst0 + (ulong)g * (ulong)a.R;
++    const int b0 = (int)((long)nb * s / S), b1 = (int)((long)nb * (s + 1) / S);
++    threadgroup half * Ws = (threadgroup half *)sh;   // [64 rows][40] half (padded)
++    threadgroup half * Xs = Ws + 64 * 40;             // [NT * 8 tokens][40] half (padded)
++    simdgroup_float8x8 acc[NT];
++    for (int t = 0; t < NT; t++) acc[t] = simdgroup_float8x8(0.f);
++    const int wr = tid >> 2, wl = tid & 3;
++    device const char * rp = src + (ulong)min(r0 + wr, a.R - 1) * rowb;
++    device const uint * wq = (device const uint *)rp; device const half * ws = (device const half *)(rp + K / 2);
++    uint wn = 0u; float scn = 0.f; float xn[NT];   /* llms Q4G_PF3: block b+1 prefetched into registers before block b's MMAs */
++    if (b0 < b1) { wn = wq[b0 * 4 + wl]; scn = (float)ws[b0]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * (ulong)a.xs + b0 * 32 + k] : 0.f; } }
++    for (int b = b0; b < b1; b++) {
++        { threadgroup half * o = Ws + wr * 40 + wl * 8;
++          for (int j = 0; j < 4; j++) { o[2 * j] = (half)(((float)(int)((wn >> (8 * j)) & 15u) - 8.f) * scn); o[2 * j + 1] = (half)(((float)(int)((wn >> (8 * j + 4)) & 15u) - 8.f) * scn); } }
++        for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; Xs[c * 40 + k] = (half)xn[j]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (b + 1 < b1) { wn = wq[(b + 1) * 4 + wl]; scn = (float)ws[b + 1]; for (int j = 0; j < NT; j++) { const int i = tid + 256 * j, c = i >> 5, k = i & 31; xn[j] = c < C ? x[(ulong)c * (ulong)a.xs + (b + 1) * 32 + k] : 0.f; } }
++        for (int kk = 0; kk < 4; kk++) {
++            simdgroup_half8x8 Am; simdgroup_load(Am, Ws + sg * 8 * 40 + kk * 8, 40);
++            for (int t = 0; t < NT; t++) { simdgroup_half8x8 Bm; simdgroup_load(Bm, Xs + t * 8 * 40 + kk * 8, 40, ulong2(0, 0), true); simdgroup_multiply_accumulate(acc[t], Am, Bm, acc[t]); }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    for (int t = 0; t < NT; t++) simdgroup_store(acc[t], sh + (t * 8) * 64 + sg * 8, 64, ulong2(0, 0), true);   // sh[token][row]
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (S == 1) {   // no split: the token-bounded tile writes dst directly (no partials, no counter)
++        for (int i = tid; i < NT * 8 * 64; i += 256) {
++            const int c = i >> 6, r = i & 63;
++            if (c < C && r0 + r < a.R) { float v = sh[c * 64 + r];
++                if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++                dst[(ulong)c * (ulong)a.ds + r0 + r] = v; }
++        }
++        return;
++    }
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) part[(((ulong)g * S + s) * C + c) * a.R + r0 + r] = sh[c * 64 + r];
++    }
++    threadgroup_barrier(mem_flags::mem_device);
++    threadgroup uint * last = (threadgroup uint *)(sh + 64 * 64);
++    const uint ntiles = ((uint)a.R + 63u) / 64u;
++    if (tid == 0) { atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++                    const uint prev = atomic_fetch_add_explicit(cnt + (ulong)g * ntiles + tg.x, 1u, memory_order_relaxed); *last = prev == (uint)(S - 1);
++                    if (*last) atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device); }
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (!*last) return;
++    if (tid == 0) atomic_store_explicit(cnt + (ulong)g * ntiles + tg.x, 0u, memory_order_relaxed);
++    for (int i = tid; i < NT * 8 * 64; i += 256) {
++        const int c = i >> 6, r = i & 63;
++        if (c < C && r0 + r < a.R) {
++            float v = 0.f; for (int q = 0; q < S - ((a.rb >> 1) & 1); q++) v += part[(((ulong)g * S + q) * C + c) * a.R + r0 + r];   /* rb bit 1: the CANARY */
++            if (a.rb & 1) { uint bits = as_type<uint>(v); if ((bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u); v = as_type<float>(bits & 0xffff0000u); }
++            dst[(ulong)c * (ulong)a.ds + r0 + r] = v;
++        }
++    }
++}
++#define LLMS_Q4GS_KSAHPF(NT) \
++kernel void kernel_llms_q4g64s_ksahpf_nt##NT(constant llms_q4gs_ks_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x0 [[buffer(2)]], \
++        device float * dst0 [[buffer(3)]], device coherent(device) float * part [[buffer(4)]], device atomic_uint * cnt [[buffer(5)]], threadgroup float * sh [[threadgroup(0)]], \
++        uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4gs_ksahpf_impl<NT>(a, src0, x0, dst0, part, cnt, sh, tg, tid, sg); }
++LLMS_Q4GS_KSAHPF(1)
++LLMS_Q4GS_KSAHPF(2)
++LLMS_Q4GS_KSAHPF(3)
++LLMS_Q4GS_KSAHPF(4)
++LLMS_Q4GS_KSAHPF(5)
++LLMS_Q4GS_KSAHPF(6)
++LLMS_Q4GS_KSAHPF(7)
++LLMS_Q4GS_KSAHPF(8)
++#undef LLMS_Q4GS_KSAHPF
++
++
++// logit stored at dst[ids[i]]; every other logit keeps what the host put there (-inf, written once). The same lanes, block stride and
++// reduction as llms_q4l_mv_impl<4, false> (each row's sum is independent of its threadgroup's other rows: bit-equal logits on V'). ----
++[[host_name("kernel_llms_q4l_mv_ix")]]
++kernel void kernel_llms_q4l_mv_ix(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++                                  device const int * ids [[buffer(4)]], threadgroup char * shmem [[threadgroup(0)]],
++                                  uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    const short NSG = FC_mul_mv_nsg;
++    constexpr short NR0 = 4;
++    const int K = args.ne00, nb = K / 32, n = args.ne01;
++    const int i0 = tgpig.x * NR0;
++    device const float * y = (device const float *) src1;
++    device const uint * wq[NR0]; device const half * ws[NR0]; int rid[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        rid[row] = ids[min(i0 + row, n - 1)];
++        device const char * rp = src0 + (ulong)rid[row] * args.nb01;
++        wq[row] = (device const uint *) rp; ws[row] = (device const half *) (rp + K / 2);
++    }
++    float sumf[NR0] = { 0.f };
++    const short ix = tiisg / 4, il = tiisg % 4;
++    for (int ib = sgitg * 8 + ix; ib < nb; ib += NSG * 8) {
++        const float4 ya = *((device const float4 *) (y + ib * 32 + il * 8));
++        const float4 yb = *((device const float4 *) (y + ib * 32 + il * 8 + 4));
++        FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            sumf[row] += llms_q4l_dot8(wq[row][ib * 4 + il], ya, yb) * (float) ws[row][ib];
++        }
++    }
++    threadgroup float * sh = (threadgroup float *) shmem;
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        if (sgitg == 0) sh[32 * row + tiisg] = 0.0f;
++        sumf[row] = simd_sum(sumf[row]);
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    FOR_UNROLL (short row = 0; row < NR0; ++row) { if (tiisg == 0) sh[32 * row + sgitg] = sumf[row]; }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (short row = 0; row < NR0 && i0 + row < n; ++row) {
++        const float tot = simd_sum(sh[32 * row + tiisg]);
++        if (tiisg == 0 && sgitg == 0) ((device float *) dst)[rid[row]] = tot;
++    }
++}
++
++
++// [0, ga) matrix A, [ga, ga + gb) matrix B, each running llms_q4l_mv_kxh_impl<4, 2, true> as the separate _k2_r4_bxh dispatch does ----
++[[host_name("kernel_llms_q4l_mv_k2_r4_bxh_d2")]]
++kernel void kernel_llms_q4l_mv_k2_r4_bxh_d2(constant ds4_metal_args_mul_mv & aa [[buffer(0)]], device const char * wa [[buffer(1)]], device const char * src1 [[buffer(2)]],
++        device char * da [[buffer(3)]], constant ds4_metal_args_mul_mv & ab [[buffer(4)]], device const char * wb [[buffer(5)]], device char * db [[buffer(6)]],
++        constant uint * gp [[buffer(7)]], threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]],
++        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    if (tgpig.x < gp[0]) { llms_q4l_mv_kxh_impl<4, 2, true>(aa, wa, src1, da, shmem, tgpig, tiisg, sgitg); return; }
++    llms_q4l_mv_kxh_impl<4, 2, true>(ab, wb, src1, db, shmem, uint3(tgpig.x - gp[0], tgpig.y, tgpig.z), tiisg, sgitg);
++}
++
++
++// simdgroup 0 of the extra threadgroup, the one-row dual's exact code (kernel_llms_q4l_mv_b2) with the row's offset ----
++struct llms_k2s_args { uint ga, gb, sk, rows; int iters; float eps; };
++static inline void llms_k2s_split_row(device const float * mix, device const float * scale, device const float * base, device float * out, int iters, float epsv) {
++    const float pre_scale = scale[0], post_scale = scale[1], comb_scale = scale[2];
++    const float4 pre_z = *((device const float4 *) mix) * pre_scale + *((device const float4 *) base);
++    *((device float4 *) out) = llms_d2_sigmoid(pre_z) + epsv;
++    const float4 post_z = *((device const float4 *) (mix + 4)) * post_scale + *((device const float4 *) (base + 4));
++    *((device float4 *) (out + 4)) = llms_d2_twice_sigmoid(post_z);
++    float4 r0 = *((device const float4 *) (mix +  8)) * comb_scale + *((device const float4 *) (base +  8));
++    float4 r1 = *((device const float4 *) (mix + 12)) * comb_scale + *((device const float4 *) (base + 12));
++    float4 r2 = *((device const float4 *) (mix + 16)) * comb_scale + *((device const float4 *) (base + 16));
++    float4 r3 = *((device const float4 *) (mix + 20)) * comb_scale + *((device const float4 *) (base + 20));
++    const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
++    const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
++    const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
++    const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
++    r0 = exp(r0 - m0);
++    r1 = exp(r1 - m1);
++    r2 = exp(r2 - m2);
++    r3 = exp(r3 - m3);
++    r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
++    r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
++    r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
++    r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
++    float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++    r0 *= col_inv;
++    r1 *= col_inv;
++    r2 *= col_inv;
++    r3 *= col_inv;
++    for (int iter = 1; iter < iters; ++iter) {
++        r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
++        r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
++        r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
++        r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
++        col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
++        r0 *= col_inv;
++        r1 *= col_inv;
++        r2 *= col_inv;
++        r3 *= col_inv;
++    }
++    *((device float4 *) (out +  8)) = r0;
++    *((device float4 *) (out + 12)) = r1;
++    *((device float4 *) (out + 16)) = r2;
++    *((device float4 *) (out + 20)) = r3;
++}
++#define LLMS_K2S(VAR, IMPL) \
++[[host_name("kernel_llms_q4l_mv_k2_r4_" #VAR "_d2s")]] \
++kernel void kernel_llms_q4l_mv_k2_r4_##VAR##_d2s(constant ds4_metal_args_mul_mv & aa [[buffer(0)]], device const char * wa [[buffer(1)]], device const char * src1 [[buffer(2)]], \
++        device char * da [[buffer(3)]], constant ds4_metal_args_mul_mv & ab [[buffer(4)]], device const char * wb [[buffer(5)]], device char * db [[buffer(6)]], \
++        constant llms_k2s_args & p [[buffer(7)]], device const float * mix [[buffer(8)]], device const float * scale [[buffer(9)]], device const float * base [[buffer(10)]], \
++        device float * split [[buffer(11)]], threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], \
++        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    if (tgpig.x < p.ga) { IMPL<4, 2, true>(aa, wa, src1, da, shmem, tgpig, tiisg, sgitg); return; } \
++    if (tgpig.x < p.ga + p.gb) { IMPL<4, 2, true>(ab, wb, src1, db, shmem, uint3(tgpig.x - p.ga, tgpig.y, tgpig.z), tiisg, sgitg); return; } \
++    if (!p.sk || sgitg != 0 || tiisg >= p.rows) return; \
++    llms_k2s_split_row(mix + 24u * tiisg, scale, base, split + 24u * tiisg, p.iters, p.eps); }
++LLMS_K2S(bxh, llms_q4l_mv_kxh_impl)
++#undef LLMS_K2S
++
++
++#define LLMS_Q4KFXH(NR, KCOL) \
++[[host_name("kernel_llms_q4l_mv_k" #KCOL "_r" #NR "_fxh")]] \
++kernel void kernel_llms_q4l_mv_k##KCOL##_r##NR##_fxh(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst, \
++    threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4l_mv_kxh_impl<NR, KCOL, false>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++LLMS_Q4KFXH(8, 2)
++LLMS_Q4KFXH(8, 3)
++#undef LLMS_Q4KFXH
++
++
++template<short NR0, short KC, bool RB>
++static inline void llms_q4l_mv_kgxh_impl(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++                                      threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg & 0xFF; const bool LEAN = (FC_mul_mv_nsg & 0x100) != 0;   /* llms Q4L_LEAN2: the flag rides the NSG constant */
++    const int K = args.ne00, nb = K / 32, gz = (int)tgpig.z;
++    const int r0 = tgpig.x * NR0;
++    device const char * wg = src0 + (ulong)gz * args.nb02;
++    device const uint * wq[NR0]; device const half * ws[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const int r = min(r0 + row, args.ne01 - 1);
++        device const char * rp = wg + (ulong)r * args.nb01;
++        wq[row] = (device const uint *) rp; ws[row] = (device const half *) (rp + K / 2);
++    }
++    float sumf[KC][NR0];
++    FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[c][row] = 0.f;
++    const short ix = tiisg / 4, il = tiisg % 4;
++    for (int ib = sgitg * 8 + ix; ib < nb; ib += NSG * 8) {
++        float4 ya[KC], yb[KC];
++        FOR_UNROLL (short c = 0; c < KC; ++c) {
++            device const half * y = (device const half *) (src1 + (ulong)gz * args.nb11 + (ulong)c * args.nb12);   /* llms KGX: x as half [row][group][K] */
++            ya[c] = float4(*((device const half4 *) (y + ib * 32 + il * 8)));
++            yb[c] = float4(*((device const half4 *) (y + ib * 32 + il * 8 + 4)));
++        }
++        FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const uint w = wq[row][ib * 4 + il];
++            const float sc = (float) ws[row][ib];
++            const half2 h0 = as_type<half2>(( w        & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h1 = as_type<half2>(((w >>  4) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h2 = as_type<half2>(((w >>  8) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h3 = as_type<half2>(((w >> 12) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            FOR_UNROLL (short c = 0; c < KC; ++c) {
++                const float4 a = ya[c], b = yb[c];
++                half2 p = h0 * half2((half)a.x, (half)b.x);
++                p = fma(h1, half2((half)a.y, (half)b.y), p);
++                p = fma(h2, half2((half)a.z, (half)b.z), p);
++                p = fma(h3, half2((half)a.w, (half)b.w), p);
++                sumf[c][row] += ((float)p.x + (float)p.y) * sc;
++            }
++        }
++    }
++#ifndef LLMS_Q4L_LEAN2_OFF
++    if (LEAN && NSG == 2) {
++        threadgroup float * part = (threadgroup float *) shmem;
++        FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const float v = simd_sum(sumf[c][row]);
++            if (sgitg == 1 && tiisg == 0) part[c * NR0 + row] = v;
++            sumf[c][row] = v;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg == 0 && tiisg == 0) FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            if (r0 + row >= args.ne01) continue;
++            float tot = (sumf[c][row] + part[c * NR0 + row]) + 0.0f;
++            if (RB) { uint bits = as_type<uint>(tot); if ((bits & 0x7f800000u) != 0x7f800000u) bits += LLMS_MVB16_CANARY ? 0u : (0x7fffu + ((bits >> 16u) & 1u)); tot = as_type<float>(bits & 0xffff0000u); }
++            ((device float *) (dst + (ulong)c * args.nb13) + (ulong)gz * args.ne01)[r0 + row] = tot;
++        }
++        return;
++    }
++#endif
++    FOR_UNROLL (short c = 0; c < KC; ++c) {
++        if (c) threadgroup_barrier(mem_flags::mem_threadgroup);
++        device float * dc = (device float *) (dst + (ulong)c * args.nb13) + (ulong)gz * args.ne01;
++        if (RB) llms_mv_reduce_and_write_b<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++        else    helper_mv_reduce_and_write<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++    }
++}
++[[host_name("kernel_llms_q4l_mv_kgxh2")]]
++kernel void kernel_llms_q4l_mv_kgxh2(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++    threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    llms_q4l_mv_kgxh_impl<4, 2, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++[[host_name("kernel_llms_q4l_mv_kgxh3")]]
++kernel void kernel_llms_q4l_mv_kgxh3(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++    threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    llms_q4l_mv_kgxh_impl<4, 3, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++
++
++// kernel_llms_hc_pre_fused_rows's mixer code (threadgroups 0-23) with its runtime loop structure (the flat-norm partials are written for any
++// thread count; the 8-simdgroup dot runs as virtual simdgroups vs = sgitg, sgitg + 2, ...); the last of a row's 24 writes the mix and runs
++// llms_k2s_split_row (K2SPLIT's exact split) ----
++struct llms_k2m_args { uint ga, gb, nm, rows; int iters; float eps; int n; float rms_eps; int ntg; };
++static inline void llms_k2m_mix_tg(constant llms_k2m_args & p, device const float * hin, device const half * fn, device float * mixo, device atomic_uint * scr,
++        device const float * scale, device const float * base, device float * split, threadgroup float * shm, uint t, ushort tiisg, ushort sgitg) {
++    /* v2 (make_mixdual2.py): threadgroup t = (row, output j, quarter q); simdgroup s is the HC kernel's virtual simdgroup vs = 2 q + s of its dot.
++       scr per row (256 words): [0, 192) the partials sr[j][vs], [192, 216) the outputs, [216, 240) the per-output counts, 255 the row count */
++    const uint row = t / 96u, jq = t % 96u, j = jq / 4u, q = jq % 4u;
++    const int n = p.n; const int vs = 2 * (int)q + (int)sgitg;
++    device const float4 * x4 = (device const float4 *) (hin + (ulong)row * (ulong)n);
++    device atomic_uint * sr_row = scr + 256u * row;
++    threadgroup uint * flag = (threadgroup uint *) shm;
++    const float sc = mixo[24ul * row];   /* parked by kernel_llms_hc_pre_fused_rows_xs: the flat-norm scale of this row's stream */
++    const short ix = tiisg/2, il = tiisg%2;
++    const int nb = n/32;
++    device const half4 * w4 = (device const half4 *) (fn + (ulong)j * (ulong)n);
++    float sr = 0.0f;
++    for (int ib = vs*16 + ix; ib < nb; ib += 8*16) {
++        const int b4 = (ib*32 + il*16)/4;
++        float4 yl4[4];
++        for (short i = 0; i < 4; ++i) yl4[i] = as_type<float4>(as_type<uint4>(x4[b4 + i]*sc));
++        float sumq = 0.f;
++        FOR_UNROLL (short i = 0; i < 4; ++i) sumq += dot(float4(w4[b4 + i]), float4(yl4[i]));
++        sr += sumq;
++    }
++    sr = simd_sum(sr);
++    if (tiisg == 0) atomic_store_explicit(&sr_row[8u * j + (uint)vs], as_type<uint>(sr), memory_order_relaxed);
++    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
++    if (sgitg == 0 && tiisg == 0) { const uint old = atomic_fetch_add_explicit(&sr_row[216u + j], 1u, memory_order_relaxed); flag[0] = old == 3u ? 1u : 0u; }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (flag[0] == 0u || sgitg != 0) return;
++    /* the last of output j's four: the original's tot = simd_sum(red2[tiisg]) with red2 = the 8 partials and zeros */
++    const float v = tiisg < 8 ? as_type<float>(atomic_load_explicit(&sr_row[8u * j + tiisg], memory_order_relaxed)) : 0.0f;
++    const float tot = simd_sum(v);
++    if (tiisg != 0) return;
++    atomic_store_explicit(&sr_row[216u + j], 0u, memory_order_relaxed);
++    atomic_store_explicit(&sr_row[192u + j], as_type<uint>(tot), memory_order_relaxed);
++    const uint oldr = atomic_fetch_add_explicit(&sr_row[255u], 1u, memory_order_relaxed);
++    if (oldr != 23u) return;
++    atomic_store_explicit(&sr_row[255u], 0u, memory_order_relaxed);
++    device float * mrow = mixo + 24ul * row;
++    for (int k = 0; k < 24; ++k) mrow[k] = as_type<float>(atomic_load_explicit(&sr_row[192u + (uint)k], memory_order_relaxed));
++    llms_k2s_split_row(mrow, scale, base, split + 24ul * row, p.iters, p.eps);
++}
++#define LLMS_K2M(VAR, IMPL) \
++[[host_name("kernel_llms_q4l_mv_k2_r4_" #VAR "_d2m")]] \
++kernel void kernel_llms_q4l_mv_k2_r4_##VAR##_d2m(constant ds4_metal_args_mul_mv & aa [[buffer(0)]], device const char * wa [[buffer(1)]], device const char * src1 [[buffer(2)]], \
++        device char * da [[buffer(3)]], constant ds4_metal_args_mul_mv & ab [[buffer(4)]], device const char * wb [[buffer(5)]], device char * db [[buffer(6)]], \
++        constant llms_k2m_args & p [[buffer(7)]], device const float * hin [[buffer(8)]], device const half * fn [[buffer(9)]], device float * mixo [[buffer(10)]], \
++        device atomic_uint * scr [[buffer(11)]], device const float * scale [[buffer(12)]], device const float * base [[buffer(13)]], device float * split [[buffer(14)]], \
++        threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], \
++        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    if (tgpig.x < p.nm) { llms_k2m_mix_tg(p, hin, fn, mixo, scr, scale, base, split, (threadgroup float *) shmem, tgpig.x, tiisg, sgitg); return; } \
++    const uint t = tgpig.x - p.nm; \
++    if (t < p.ga) { IMPL<4, 2, true>(aa, wa, src1, da, shmem, uint3(t, tgpig.y, tgpig.z), tiisg, sgitg); return; } \
++    IMPL<4, 2, true>(ab, wb, src1, db, shmem, uint3(t - p.ga, tgpig.y, tgpig.z), tiisg, sgitg); }
++LLMS_K2M(bxh, llms_q4l_mv_kxh_impl)
++#undef LLMS_K2M
++
++
++template<short NR0, short KC, bool RB>
++static inline void llms_q4l_mv_kxh1_impl(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst,
++                                      threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg & 0xFF; const bool LEAN = (FC_mul_mv_nsg & 0x100) != 0;   /* llms Q4L_LEAN2: the flag rides the NSG constant */
++    const int K = args.ne00, nb = K / 32;
++    const int r0 = tgpig.x * NR0;
++    device const uint * wq[NR0]; device const half * ws[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const int r = min(r0 + row, args.ne01 - 1);
++        device const char * rp = src0 + (ulong)r * args.nb01;
++        wq[row] = (device const uint *) rp; ws[row] = (device const half *) (rp + K / 2);
++    }
++    float sumf[KC][NR0];
++    FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[c][row] = 0.f;
++    const short ix = tiisg / 4, il = tiisg % 4;
++    for (int ib = sgitg * 8 + ix; ib < nb; ib += NSG * 8) {
++        float4 ya[KC], yb[KC];
++        FOR_UNROLL (short c = 0; c < KC; ++c) {
++            device const half * y = (device const half *) src1 + (ulong)c * (ulong)args.ne00;   /* x as half: the f32->f16 copy's row stride = ne00 halves (apply_hx.py) */
++            ya[c] = float4(*((device const half4 *) (y + ib * 32 + il * 8)));
++            yb[c] = float4(*((device const half4 *) (y + ib * 32 + il * 8 + 4)));
++        }
++        FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const uint w = wq[row][ib * 4 + il];
++            const float sc = (float) ws[row][ib];
++            const half2 h0 = as_type<half2>(( w        & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h1 = as_type<half2>(((w >>  4) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h2 = as_type<half2>(((w >>  8) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            const half2 h3 = as_type<half2>(((w >> 12) & 0x000F000Fu) | 0x64006400u) - half2(1032.0h);
++            FOR_UNROLL (short c = 0; c < KC; ++c) {
++                const float4 a = ya[c], b = yb[c];
++                half2 p = h0 * half2((half)a.x, (half)b.x);
++                p = fma(h1, half2((half)a.y, (half)b.y), p);
++                p = fma(h2, half2((half)a.z, (half)b.z), p);
++                p = fma(h3, half2((half)a.w, (half)b.w), p);
++                sumf[c][row] += ((float)p.x + (float)p.y) * sc;
++            }
++        }
++    }
++    if (NSG == 1 && RB) {   /* llms Q4L_N1X: one simdgroup holds the whole sum -- the direct epilogue (the generic one's second sum only adds zeros) */
++        FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const float tot = simd_sum(sumf[c][row]) + 0.0f;
++            if (tiisg == 0 && r0 + row < args.ne01) {
++                uint bits = as_type<uint>(tot);
++                if ((bits & 0x7f800000u) != 0x7f800000u) bits += LLMS_MVB16_CANARY ? 0u : (0x7fffu + ((bits >> 16u) & 1u));
++                ((device float *) (dst + (ulong)c * (ulong)args.ne01 * 4u))[r0 + row] = as_type<float>(bits & 0xffff0000u);
++            }
++        }
++        return;
++    }
++#ifndef LLMS_Q4L_LEAN2_OFF
++    if (LEAN && NSG == 2) {
++        threadgroup float * part = (threadgroup float *) shmem;
++        FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            const float v = simd_sum(sumf[c][row]);
++            if (sgitg == 1 && tiisg == 0) part[c * NR0 + row] = v;
++            sumf[c][row] = v;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sgitg == 0 && tiisg == 0) FOR_UNROLL (short c = 0; c < KC; ++c) FOR_UNROLL (short row = 0; row < NR0; ++row) {
++            if (r0 + row >= args.ne01) continue;
++            float tot = (sumf[c][row] + part[c * NR0 + row]) + 0.0f;
++            if (RB) { uint bits = as_type<uint>(tot); if ((bits & 0x7f800000u) != 0x7f800000u) bits += LLMS_MVB16_CANARY ? 0u : (0x7fffu + ((bits >> 16u) & 1u)); tot = as_type<float>(bits & 0xffff0000u); }
++            ((device float *) (dst + (ulong)c * (ulong)args.ne01 * 4u))[r0 + row] = tot;
++        }
++        return;
++    }
++#endif
++    FOR_UNROLL (short c = 0; c < KC; ++c) {
++        if (c) threadgroup_barrier(mem_flags::mem_threadgroup);
++        device float * dc = (device float *) (dst + (ulong)c * (ulong)args.ne01 * 4u);
++        if (RB) llms_mv_reduce_and_write_b<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++        else    helper_mv_reduce_and_write<NR0>(dc, sumf[c], r0, args.ne01, tiisg, sgitg, shmem);
++    }
++}
++#define LLMS_Q4KBXHN1X(NR, KCOL) \
++[[host_name("kernel_llms_q4l_mv_k" #KCOL "_r" #NR "_bxh_n1x")]] \
++kernel void kernel_llms_q4l_mv_k##KCOL##_r##NR##_bxh_n1x(constant ds4_metal_args_mul_mv & args, device const char * src0, device const char * src1, device char * dst, \
++    threadgroup char * shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
++    llms_q4l_mv_kxh1_impl<NR, KCOL, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); }
++LLMS_Q4KBXHN1X(4, 2)
++LLMS_Q4KBXHN1X(8, 2)
++LLMS_Q4KBXHN1X(4, 3)
++LLMS_Q4KBXHN1X(8, 3)
++#undef LLMS_Q4KBXHN1X

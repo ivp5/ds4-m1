@@ -200,6 +200,67 @@ kernel void kernel_flash_attn_ext_pad(
     }
 }
 
+
+kernel void kernel_flash_attn_ext_pad_v16(
+        constant ds4_metal_args_flash_attn_ext_pad & args,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const int32_t C = FC_flash_attn_ext_pad_ncpsg;
+
+    device char * k_pad    = dst;
+    device char * v_pad    = k_pad + args.nb11*C*args.ne_12_2*args.ne_12_3;
+    device char * mask_pad = v_pad + args.nb21*C*args.ne_12_2*args.ne_12_3;
+
+    const int32_t icp = args.ne11 % C;
+    const int32_t ic0 = args.ne11 - icp;
+
+    const int32_t i1 = tgpig[0];
+    const int32_t i2 = tgpig[1];
+    const int32_t i3 = tgpig[2];
+
+    if (i2 < args.ne_12_2 && i3 < args.ne_12_3) {
+        device const char * k_src = k + args.nb11*(ic0 + i1) + args.nb12*i2 + args.nb13*i3;
+        device const char * v_src = v + args.nb21*(ic0 + i1) + args.nb22*i2 + args.nb23*i3;
+
+        device char * k_dst = k_pad + args.nb11*i1 + args.nb11*C*i2 + args.nb11*C*args.ne_12_2*i3;
+        device char * v_dst = v_pad + args.nb21*i1 + args.nb21*C*i2 + args.nb21*C*args.ne_12_2*i3;
+
+        /* llms FA_PAD16: the same bytes, 16 at a time when the row sizes allow (the byte loop otherwise) */
+        const bool w16 = (args.nb11 % 16u) == 0 && (args.nb21 % 16u) == 0;
+        if (i1 >= icp) {
+            if (w16) { for (uint64_t i = tiitg; i < args.nb11 / 16u; i += ntg.x) ((device uint4 *)k_dst)[i] = uint4(0u);
+                       for (uint64_t i = tiitg; i < args.nb21 / 16u; i += ntg.x) ((device uint4 *)v_dst)[i] = uint4(0u); }
+            else { for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) k_dst[i] = 0; for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) v_dst[i] = 0; }
+        } else {
+            if (w16) { for (uint64_t i = tiitg; i < args.nb11 / 16u; i += ntg.x) ((device uint4 *)k_dst)[i] = ((device const uint4 *)k_src)[i];
+                       for (uint64_t i = tiitg; i < args.nb21 / 16u; i += ntg.x) ((device uint4 *)v_dst)[i] = ((device const uint4 *)v_src)[i]; }
+            else { for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) k_dst[i] = k_src[i]; for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) v_dst[i] = v_src[i]; }
+        }
+    }
+
+    if (FC_flash_attn_ext_pad_has_mask) {
+        if (i2 < args.ne32 && i3 < args.ne33) {
+            for (int ib = i1; ib < args.ne31; ib += C) {
+                device const half * mask_src = (device const half *)(mask      + args.nb31*ib + args.nb32*i2 + args.nb33*i3) + ic0;
+                device       half * mask_dst = (device       half *)(mask_pad) + C*ib + C*args.ne31*i2 + C*args.ne31*args.ne32*i3;
+
+                for (int i = tiitg; i < C; i += ntg.x) {
+                    if (i >= icp) {
+                        mask_dst[i] = -MAXHALF;
+                    } else {
+                        mask_dst[i] = mask_src[i];
+                    }
+                }
+            }
+        }
+    }
+}
+
 constant int32_t FC_flash_attn_ext_blk_nqptg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 24)]];
 constant int32_t FC_flash_attn_ext_blk_ncpsg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 25)]];
 
@@ -1690,3 +1751,32 @@ static inline void ds4_flash_attn_vec_packed8_reduce_f16_512(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+
+
+template<short SG>
+static inline void llms_fa_reduce_sg_impl(constant ds4_metal_args_flash_attn_ext_vec_reduce & args, device const char * htmp, device char * dst,
+                                          uint tgpig, ushort tiisg, ushort sgitg) {
+    constexpr short NWG_ = 32; constexpr short DV_ = 512; constexpr short DV4 = DV_ / 4;
+    const uint64_t rid = tgpig; const short iwg = tiisg;
+    device const float * ss = (device const float *) htmp + (uint64_t)args.nrows*DV_*NWG_;
+    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
+    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    const float mx = simd_max(M);
+    const float ms = exp(M - mx);
+    S = simd_sum(S*ms);
+    S = S == 0.0f ? 0.0f : 1.0f/S;
+    device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG_;
+    device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+    for (short i = sgitg; i < DV4; i += SG) {
+        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        if (iwg == 0) dst4[i] = v*S;
+    }
+}
+#define LLMS_FA_RED_SG(SG) \
+kernel void kernel_llms_fa_reduce_sg##SG(constant ds4_metal_args_flash_attn_ext_vec_reduce & args, device const char * htmp, device char * dst, \
+        uint tgpig[[threadgroup_position_in_grid]], ushort tiisg[[thread_index_in_simdgroup]], ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    llms_fa_reduce_sg_impl<SG>(args, htmp, dst, tgpig, tiisg, sgitg); }
+LLMS_FA_RED_SG(4)
+LLMS_FA_RED_SG(8)
+LLMS_FA_RED_SG(16)

@@ -387,6 +387,7 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
 bool ds4_token_is_stop(ds4_engine *e, int token);
 bool ds4_token_is_thinking_control(ds4_engine *e, int token);
+int ds4_token_think_end(ds4_engine *e);   /* llms THINK_BUDGET */
 bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       int token,
                                       ds4_think_mode mode);
@@ -530,11 +531,16 @@ uint64_t ds4_test_ds41_batch_count(void);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
+int ds4_session_copy_tail(ds4_session *s, int row, float *x, float *pre, float *split, float *f);
+void ds4_llms_tail_publish(int on);
+int ds4_session_copy_tail_l39(int row, float *out);   /* llms TAILFULL: the last layer's norm / selected / route_weights / unrounded f of batch row `row` (2 D + 12 floats) */   /* llms TAILFULL: ask the batch step to publish each row's final split into its session */   /* llms TAILFULL: the final-layer capture (x, pre, the row's ffn_split) */
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 /* Pay the one-time first-submission GPU cost outside any measured window;
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval_rows(ds4_session *s, const int *tokens, int k, float *row_logits, char *err, size_t errlen);   /* llms VERIFY_ROWS */
+int ds4_session_rollback_rows(ds4_session *s, int keep, int k);   /* llms SPEC_COPY */
 
 typedef struct {
     ds4_session *session;
@@ -615,6 +621,13 @@ bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
+/* llms DSP41_RESRAW: after a speculative call whose draft was rejected under sampling, s->logits holds a one-hot residual draw
+ * made with that call's sampler settings; this restores the target's raw logits (true when it did). Call it when the
+ * next token is sampled under different settings. */
+bool ds4_session_dsp41_restore_raw(ds4_session *s);
+int ds4_session_dsp41_sample_row(ds4_session *s, int pos, int row, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+void ds4_session_set_draft_hint_seq(ds4_session *s, const int *tokens, int n);   /* llms GRAMMAR_DEPTH: up to 3 grammar-fixed tokens for the next cycle (greedy) */
+void ds4_session_set_draft_hint(ds4_session *s, int token);   /* llms DSML_HINT: a one-shot block-1 draft for the next speculative cycle (greedy steps only) */   /* llms FLIPKEEP */
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The

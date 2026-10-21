@@ -1,0 +1,1632 @@
+{
+  "format": "ds4-activation-mean-v1",
+  "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "captured_model": {
+    "bytes": 365713686528,
+    "header_sha256": "c6c4c8c5a8078366687af351d4a5e79b70b62a0e672932e065f0456a1a5f8311"
+  },
+  "source_acts_sha256": "0da3352f91bedb5fa75ee0aa47b2f1a2cbbae97157c3b67030bf14dd8bc9392f",
+  "source_corpus_sha256": "a324eb890652d286ff8391671f75cefbe798e64044bd7b4949f7d1acdd93e6d6",
+  "source_corpus": "Four short excerpts: Popper (1959), Aumann and Hart (volume 3), O\u2019Donnell (Analysis of Boolean Functions), Norton (2021). Text is not redistributed. The collection record identifies these as separate from evaluation texts.",
+  "sample_counts": {
+    "blk.0.attn_q_a.weight": 2430,
+    "blk.0.attn_q_b.weight": 2430,
+    "blk.0.attn_kv.weight": 2430,
+    "blk.0.attn_output_a.weight": 2430,
+    "blk.0.attn_output_b.weight": 2430,
+    "blk.0.ffn_gate_shexp.weight": 2430,
+    "blk.0.ffn_up_shexp.weight": 2430,
+    "blk.0.ffn_down_shexp.weight": 2430,
+    "blk.1.attn_q_a.weight": 2430,
+    "blk.1.attn_q_b.weight": 2430,
+    "blk.1.attn_kv.weight": 2430,
+    "blk.1.attn_output_a.weight": 2430,
+    "blk.1.attn_output_b.weight": 2430,
+    "blk.1.ffn_gate_shexp.weight": 2430,
+    "blk.1.ffn_up_shexp.weight": 2430,
+    "blk.1.ffn_down_shexp.weight": 2430,
+    "blk.2.attn_q_a.weight": 2430,
+    "blk.2.attn_q_b.weight": 2430,
+    "blk.2.attn_kv.weight": 2430,
+    "blk.2.attn_output_a.weight": 2430,
+    "blk.2.attn_output_b.weight": 2430,
+    "blk.2.ffn_gate_shexp.weight": 2430,
+    "blk.2.ffn_up_shexp.weight": 2430,
+    "blk.2.ffn_down_shexp.weight": 2430,
+    "blk.3.attn_q_a.weight": 2430,
+    "blk.3.attn_q_b.weight": 2430,
+    "blk.3.attn_kv.weight": 2430,
+    "blk.3.attn_output_a.weight": 2430,
+    "blk.3.attn_output_b.weight": 2430,
+    "blk.3.ffn_gate_shexp.weight": 2430,
+    "blk.3.ffn_up_shexp.weight": 2430,
+    "blk.3.ffn_down_shexp.weight": 2430,
+    "blk.4.attn_q_a.weight": 2430,
+    "blk.4.attn_q_b.weight": 2430,
+    "blk.4.attn_kv.weight": 2430,
+    "blk.4.attn_output_a.weight": 2430,
+    "blk.4.attn_output_b.weight": 2430,
+    "blk.4.ffn_gate_shexp.weight": 2430,
+    "blk.4.ffn_up_shexp.weight": 2430,
+    "blk.4.ffn_down_shexp.weight": 2430,
+    "blk.5.attn_q_a.weight": 2430,
+    "blk.5.attn_q_b.weight": 2430,
+    "blk.5.attn_kv.weight": 2430,
+    "blk.5.attn_output_a.weight": 2430,
+    "blk.5.attn_output_b.weight": 2430,
+    "blk.5.ffn_gate_shexp.weight": 2430,
+    "blk.5.ffn_up_shexp.weight": 2430,
+    "blk.5.ffn_down_shexp.weight": 2430,
+    "blk.6.attn_q_a.weight": 2430,
+    "blk.6.attn_q_b.weight": 2430,
+    "blk.6.attn_kv.weight": 2430,
+    "blk.6.attn_output_a.weight": 2430,
+    "blk.6.attn_output_b.weight": 2430,
+    "blk.6.ffn_gate_shexp.weight": 2430,
+    "blk.6.ffn_up_shexp.weight": 2430,
+    "blk.6.ffn_down_shexp.weight": 2430,
+    "blk.7.attn_q_a.weight": 2430,
+    "blk.7.attn_q_b.weight": 2430,
+    "blk.7.attn_kv.weight": 2430,
+    "blk.7.attn_output_a.weight": 2430,
+    "blk.7.attn_output_b.weight": 2430,
+    "blk.7.ffn_gate_shexp.weight": 2430,
+    "blk.7.ffn_up_shexp.weight": 2430,
+    "blk.7.ffn_down_shexp.weight": 2430,
+    "blk.8.attn_q_a.weight": 2430,
+    "blk.8.attn_q_b.weight": 2430,
+    "blk.8.attn_kv.weight": 2430,
+    "blk.8.attn_output_a.weight": 2430,
+    "blk.8.attn_output_b.weight": 2430,
+    "blk.8.ffn_gate_shexp.weight": 2430,
+    "blk.8.ffn_up_shexp.weight": 2430,
+    "blk.8.ffn_down_shexp.weight": 2430,
+    "blk.9.attn_q_a.weight": 2430,
+    "blk.9.attn_q_b.weight": 2430,
+    "blk.9.attn_kv.weight": 2430,
+    "blk.9.attn_output_a.weight": 2430,
+    "blk.9.attn_output_b.weight": 2430,
+    "blk.9.ffn_gate_shexp.weight": 2430,
+    "blk.9.ffn_up_shexp.weight": 2430,
+    "blk.9.ffn_down_shexp.weight": 2430,
+    "blk.10.attn_q_a.weight": 2430,
+    "blk.10.attn_q_b.weight": 2430,
+    "blk.10.attn_kv.weight": 2430,
+    "blk.10.attn_output_a.weight": 2430,
+    "blk.10.attn_output_b.weight": 2430,
+    "blk.10.ffn_gate_shexp.weight": 2430,
+    "blk.10.ffn_up_shexp.weight": 2430,
+    "blk.10.ffn_down_shexp.weight": 2430,
+    "blk.11.attn_q_a.weight": 2430,
+    "blk.11.attn_q_b.weight": 2430,
+    "blk.11.attn_kv.weight": 2430,
+    "blk.11.attn_output_a.weight": 2430,
+    "blk.11.attn_output_b.weight": 2430,
+    "blk.11.ffn_gate_shexp.weight": 2430,
+    "blk.11.ffn_up_shexp.weight": 2430,
+    "blk.11.ffn_down_shexp.weight": 2430,
+    "blk.12.attn_q_a.weight": 2430,
+    "blk.12.attn_q_b.weight": 2430,
+    "blk.12.attn_kv.weight": 2430,
+    "blk.12.attn_output_a.weight": 2430,
+    "blk.12.attn_output_b.weight": 2430,
+    "blk.12.ffn_gate_shexp.weight": 2430,
+    "blk.12.ffn_up_shexp.weight": 2430,
+    "blk.12.ffn_down_shexp.weight": 2430,
+    "blk.13.attn_q_a.weight": 2430,
+    "blk.13.attn_q_b.weight": 2430,
+    "blk.13.attn_kv.weight": 2430,
+    "blk.13.attn_output_a.weight": 2430,
+    "blk.13.attn_output_b.weight": 2430,
+    "blk.13.ffn_gate_shexp.weight": 2430,
+    "blk.13.ffn_up_shexp.weight": 2430,
+    "blk.13.ffn_down_shexp.weight": 2430,
+    "blk.14.attn_q_a.weight": 2430,
+    "blk.14.attn_q_b.weight": 2430,
+    "blk.14.attn_kv.weight": 2430,
+    "blk.14.attn_output_a.weight": 2430,
+    "blk.14.attn_output_b.weight": 2430,
+    "blk.14.ffn_gate_shexp.weight": 2430,
+    "blk.14.ffn_up_shexp.weight": 2430,
+    "blk.14.ffn_down_shexp.weight": 2430,
+    "blk.15.attn_q_a.weight": 2430,
+    "blk.15.attn_q_b.weight": 2430,
+    "blk.15.attn_kv.weight": 2430,
+    "blk.15.attn_output_a.weight": 2430,
+    "blk.15.attn_output_b.weight": 2430,
+    "blk.15.ffn_gate_shexp.weight": 2430,
+    "blk.15.ffn_up_shexp.weight": 2430,
+    "blk.15.ffn_down_shexp.weight": 2430,
+    "blk.16.attn_q_a.weight": 2430,
+    "blk.16.attn_q_b.weight": 2430,
+    "blk.16.attn_kv.weight": 2430,
+    "blk.16.attn_output_a.weight": 2430,
+    "blk.16.attn_output_b.weight": 2430,
+    "blk.16.ffn_gate_shexp.weight": 2430,
+    "blk.16.ffn_up_shexp.weight": 2430,
+    "blk.16.ffn_down_shexp.weight": 2430,
+    "blk.17.attn_q_a.weight": 2430,
+    "blk.17.attn_q_b.weight": 2430,
+    "blk.17.attn_kv.weight": 2430,
+    "blk.17.attn_output_a.weight": 2430,
+    "blk.17.attn_output_b.weight": 2430,
+    "blk.17.ffn_gate_shexp.weight": 2430,
+    "blk.17.ffn_up_shexp.weight": 2430,
+    "blk.17.ffn_down_shexp.weight": 2430,
+    "blk.18.attn_q_a.weight": 2430,
+    "blk.18.attn_q_b.weight": 2430,
+    "blk.18.attn_kv.weight": 2430,
+    "blk.18.attn_output_a.weight": 2430,
+    "blk.18.attn_output_b.weight": 2430,
+    "blk.18.ffn_gate_shexp.weight": 2430,
+    "blk.18.ffn_up_shexp.weight": 2430,
+    "blk.18.ffn_down_shexp.weight": 2430,
+    "blk.19.attn_q_a.weight": 2430,
+    "blk.19.attn_q_b.weight": 2430,
+    "blk.19.attn_kv.weight": 2430,
+    "blk.19.attn_output_a.weight": 2430,
+    "blk.19.attn_output_b.weight": 2430,
+    "blk.19.ffn_gate_shexp.weight": 2430,
+    "blk.19.ffn_up_shexp.weight": 2430,
+    "blk.19.ffn_down_shexp.weight": 2430,
+    "blk.20.attn_q_a.weight": 2430,
+    "blk.20.attn_q_b.weight": 2430,
+    "blk.20.attn_kv.weight": 2430,
+    "blk.20.attn_output_a.weight": 2430,
+    "blk.20.attn_output_b.weight": 2430,
+    "blk.20.ffn_gate_shexp.weight": 2430,
+    "blk.20.ffn_up_shexp.weight": 2430,
+    "blk.20.ffn_down_shexp.weight": 2430,
+    "blk.21.attn_q_a.weight": 2430,
+    "blk.21.attn_q_b.weight": 2430,
+    "blk.21.attn_kv.weight": 2430,
+    "blk.21.attn_output_a.weight": 2430,
+    "blk.21.attn_output_b.weight": 2430,
+    "blk.21.ffn_gate_shexp.weight": 2430,
+    "blk.21.ffn_up_shexp.weight": 2430,
+    "blk.21.ffn_down_shexp.weight": 2430,
+    "blk.22.attn_q_a.weight": 2430,
+    "blk.22.attn_q_b.weight": 2430,
+    "blk.22.attn_kv.weight": 2430,
+    "blk.22.attn_output_a.weight": 2430,
+    "blk.22.attn_output_b.weight": 2430,
+    "blk.22.ffn_gate_shexp.weight": 2430,
+    "blk.22.ffn_up_shexp.weight": 2430,
+    "blk.22.ffn_down_shexp.weight": 2430,
+    "blk.23.attn_q_a.weight": 2430,
+    "blk.23.attn_q_b.weight": 2430,
+    "blk.23.attn_kv.weight": 2430,
+    "blk.23.attn_output_a.weight": 2430,
+    "blk.23.attn_output_b.weight": 2430,
+    "blk.23.ffn_gate_shexp.weight": 2430,
+    "blk.23.ffn_up_shexp.weight": 2430,
+    "blk.23.ffn_down_shexp.weight": 2430,
+    "blk.24.attn_q_a.weight": 2430,
+    "blk.24.attn_q_b.weight": 2430,
+    "blk.24.attn_kv.weight": 2430,
+    "blk.24.attn_output_a.weight": 2430,
+    "blk.24.attn_output_b.weight": 2430,
+    "blk.24.ffn_gate_shexp.weight": 2430,
+    "blk.24.ffn_up_shexp.weight": 2430,
+    "blk.24.ffn_down_shexp.weight": 2430,
+    "blk.25.attn_q_a.weight": 2430,
+    "blk.25.attn_q_b.weight": 2430,
+    "blk.25.attn_kv.weight": 2430,
+    "blk.25.attn_output_a.weight": 2430,
+    "blk.25.attn_output_b.weight": 2430,
+    "blk.25.ffn_gate_shexp.weight": 2430,
+    "blk.25.ffn_up_shexp.weight": 2430,
+    "blk.25.ffn_down_shexp.weight": 2430,
+    "blk.26.attn_q_a.weight": 2430,
+    "blk.26.attn_q_b.weight": 2430,
+    "blk.26.attn_kv.weight": 2430,
+    "blk.26.attn_output_a.weight": 2430,
+    "blk.26.attn_output_b.weight": 2430,
+    "blk.26.ffn_gate_shexp.weight": 2430,
+    "blk.26.ffn_up_shexp.weight": 2430,
+    "blk.26.ffn_down_shexp.weight": 2430,
+    "blk.27.attn_q_a.weight": 2430,
+    "blk.27.attn_q_b.weight": 2430,
+    "blk.27.attn_kv.weight": 2430,
+    "blk.27.attn_output_a.weight": 2430,
+    "blk.27.attn_output_b.weight": 2430,
+    "blk.27.ffn_gate_shexp.weight": 2430,
+    "blk.27.ffn_up_shexp.weight": 2430,
+    "blk.27.ffn_down_shexp.weight": 2430,
+    "blk.28.attn_q_a.weight": 2430,
+    "blk.28.attn_q_b.weight": 2430,
+    "blk.28.attn_kv.weight": 2430,
+    "blk.28.attn_output_a.weight": 2430,
+    "blk.28.attn_output_b.weight": 2430,
+    "blk.28.ffn_gate_shexp.weight": 2430,
+    "blk.28.ffn_up_shexp.weight": 2430,
+    "blk.28.ffn_down_shexp.weight": 2430,
+    "blk.29.attn_q_a.weight": 2430,
+    "blk.29.attn_q_b.weight": 2430,
+    "blk.29.attn_kv.weight": 2430,
+    "blk.29.attn_output_a.weight": 2430,
+    "blk.29.attn_output_b.weight": 2430,
+    "blk.29.ffn_gate_shexp.weight": 2430,
+    "blk.29.ffn_up_shexp.weight": 2430,
+    "blk.29.ffn_down_shexp.weight": 2430,
+    "blk.30.attn_q_a.weight": 2430,
+    "blk.30.attn_q_b.weight": 2430,
+    "blk.30.attn_kv.weight": 2430,
+    "blk.30.attn_output_a.weight": 2430,
+    "blk.30.attn_output_b.weight": 2430,
+    "blk.30.ffn_gate_shexp.weight": 2430,
+    "blk.30.ffn_up_shexp.weight": 2430,
+    "blk.30.ffn_down_shexp.weight": 2430,
+    "blk.31.attn_q_a.weight": 2430,
+    "blk.31.attn_q_b.weight": 2430,
+    "blk.31.attn_kv.weight": 2430,
+    "blk.31.attn_output_a.weight": 2430,
+    "blk.31.attn_output_b.weight": 2430,
+    "blk.31.ffn_gate_shexp.weight": 2430,
+    "blk.31.ffn_up_shexp.weight": 2430,
+    "blk.31.ffn_down_shexp.weight": 2430,
+    "blk.32.attn_q_a.weight": 2430,
+    "blk.32.attn_q_b.weight": 2430,
+    "blk.32.attn_kv.weight": 2430,
+    "blk.32.attn_output_a.weight": 2430,
+    "blk.32.attn_output_b.weight": 2430,
+    "blk.32.ffn_gate_shexp.weight": 2430,
+    "blk.32.ffn_up_shexp.weight": 2430,
+    "blk.32.ffn_down_shexp.weight": 2430,
+    "blk.33.attn_q_a.weight": 2430,
+    "blk.33.attn_q_b.weight": 2430,
+    "blk.33.attn_kv.weight": 2430,
+    "blk.33.attn_output_a.weight": 2430,
+    "blk.33.attn_output_b.weight": 2430,
+    "blk.33.ffn_gate_shexp.weight": 2430,
+    "blk.33.ffn_up_shexp.weight": 2430,
+    "blk.33.ffn_down_shexp.weight": 2430,
+    "blk.34.attn_q_a.weight": 2430,
+    "blk.34.attn_q_b.weight": 2430,
+    "blk.34.attn_kv.weight": 2430,
+    "blk.34.attn_output_a.weight": 2430,
+    "blk.34.attn_output_b.weight": 2430,
+    "blk.34.ffn_gate_shexp.weight": 2430,
+    "blk.34.ffn_up_shexp.weight": 2430,
+    "blk.34.ffn_down_shexp.weight": 2430,
+    "blk.35.attn_q_a.weight": 2430,
+    "blk.35.attn_q_b.weight": 2430,
+    "blk.35.attn_kv.weight": 2430,
+    "blk.35.attn_output_a.weight": 2430,
+    "blk.35.attn_output_b.weight": 2430,
+    "blk.35.ffn_gate_shexp.weight": 2430,
+    "blk.35.ffn_up_shexp.weight": 2430,
+    "blk.35.ffn_down_shexp.weight": 2430,
+    "blk.36.attn_q_a.weight": 2430,
+    "blk.36.attn_q_b.weight": 2430,
+    "blk.36.attn_kv.weight": 2430,
+    "blk.36.attn_output_a.weight": 2430,
+    "blk.36.attn_output_b.weight": 2430,
+    "blk.36.ffn_gate_shexp.weight": 2430,
+    "blk.36.ffn_up_shexp.weight": 2430,
+    "blk.36.ffn_down_shexp.weight": 2430,
+    "blk.37.attn_q_a.weight": 2430,
+    "blk.37.attn_q_b.weight": 2430,
+    "blk.37.attn_kv.weight": 2430,
+    "blk.37.attn_output_a.weight": 2430,
+    "blk.37.attn_output_b.weight": 2430,
+    "blk.37.ffn_gate_shexp.weight": 2430,
+    "blk.37.ffn_up_shexp.weight": 2430,
+    "blk.37.ffn_down_shexp.weight": 2430,
+    "blk.38.attn_q_a.weight": 2430,
+    "blk.38.attn_q_b.weight": 2430,
+    "blk.38.attn_kv.weight": 2430,
+    "blk.38.attn_output_a.weight": 2430,
+    "blk.38.attn_output_b.weight": 2430,
+    "blk.38.ffn_gate_shexp.weight": 2430,
+    "blk.38.ffn_up_shexp.weight": 2430,
+    "blk.38.ffn_down_shexp.weight": 2430,
+    "blk.39.attn_q_a.weight": 2430,
+    "blk.39.attn_q_b.weight": 2430,
+    "blk.39.attn_kv.weight": 2430,
+    "blk.39.attn_output_a.weight": 2430,
+    "blk.39.attn_output_b.weight": 2430,
+    "blk.39.ffn_gate_shexp.weight": 2430,
+    "blk.39.ffn_up_shexp.weight": 2430,
+    "blk.39.ffn_down_shexp.weight": 2430,
+    "output.weight": 2399
+  },
+  "tensor_shapes": {
+    "blk.0.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.0.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.0.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.0.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.0.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.0.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.0.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.0.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.1.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.1.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.1.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.1.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.1.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.1.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.1.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.1.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.2.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.2.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.2.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.2.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.2.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.2.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.2.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.2.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.3.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.3.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.3.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.3.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.3.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.3.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.3.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.3.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.4.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.4.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.4.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.4.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.4.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.4.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.4.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.4.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.5.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.5.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.5.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.5.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.5.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.5.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.5.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.5.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.6.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.6.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.6.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.6.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.6.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.6.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.6.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.6.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.7.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.7.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.7.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.7.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.7.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.7.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.7.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.7.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.8.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.8.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.8.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.8.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.8.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.8.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.8.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.8.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.9.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.9.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.9.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.9.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.9.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.9.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.9.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.9.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.10.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.10.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.10.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.10.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.10.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.10.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.10.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.10.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.11.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.11.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.11.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.11.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.11.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.11.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.11.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.11.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.12.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.12.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.12.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.12.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.12.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.12.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.12.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.12.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.13.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.13.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.13.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.13.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.13.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.13.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.13.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.13.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.14.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.14.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.14.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.14.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.14.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.14.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.14.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.14.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.15.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.15.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.15.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.15.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.15.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.15.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.15.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.15.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.16.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.16.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.16.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.16.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.16.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.16.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.16.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.16.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.17.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.17.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.17.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.17.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.17.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.17.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.17.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.17.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.18.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.18.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.18.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.18.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.18.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.18.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.18.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.18.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.19.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.19.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.19.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.19.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.19.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.19.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.19.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.19.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.20.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.20.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.20.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.20.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.20.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.20.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.20.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.20.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.21.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.21.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.21.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.21.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.21.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.21.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.21.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.21.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.22.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.22.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.22.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.22.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.22.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.22.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.22.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.22.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.23.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.23.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.23.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.23.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.23.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.23.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.23.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.23.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.24.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.24.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.24.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.24.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.24.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.24.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.24.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.24.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.25.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.25.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.25.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.25.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.25.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.25.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.25.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.25.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.26.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.26.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.26.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.26.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.26.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.26.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.26.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.26.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.27.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.27.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.27.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.27.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.27.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.27.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.27.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.27.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.28.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.28.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.28.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.28.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.28.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.28.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.28.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.28.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.29.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.29.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.29.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.29.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.29.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.29.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.29.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.29.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.30.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.30.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.30.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.30.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.30.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.30.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.30.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.30.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.31.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.31.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.31.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.31.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.31.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.31.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.31.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.31.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.32.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.32.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.32.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.32.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.32.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.32.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.32.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.32.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.33.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.33.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.33.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.33.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.33.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.33.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.33.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.33.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.34.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.34.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.34.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.34.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.34.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.34.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.34.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.34.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.35.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.35.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.35.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.35.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.35.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.35.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.35.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.35.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.36.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.36.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.36.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.36.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.36.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.36.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.36.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.36.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.37.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.37.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.37.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.37.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.37.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.37.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.37.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.37.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.38.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.38.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.38.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.38.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.38.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.38.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.38.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.38.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "blk.39.attn_q_a.weight": [
+      5120,
+      1280
+    ],
+    "blk.39.attn_q_b.weight": [
+      1280,
+      32768
+    ],
+    "blk.39.attn_kv.weight": [
+      5120,
+      512
+    ],
+    "blk.39.attn_output_a.weight": [
+      4096,
+      8192
+    ],
+    "blk.39.attn_output_b.weight": [
+      8192,
+      5120
+    ],
+    "blk.39.ffn_gate_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.39.ffn_up_shexp.weight": [
+      5120,
+      2304
+    ],
+    "blk.39.ffn_down_shexp.weight": [
+      2304,
+      5120
+    ],
+    "output.weight": [
+      5120,
+      129280
+    ]
+  },
+  "files": {
+    "dense_means.npz": {
+      "bytes": 9245233,
+      "sha256": "7f4b2b2ac71e893343a072a0d9177785f8ecc1f936b68541c56e2fba4d4a14e8"
+    },
+    "importance.npy": {
+      "bytes": 1638528,
+      "sha256": "cec3bf257e34e46d40feb2ce3391fb8c8a534d11246549cb698dd899d08b7e59"
+    }
+  },
+  "importance_derivation": "Shared gate/up and routed gate/up receive the same normalized FFN input. Importance is the 40 shared-gate per-column means, converted to float64. Shared gate/up means match at all 40 layers. This importance replaces historical benchmark-derived BS64 calibration and has not been validated end to end."
+}

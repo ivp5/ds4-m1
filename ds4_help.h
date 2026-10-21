@@ -13,4 +13,7 @@ typedef enum {
 
 void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic);
 
+#include "ds4.h"
+void llms_adopted_engine_defaults(ds4_engine_options *e);   /* llms ADOPTED (apply_adopted.py) */
+
 #endif

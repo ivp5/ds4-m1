@@ -64,3 +64,9 @@ contain real conversations.
 For changes to state handling, cover rewind/replay, save/load, images, and
 multiple sessions as well as a fresh prompt. For distributed changes, exercise
 both ranks and failures; a local command-parser test is not physical TP QA.
+
+## Local Metal pack
+
+`make test-metal-pack` builds the native programs and checks codec fixtures,
+compiled defaults, missing-asset errors, generated Metal sources and converter
+formats. It runs no model. See [validation scope](METAL_VALIDATION.md).

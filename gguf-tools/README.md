@@ -378,3 +378,9 @@ pre-tokenizer from a current `regex` release.
 `make test-qwen4-kernels` runs the Metal kernel tests and
 `make test-qwen4-vision` checks the vision tower against the HF implementation
 (`tests/qwen4_vision_ref.py`).
+
+## Local Metal weight layouts
+
+See [the setup guide](../docs/METAL_SETUP.md) for BS64 gate/up, G32 down, dense Q4L,
+draft support and lookahead generation. Bundled [calibration](calibration/README.md)
+is independent of evaluation workloads. `assets.py` validates a generated pack.

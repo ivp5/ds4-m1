@@ -51,6 +51,9 @@ bool ds4_engram_table_open(ds4_engram_table *table, const char *path,
 void ds4_engram_table_close(ds4_engram_table *table);
 /* Output uses F32 storage for the reference's BF16-rounded values. No whole
  * table allocation; caller owns count * DIM floats. Failure invalidates output. */
+/* llms ENGRAM_RA: the same decode from a read-only mapping (map = the mapping's start, map_file_off = its file offset) */
+bool ds4_engram_read_mapped(const ds4_engram_table *t, const uint8_t *map, uint64_t map_file_off,
+                            const uint32_t *rows, size_t count, float *out);
 bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
                      size_t count, float *out);
 /* Read COLS rows per token, restoring token order after deduplicated disk reads.

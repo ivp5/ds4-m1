@@ -1,0 +1,7 @@
+[
+  "Explain how a hash table resolves collisions with separate chaining and with open addressing. Give a short Python example of each and compare their costs. About 400 words. Do not run any tools.",
+  "Summarize the main causes of the French Revolution in about 350 words for a reader who knows little history. Do not run any tools.",
+  "Write a POSIX shell script that lists the ten largest regular files under a directory given as its argument, with human-readable sizes, and explain each line. Do not run any tools.",
+  "Explain the difference between TCP and UDP to a beginner: reliability, ordering, latency, and two everyday examples of each. About 350 words. Do not run any tools.",
+  "Explain the German saying 'Der Weg ist das Ziel': its literal meaning, where it comes from, how it is used today, and two example sentences in German with English translations. Do not run any tools."
+]

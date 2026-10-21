@@ -5720,6 +5720,13 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     chat_msgs msgs = {0};
+    if (getenv("LLMS_DS4_RAW_COMPLETION")) {
+
+
+        r->prompt_text = prompt; prompt = NULL;
+        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        return true;
+    }
     chat_msg sys = {0};
     sys.role = xstrdup("system");
     sys.content = xstrdup("You are a helpful assistant");
@@ -12428,6 +12435,9 @@ static int server_prefill_quantum(server *s) {
  * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
  * advances from its current frontier. Absolute positions remain session-local,
  * so compressor alignment is independent of scheduler order. */
+static void server_generation_enter(server *s);
+static void server_generation_leave(server *s);
+static int server_eval_token(server *s, server_slot *slot, int token, char *err, size_t errlen);
 static int server_session_sync(server *s, server_slot *slot,
                                const ds4_tokens *prompt,
                                char *err, size_t errlen) {
@@ -12445,6 +12455,34 @@ static int server_session_sync(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
+    {
+        static int lockstep = -1;
+        if (lockstep < 0) {
+            const char *e = getenv("LLMS_DS4_LOCKSTEP_PREFILL");
+            lockstep = e && *e ? atoi(e) : 0;
+            if (lockstep > 0) fprintf(stderr, "llms: lockstep prefill (prompt suffixes under %d tokens ride the decode batch, one token per step)\n", lockstep);
+        }
+        if (lockstep > 0 && prompt->len > done && prompt->len - done < lockstep) {
+            if (done == 0) {
+                ds4_tokens first = *prompt;
+                first.len = 1;
+                /* one token: inference_mu alone serializes it with the decode worker's batch; the prefill gate would wait for
+                   decode_pending == 0, which lockstep sessions (re-posting at once) can keep from happening */
+                if (g_stop_requested || slot_job_cancelled(slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+                pthread_mutex_lock(&s->inference_mu);
+                int rc0 = ds4_session_sync(slot->session, &first, err, errlen);
+                pthread_mutex_unlock(&s->inference_mu);
+                if (rc0 != 0) return rc0;
+                done = 1;
+            }
+            server_generation_enter(s);
+            int rc = 0;
+            for (int i = done; i < prompt->len && rc == 0; i++)
+                rc = server_eval_token(s, slot, prompt->v[i], err, errlen);
+            server_generation_leave(s);
+            return rc;
+        }
+    }
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
@@ -13926,6 +13964,7 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    int llms_fpv[64]; int llms_fpn = 0, llms_fpi = -1;   /* llms THINK_FORCE_PREFIX: the forced answer opening, its length, the next index */
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -13973,6 +14012,28 @@ decode_again:
             finish = "error";
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
+        }
+        {   /* llms LLMS_DS4_THINK_BUDGET: force the end of thinking once the budget is spent */
+            static long llms_tb = -2;
+            if (llms_tb == -2) { const char *e = getenv("LLMS_DS4_THINK_BUDGET"); llms_tb = (e && *e) ? atol(e) : -1; }
+            if (llms_fpi >= 0 && llms_fpi < llms_fpn) token = llms_fpv[llms_fpi++];   /* llms THINK_FORCE_PREFIX: the next forced token */
+            if (llms_tb > 0 && thinking.inside && completion >= llms_tb) {
+                const int te = ds4_token_think_end(s->engine);
+                if (te >= 0 && token != te) {
+                    token = te;
+                    server_log(DS4_LOG_DEFAULT, "llms: think budget %ld reached at completion %d: </think> forced", llms_tb, completion);
+                    const char *fp = getenv("LLMS_DS4_THINK_FORCE_PREFIX");   /* llms THINK_FORCE_PREFIX */
+                    if (fp && *fp && llms_fpi < 0) {
+                        char buf[256]; size_t n = 0;   /* '\n' in the variable stands for a newline */
+                        for (const char *q = fp; *q && n + 1 < sizeof buf; q++) { if (q[0] == '\\' && q[1] == 'n') { buf[n++] = '\n'; q++; } else buf[n++] = *q; }
+                        buf[n] = 0;
+                        ds4_tokens tv = {0}; ds4_tokenize_text(s->engine, buf, &tv);
+                        llms_fpn = 0; for (int k = 0; k < tv.len && k < 64; k++) llms_fpv[llms_fpn++] = tv.v[k];
+                        ds4_tokens_free(&tv); llms_fpi = 0;
+                        server_log(DS4_LOG_DEFAULT, "llms: answer opening forced after the think budget (%d tokens)", llms_fpn);
+                    }
+                }
+            }
         }
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
@@ -15877,7 +15938,7 @@ int main(int argc, char **argv) {
         }
         cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
         if (skip_cuda) {
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+            if ((llms_adopted_engine_defaults(&cfg.engine), ds4_engine_open(&engine, &cfg.engine)) != 0) return 1;
         } else {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -15891,7 +15952,7 @@ int main(int argc, char **argv) {
             if (ds4_engine_create_with_gpu_config(
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+    } else if ((llms_adopted_engine_defaults(&cfg.engine), ds4_engine_open(&engine, &cfg.engine)) != 0) {
         return 1;
     }
 

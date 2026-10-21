@@ -1,0 +1,104 @@
+--- a/dsv41_ropetab.metal
++++ b/dsv41_ropetab.metal
+@@ -291,3 +291,101 @@
+     }
+ }
+ #endif
++
++
++// once with the expression and functions of kernel_dsv41_rope, then read by every head (kernel_llms_dsv41_rope_tab).
++struct ds4_metal_args_llms_rope_table {
++    uint start;
++    float frequencies[32];
++};
++
++kernel void kernel_llms_rope_table(
++        constant ds4_metal_args_llms_rope_table &args,
++        device float *tab,
++        uint lane [[thread_index_in_simdgroup]]) {
++    const float theta = float(args.start) * args.frequencies[lane];
++    tab[2u * lane] = precise::cos(theta);
++    tab[2u * lane + 1u] = precise::sin(theta);
++}
++
++struct ds4_metal_args_llms_rope_tab {
++    uint width;
++    uint heads;
++    uint inverse;
++};
++
++kernel void kernel_llms_dsv41_rope_tab(
++        constant ds4_metal_args_llms_rope_tab &args,
++        device float *x,
++        device const float *tab,
++        uint2 group [[threadgroup_position_in_grid]],
++        uint lane [[thread_index_in_simdgroup]]) {
++    const float c = tab[2u * lane];
++    const float s = args.inverse ? -tab[2u * lane + 1u] : tab[2u * lane + 1u];
++    const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
++                    args.width - 64u + 2u * lane;
++    const float re = x[i], im = x[i + 1u];
++    x[i] = dsv41_bf16(re * c - im * s);
++    x[i + 1u] = dsv41_bf16(re * s + im * c);
++}
++
++
++struct llms_engpar_args { uint width; uint rows; float eps; uint masked; uint canary; };
++kernel void kernel_llms_engram_add_par(
++        constant llms_engpar_args &args,
++        device float *residual,
++        device const float *kv,
++        device const float *q_weight,
++        device const float *k_weight,
++        device const uchar *mask,
++        threadgroup float *tg [[threadgroup(0)]],
++        uint2 group [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]]) {
++    if (args.masked && !mask[group.x]) return;
++    const uint lane = tid & 31u, sg = tid >> 5;
++    const ulong offset = ((ulong)group.x * 4u + group.y) * args.width;
++    const ulong key_offset = ((ulong)group.x * 5u + group.y) * args.width;
++    const ulong value_offset = ((ulong)group.x * 5u + 4u) * args.width;
++    threadgroup float *th = tg, *tk = tg + 1024, *tq = tg + 2048, *tw = tg + 3072, *tgate = tg + 4096;
++    float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;   /* simdgroup 0's lanes: the original kernel's 32 lane chains, in its order */
++    const uint nk = args.width / 32u;
++    for (uint k0 = 0u; k0 < nk; k0 += 32u) {
++        {
++            const uint kk = k0 + sg;
++            if (kk < nk) {
++                const uint i = lane + 32u * kk;
++                const uint wi = group.y * args.width + i;
++                th[tid] = residual[offset + i];
++                tk[tid] = dsv41_bf16(kv[key_offset + i]);
++                tq[tid] = q_weight[wi];
++                tw[tid] = k_weight[wi];
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sg == 0u) {
++            const uint kmax = min(32u, nk - k0);
++            for (uint j = 0u; j < kmax; j++) {
++                const float h = th[j * 32u + lane];
++                const float k = tk[j * 32u + lane];
++                h2 += h * h;
++                k2 += k * k;
++                dot += h * (tq[j * 32u + lane] * tw[j * 32u + lane]) * k;
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    if (sg == 0u) {
++        h2 = simd_sum(h2);
++        k2 = simd_sum(k2);
++        dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
++              rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
++        float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
++        if (args.canary) gate *= 1.0009765625f;
++        if (lane == 0u) tgate[0] = gate;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    const float gate = tgate[0];
++    for (uint i = tid; i < args.width; i += 1024u)
++        residual[offset + i] = dsv41_bf16(residual[offset + i] +
++            gate * dsv41_bf16(kv[value_offset + i]));
++}

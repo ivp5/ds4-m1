@@ -1,0 +1,10 @@
+[
+  "Explain how water moves through a watershed after several days of rain. Distinguish infiltration, groundwater, surface runoff, and evaporation. Give a worked numerical example and explain which measurements would improve it.",
+  "Design a small in-memory library catalogue with books, editions, borrowers, and loans. Describe the invariants, show Python functions for borrowing and returning, and discuss failures and tests. Do not use tools.",
+  "Write an introduction to modular arithmetic for a curious adult. Work through examples involving clocks and checksums, then explain where modular inverses exist and where they do not.",
+  "Explain how a public observatory could schedule telescope time fairly among several research groups. Compare two policies with examples, including unpredictable weather and urgent observations.",
+  "Give a practical guide to debugging a command-line program that reads CSV files and sometimes returns incorrect totals. Show a minimal example, tests for missing values and quoted commas, and a corrected implementation. Do not use tools.",
+  "Compare a meadow, a forest, and a wetland as habitats through the seasons. Explain nutrient cycles, disturbances, and restoration choices without pretending one habitat is always best.",
+  "Write a tutorial on finite state machines using a ticket vending machine. Include a transition table, pseudocode, and tests for cancellation, incorrect payment, and an unavailable ticket. Do not use tools.",
+  "Explain in clear Spanish how a bicycle changes mechanical advantage through its gears. Include units, a numerical example, and the difference between power and force."
+]

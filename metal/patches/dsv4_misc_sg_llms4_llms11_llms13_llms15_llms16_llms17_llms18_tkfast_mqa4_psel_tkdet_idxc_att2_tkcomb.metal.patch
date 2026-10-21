@@ -1,0 +1,1104 @@
+--- a/dsv4_misc_sg_llms4_llms11_llms13_llms15_llms16_llms17_llms18_tkfast_mqa4_psel_tkdet_idxc_att2_tkcomb.metal
++++ b/dsv4_misc_sg_llms4_llms11_llms13_llms15_llms16_llms17_llms18_tkfast_mqa4_psel_tkdet_idxc_att2_tkcomb.metal
+@@ -79,6 +79,7 @@
+     uint64_t dst_token_stride;
+     uint64_t dst_head_stride;
+     float    scale;
++    uint32_t ring_prev;   // llms ATT2_RING: logical raw rows >= ring_prev come from buffer 6 (0 = off); fills the tail padding
+ };
+ 
+ struct ds4_metal_args_dsv4_indexer_scores_fused {
+@@ -6264,6 +6265,59 @@
+     }
+ }
+ 
++
++kernel void kernel_astra_indexed_reduce_t32(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        device const char *tmp,
++        device const char *sinks,
++        device       char *dst,
++        uint tgpig [[threadgroup_position_in_grid]],
++        ushort lane [[thread_index_in_simdgroup]],
++        ushort sg   [[simdgroup_index_in_threadgroup]]) {
++    constexpr uint vecs_per_row = 128u;
++    const uint n_splits = args.n_splits;
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    const uint64_t row = tgpig / 4u;
++    const uint vbase = (tgpig % 4u) * 32u;
++    if (row >= n_rows || n_splits < 2u || n_splits > 31u) {
++        return;
++    }
++
++    device const float4 *partials = (device const float4 *)tmp;
++    device const float *stats = (device const float *)(partials +
++        n_rows * vecs_per_row * n_splits);
++    float part_sum = 0.0f;
++    float part_max = -FLT_MAX/2.0f;
++    if ((uint)lane < n_splits) {
++        const uint64_t stat = (row * n_splits + (uint)lane) * 2u;
++        part_sum = stats[stat + 0u];
++        part_max = stats[stat + 1u];
++    } else if ((uint)lane == n_splits) {
++        const uint head = (uint)(row % args.n_head);
++        part_sum = 1.0f;
++        part_max = ((device const float *)sinks)[head];
++    }
++
++    const float global_max = simd_max(part_max);
++    const float part_scale = part_sum > 0.0f ?
++        exp(part_max - global_max) : 0.0f;
++    const float total_sum = simd_sum(part_sum * part_scale);
++    const float inv_sum = total_sum > 0.0f ? 1.0f / total_sum : 0.0f;
++
++    device float4 *out = (device float4 *)dst + row * vecs_per_row;
++    for (uint i = vbase + (uint)sg; i < vbase + 32u; i += 4u) {
++        float4 value = float4(0.0f);
++        if ((uint)lane < n_splits) {
++            value = partials[(row * vecs_per_row + i) * n_splits +
++                             (uint)lane] * part_scale;
++        }
++        value = simd_sum(value);
++        if (lane == 0u) {
++            out[i] = value * inv_sum;
++        }
++    }
++}
++
+ static inline float dsv4_indexer_dot128_shared_q(
+         float4 c0,
+         float4 c1,
+@@ -7663,6 +7717,17 @@
+     if (valid && (lane & 1u) == 0u) row[column >> 1] = (uchar)(code | (upper << 4));
+     if (lane == 0u) row[256u + group.x] = (uchar)sidx;
+ }
++
++struct llms_fp4_psel_args { uint n_sel; uint visible; uint canary; };
++kernel void kernel_llms_fp4_pack_selected(constant llms_fp4_psel_args & a, device const char *src, device const int *sel, device half4 *dst,
++        device int *ids, uint gid [[thread_position_in_grid]]) {
++    const uint s = gid >> 7, c = gid & 127u;
++    if (s >= a.n_sel) return;
++    const int id = sel[s];
++    const bool ok = id >= 0 && (uint)id < a.visible && !(a.canary && s == a.n_sel - 1u);   // canary: the last selected slot dropped
++    if (ok) dst[(ulong)s * 128u + c] = llms_fp4_load_h4(src, (uint)id, c);
++    if (c == 0u) ids[s] = ok ? (int)s : -1;
++}
+ kernel void kernel_llms_fp4_rows_to_half(constant uint & n_rows, device const char *src, device half4 *dst, uint gid [[thread_position_in_grid]]) {
+     const uint row = gid >> 7, c = gid & 127u;
+     if (row >= n_rows) return;
+@@ -7767,7 +7832,7 @@
+ 
+ 
+ 
+-struct llms_topk_args { uint n, k, rows, canary; ulong score_stride, sel_stride; };
++struct llms_topk_args { uint n, k, rows, canary; ulong score_stride, sel_stride; uint mode; };   /* mode: llms TK_IDXORD */
+ static inline uint llms_fkey(float f) { const uint u = as_type<uint>(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+ kernel void kernel_llms_topk_radix(constant llms_topk_args & a, device const float *scores, device int *selected,
+                                    threadgroup uint *tg [[threadgroup(0)]], uint row [[threadgroup_position_in_grid]],
+@@ -7781,36 +7846,138 @@
+     const uint n = a.n, k = a.k;
+     uint prefix = 0u, pmask = 0u, need = k;
+     const bool all = k >= n;   /* llms TOPK_FAST: every element selected */
+-    for (uint pass = 0; pass < (all ? 0u : 3u); pass++) {
+-        const uint shift = pass == 0 ? 21u : pass == 1 ? 10u : 0u, nb = pass == 2 ? 1024u : 2048u;
+-        for (uint i = tid; i < nb; i += 1024u) hist[i] = 0u;
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
+-        for (uint i = tid; i < n; i += 1024u) {
+-            const uint key = llms_fkey(s[i]);
+-            if ((key & pmask) == prefix) atomic_fetch_add_explicit((threadgroup atomic_uint *)&hist[(key >> shift) & (nb - 1u)], 1u, memory_order_relaxed);
+-        }
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
+-        {   /* llms TOPK_FAST (make_topk_fast.py): the digit by a parallel count from the top -- the serial loop's result exactly */
+-            const uint per = nb / 1024u;   /* 2 bins per thread (nb 2048) or 1 (nb 1024) */
+-            const uint b_hi = nb - 1u - tid * per, b_lo = per == 2u ? b_hi - 1u : b_hi;
+-            const uint c_hi = hist[b_hi], c_lo = per == 2u ? hist[b_lo] : 0u, loc = c_hi + c_lo;
+-            const uint lane = tid & 31u, sg = tid >> 5;
+-            const uint incl = simd_prefix_inclusive_sum(loc);
+-            threadgroup uint *sgt = skey;   /* 32 simdgroup totals (skey is re-initialised after the passes) */
+-            if (lane == 31u) sgt[sg] = incl;
++    for(uint pass=0u;pass<(all?0u:3u);pass++) {
++        const uint shift=pass==0u?21u:pass==1u?10u:0u;
++        const uint nb=pass==2u?1024u:2048u;
++        // Two replicas with16wordpadding. Last live index2064+2047=4111.
++        for(uint i=tid;i<nb;i+=1024u){tg[i]=0u;tg[2064u+i]=0u;}
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        const uint lane=tid&31u,sg=tid>>5;
++        threadgroup uint *local_hist=tg+(sg&1u)*2064u;
++        for(uint i=tid;i<n;i+=1024u) {
++            const uint key=llms_fkey(s[i]);
++            if((key&pmask)==prefix)
++                atomic_fetch_add_explicit((threadgroup atomic_uint*)&local_hist[(key>>shift)&(nb-1u)],1u,memory_order_relaxed);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        const uint per=nb/1024u,b_hi=nb-1u-tid*per,b_lo=per==2u?b_hi-1u:b_hi;
++        const uint c_hi=tg[b_hi]+tg[2064u+b_hi];
++        const uint c_lo=per==2u?(tg[b_lo]+tg[2064u+b_lo]):0u,loc=c_hi+c_lo;
++        const uint incl=simd_prefix_inclusive_sum(loc);
++        // Every histogram count is now in registers; all readers must finish
++        // before the same storage becomes scan/selection metadata.
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        threadgroup uint *rs=tg;
++        threadgroup uint *rc=tg+96u;
++        if(lane==31u)rs[sg]=incl;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if(sg==0u){const uint v=rs[lane],vi=simd_prefix_inclusive_sum(v);rs[32u+lane]=vi-v;if(lane==31u)rs[64u]=vi;}
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        const uint above=rs[32u+sg]+incl-loc;
++        if(above<need&&above+c_hi>=need){rc[0]=b_hi;rc[1]=need-above;rc[2]=c_hi;}
++        else if(per==2u&&above+c_hi<need&&above+loc>=need){rc[0]=b_lo;rc[1]=need-(above+c_hi);rc[2]=c_lo;}
++        if(tid==0u&&rs[64u]<need){rc[0]=0u;rc[1]=need-rs[64u];rc[2]=0u;}
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        prefix|=rc[0]<<shift;pmask|=(nb-1u)<<shift;need=rc[1];
++        const bool saturated=rc[2]==need && prefix>0u;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if(pass<2u && saturated){prefix-=1u;need=0u;break;}
++    }
++    // Strict cutoff: key > prefix wins; need lowest-ID ties at prefix also win.
++    // A saturated bucket uses prefix=lower_bound-1 and need=0.
++    if (a.mode == 1u && n <= 62720u) {
++        device int *out = selected + (ulong)row*a.sel_stride;
++        if (all) { for(uint i=tid;i<k;i+=1024u) out[i]=i<n ? (int)i ^ (a.canary && i==0u ? 1:0) : -1; return; }
++        const uint lane=tid&31u,sg=tid>>5;
++        threadgroup uint *masks=tg+192u;
++        for(uint phase=0u;phase<2u;phase++) {
++            const uint extent=phase==0u?min(n,1024u):n;
++            const uint span=((extent+1023u)/1024u)*32u;
++            const uint begin=sg*span,end=min(begin+span,extent);
++            uint eq_count=0u,gt_count=0u;
++            for(uint i0=begin;i0<end;i0+=32u) {
++                const uint i=i0+lane;
++                const uint key=i<end?llms_fkey(s[i]):0u;
++                const bool eq=i<end && key==prefix, gt=i<end && key>prefix;
++                eq_count+=uint(eq);gt_count+=uint(gt);
++                const uint eb=(uint)((uint64_t)simd_ballot(eq));
++                const uint gb=(uint)((uint64_t)simd_ballot(gt));
++                if(lane==0u){masks[2u*(i0>>5)]=eb;masks[2u*(i0>>5)+1u]=gb;}
++            }
++            const uint eq_total=simd_sum(eq_count),gt_total=simd_sum(gt_count);
++            if(lane==0u){hist[sg]=eq_total;hist[32u+sg]=gt_total;}
+             threadgroup_barrier(mem_flags::mem_threadgroup);
+-            if (sg == 0u) { const uint v = sgt[lane]; const uint vi = simd_prefix_inclusive_sum(v); sgt[32u + lane] = vi - v; if (lane == 31u) sgt[64] = vi; }
++            if(sg==0u) {
++                const uint eq=hist[lane],gt=hist[32u+lane];
++                const uint eq_inc=simd_prefix_inclusive_sum(eq),gt_inc=simd_prefix_inclusive_sum(gt);
++                const uint tie_before=eq_inc-eq;
++                const uint selected_count=gt+min(eq,need>tie_before?need-tie_before:0u);
++                hist[64u+lane]=tie_before;hist[96u+lane]=simd_prefix_exclusive_sum(selected_count);
++                hist[128u+lane]=selected_count;
++                if(lane==31u) hist[160]=(gt_inc==k-need && eq_inc>=need)?1u:0u;
++            }
+             threadgroup_barrier(mem_flags::mem_threadgroup);
+-            const uint above = sgt[32u + sg] + incl - loc;   /* keys counted in the bins above this thread's */
+-            if (above < need && above + c_hi >= need) { ctl[0] = b_hi; ctl[1] = need - above; }
+-            else if (per == 2u && above + c_hi < need && above + loc >= need) { ctl[0] = b_lo; ctl[1] = need - (above + c_hi); }
+-            if (tid == 0u && sgt[64] < need) { ctl[0] = 0u; ctl[1] = need - sgt[64]; }   /* the serial loop's fall-through */
+-        }
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
+-        prefix |= ctl[0] << shift; pmask |= (nb - 1u) << shift; need = ctl[1];
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
+-    }
+-    // prefix = the key of the k-th largest; need = how many keys equal to it belong to the top k
++            if(phase==0u && hist[160]==0u) continue;
++            const uint count=hist[128u+sg];
++            if(count==0u) return;
++            const uint tie_before=hist[64u+sg],lowmask=(1u<<lane)-1u;
++            uint tbase=0u,obase=hist[96u+sg];const uint finish=obase+count;
++            for(uint i0=begin;i0<end;i0+=32u) {
++                const uint eb=masks[2u*(i0>>5)],gb=masks[2u*(i0>>5)+1u];
++                const uint epre=popcount(eb&lowmask);
++                const uint remain=need>tie_before+tbase?need-tie_before-tbase:0u;
++                const bool sel=((gb>>lane)&1u) || (((eb>>lane)&1u) && epre<remain);
++                const uint pos=obase+popcount(gb&lowmask)+min(epre,remain);
++                if(sel) out[pos]=(int)(i0+lane) ^ (a.canary && pos==0u ? 1:0);
++                tbase+=popcount(eb);obase+=popcount(gb)+min(popcount(eb),remain);
++                if(obase>=finish) break;
++            }
++            return;
++        }
++    }
++    if (a.mode == 1u) {
++        device int *out = selected + (ulong)row*a.sel_stride;
++        if (all) { for(uint i=tid;i<k;i+=1024u) out[i]=i<n ? (int)i ^ (a.canary && i==0u ? 1:0) : -1; return; }
++        const uint lane=tid&31u,sg=tid>>5;
++        for(uint phase=0u;phase<2u;phase++) {
++            const uint extent=phase==0u?min(n,1024u):n;
++            const uint span=((extent+1023u)/1024u)*32u;
++            const uint begin=sg*span,end=min(begin+span,extent);
++            uint eq_count=0u,gt_count=0u;
++            for(uint i=begin+lane;i<end;i+=32u) {
++                const uint key=llms_fkey(s[i]);eq_count+=(key==prefix);gt_count+=(key>prefix);
++            }
++            const uint eq_total=simd_sum(eq_count),gt_total=simd_sum(gt_count);
++            if(lane==0u){hist[sg]=eq_total;hist[32u+sg]=gt_total;}
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            if(sg==0u) {
++                const uint eq=hist[lane],gt=hist[32u+lane];
++                const uint eq_inc=simd_prefix_inclusive_sum(eq),gt_inc=simd_prefix_inclusive_sum(gt);
++                const uint tie_before=eq_inc-eq;
++                const uint selected_count=gt+min(eq,need>tie_before?need-tie_before:0u);
++                hist[64u+lane]=tie_before;hist[96u+lane]=simd_prefix_exclusive_sum(selected_count);
++                hist[128u+lane]=selected_count;
++                if(lane==31u) ctl[4]=(gt_inc==k-need && eq_inc>=need)?1u:0u;
++            }
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            if(phase==0u && ctl[4]==0u) continue;
++            const uint count=hist[128u+sg];
++            if(count==0u) return;
++            const uint tie_before=hist[64u+sg];
++            uint tbase=0u,obase=hist[96u+sg];const uint finish=obase+count;
++            for(uint i0=begin;i0<end;i0+=32u) {
++                const uint i=i0+lane,key=i<end?llms_fkey(s[i]):0u;
++                const uint eq=(i<end && key==prefix)?1u:0u;
++                const uint epre=simd_prefix_exclusive_sum(eq);
++                const uint sel=(i<end && (key>prefix || (eq && tie_before+tbase+epre<need)))?1u:0u;
++                const uint pos=obase+simd_prefix_exclusive_sum(sel);
++                if(sel) out[pos]=(int)i ^ (a.canary && pos==0u ? 1:0);
++                tbase+=simd_sum(eq);obase+=simd_sum(sel);
++                if(obase>=finish) break;
++            }
++            return;
++        }
++    }
+     if (tid == 0) { ctl[2] = 0u; ctl[3] = 0u; }
+     for (uint i = tid; i < 1024u; i += 1024u) { skey[i] = 0u; sidx[i] = 0x7fffffff; }
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+@@ -7820,10 +7987,29 @@
+     for (uint i = tid; i < n; i += 1024u) {
+         const uint key = llms_fkey(s[i]);
+         if (key > prefix) { const uint slot = atomic_fetch_add_explicit((threadgroup atomic_uint *)&ctl[2], 1u, memory_order_relaxed); skey[slot] = key; sidx[slot] = (int)i; }
+-        else if (key == prefix) { const uint e = atomic_fetch_add_explicit((threadgroup atomic_uint *)&ctl[3], 1u, memory_order_relaxed);
+-                                  if (e < need) { skey[n_gt + e] = key; sidx[n_gt + e] = (int)i; } }
+     }
+     threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (!all) {   /* llms TKDET (make_tkdet.py): cutoff ties in INDEX order, lowest first */
++        threadgroup uint *sgt = hist;   /* the histogram is free after the passes */
++        const uint lane = tid & 31u, sg = tid >> 5;
++        uint tbase = 0u;
++        for (uint i0 = 0u; i0 < n; i0 += 1024u) {
++            const uint i = i0 + tid;
++            const uint key = i < n ? llms_fkey(s[i]) : 0u;
++            const uint t = (i < n && key == prefix) ? 1u : 0u;
++            const uint pre = simd_prefix_exclusive_sum(t), tot = simd_sum(t);
++            if (lane == 0u) sgt[sg] = tot;
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            uint off = 0u, chunk = 0u;
++            for (uint w = 0u; w < 32u; w++) { const uint v = sgt[w]; if (w < sg) off += v; chunk += v; }
++            const uint e = tbase + off + pre;
++            if (t && e < need) { skey[n_gt + e] = key; sidx[n_gt + e] = (int)i; }
++            tbase += chunk;
++            threadgroup_barrier(mem_flags::mem_threadgroup);
++            if (tbase >= need) break;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
+     // ties at the threshold were taken in arrival order: restore index order among them by sorting everything (key desc, index asc)
+     uint m = 1u; while (m < k) m <<= 1;
+     for (uint size = 2u; size <= m; size <<= 1) {
+@@ -8034,6 +8220,807 @@
+     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) simdgroup_store(c[i][j], o + (ulong)(8 * i) * 512u + 8 * j, 512);
+ }
+ 
++
++
++// V4.1's attention reads ONE 512-wide KV row per position for all 64 heads (K = V; flash_attn_ext_vec binds the same buffer twice).
++// The stock vec kernel runs a threadgroup per (head, KV split): every head re-reads every row (~41 MB of cache traffic per layer for
++// 0.7 MB of rows), after staging copies, a pad and a mask fill. Here: llms_mqa_partial -- a threadgroup per (chunk of 16 rows, group
++// of 16 heads); the rows are read ONCE per threadgroup straight from the raw window ring (f32) and the selected compressed rows (f32
++// or f16), rounded to half as the staging did, kept in threadgroup memory and used by all 16 heads (2 per simdgroup); per (chunk, head)
++// the partial max m, sum l and the unnormalized 512-wide output -> part. llms_mqa_reduce -- a threadgroup per head: the chunks and the
++// head's sink logit (it adds exp(sink - M) to the denominator only) -> heads (f32), the input of the BF16 pass + inverse rope.
++// q rounds to half before the dot (the f16 vec kernel's Q type); scores, softmax and the output accumulate in float.
++struct llms_mqa_args { uint n_raw, raw_cap, raw_start, n_comp, n_head, comp_f16, n_chunk, pad0; float scale; };
++#define LLMS_MQA_R 16u
++#define LLMS_MQA_PS 516u   /* floats per (chunk, head) partial: m, l, 2 pad, 512 outputs (16-byte aligned) */
++kernel void llms_mqa_partial(constant llms_mqa_args & a [[buffer(0)]], device const float * q [[buffer(1)]], device const float * raw [[buffer(2)]],
++        device const char * comp [[buffer(3)]], device float * part [[buffer(4)]], threadgroup half4 * kvs [[threadgroup(0)]],
++        uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]]) {
++    const uint N = a.n_raw + a.n_comp, j0 = tg.x * LLMS_MQA_R, j1 = min(N, j0 + LLMS_MQA_R), nr = j1 > j0 ? j1 - j0 : 0u;
++    for (uint idx = tid; idx < nr * 128u; idx += 256u) {
++        const uint r = idx / 128u, e4 = idx % 128u, j = j0 + r;
++        float4 v;
++        if (j < a.n_raw) v = ((device const float4 *)(raw + (uint64_t)((a.raw_start + j) % a.raw_cap) * 512u))[e4];
++        else if (a.comp_f16) v = float4(((device const half4 *)(comp + (uint64_t)(j - a.n_raw) * 1024u))[e4]);
++        else v = ((device const float4 *)(comp + (uint64_t)(j - a.n_raw) * 2048u))[e4];
++        kvs[r * 128u + e4] = half4(v);
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint hh = 0; hh < 2u; hh++) {
++        const uint h = tg.y * 16u + sg * 2u + hh;
++        if (h >= a.n_head) break;
++        float4 qv[4];
++        for (uint k = 0; k < 4u; k++) qv[k] = float4(half4(((device const float4 *)(q + (uint64_t)h * 512u))[lane + 32u * k]));
++        float s[LLMS_MQA_R]; float m = -INFINITY;
++        for (uint r = 0; r < nr; r++) {
++            float d = 0.f;
++            for (uint k = 0; k < 4u; k++) d += dot(qv[k], float4(kvs[r * 128u + lane + 32u * k]));
++            d = simd_sum(d) * a.scale; s[r] = d; m = max(m, d);
++        }
++        float l = 0.f; float4 o[4] = { float4(0.f), float4(0.f), float4(0.f), float4(0.f) };
++        for (uint r = 0; r < nr; r++) {
++            const float p = exp(s[r] - m); l += p;
++            for (uint k = 0; k < 4u; k++) o[k] += p * float4(kvs[r * 128u + lane + 32u * k]);
++        }
++        device float * pp = part + ((uint64_t)tg.x * a.n_head + h) * LLMS_MQA_PS;
++        if (lane == 0) { pp[0] = nr ? m : -INFINITY; pp[1] = l; }
++        for (uint k = 0; k < 4u; k++) ((device float4 *)(pp + 4))[lane + 32u * k] = o[k];
++    }
++}
++kernel void llms_mqa_reduce(constant llms_mqa_args & a [[buffer(0)]], device const float * part [[buffer(1)]], device const float * sinks [[buffer(2)]],
++        device float * heads [[buffer(3)]], uint h [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
++    /* 128 threads per head: thread t owns the float4 of dims 4t..4t+3 */
++    const float sk = sinks[h];
++    float M = sk;
++    for (uint c = 0; c < a.n_chunk; c++) M = max(M, part[((uint64_t)c * a.n_head + h) * LLMS_MQA_PS]);
++    float L = exp(sk - M); float4 O = float4(0.f);
++    for (uint c = 0; c < a.n_chunk; c++) {
++        device const float * pp = part + ((uint64_t)c * a.n_head + h) * LLMS_MQA_PS;
++        const float w = exp(pp[0] - M);
++        L += pp[1] * w;
++        O += w * ((device const float4 *)(pp + 4))[tid];
++    }
++    ((device float4 *)(heads + (uint64_t)h * 512u))[tid] = O / L;
++}
++
++
++
++// converted half rows by index (no gather pass); the same (m, l, o) partials for llms_mqa_reduce ----
++struct llms_mqa4_args { uint n_raw, raw_cap, raw_start, n_comp, n_head, has_sel, n_chunk, pad0; float scale; };
++kernel void llms_mqa4_partial(constant llms_mqa4_args & a [[buffer(0)]], device const float * q [[buffer(1)]], device const float * raw [[buffer(2)]],
++        device const half * comp [[buffer(3)]], device const int * sel [[buffer(4)]], device float * part [[buffer(5)]], threadgroup half4 * kvs [[threadgroup(0)]],
++        uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]]) {
++    const uint N = a.n_raw + a.n_comp, j0 = tg.x * 16u, j1 = min(N, j0 + 16u), nr = j1 > j0 ? j1 - j0 : 0u;
++    for (uint idx = tid; idx < 16u * 128u; idx += 256u) {
++        const uint r = idx >> 7, e4 = idx & 127u, j = j0 + min(r, nr - 1u);
++        half4 v;
++        if (j < a.n_raw) v = half4(((device const float4 *)(raw + (uint64_t)((a.raw_start + j) % a.raw_cap) * 512u))[e4]);
++        else { const uint cj = a.has_sel ? (uint)sel[j - a.n_raw] : j - a.n_raw; v = ((device const half4 *)(comp + (uint64_t)cj * 512u))[e4]; }
++        kvs[idx] = v;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    #pragma unroll
++    for (uint hh = 0; hh < 2u; hh++) {
++        const uint h = tg.y * 16u + sg * 2u + hh;
++        float4 qv[4];
++        #pragma unroll
++        for (uint k = 0; k < 4u; k++) qv[k] = float4(half4(((device const float4 *)(q + (uint64_t)h * 512u))[lane + 32u * k]));
++        float s[16];
++        #pragma unroll
++        for (uint r = 0; r < 16u; r++) {
++            float d = 0.f;
++            #pragma unroll
++            for (uint k = 0; k < 4u; k++) d += dot(qv[k], float4(kvs[r * 128u + lane + 32u * k]));
++            s[r] = d;
++        }
++        float m = -INFINITY;
++        #pragma unroll
++        for (uint r = 0; r < 16u; r++) { s[r] = simd_sum(s[r]) * a.scale; if (r < nr) m = max(m, s[r]); }
++        float l = 0.f; float4 o[4] = { float4(0.f), float4(0.f), float4(0.f), float4(0.f) };
++        #pragma unroll
++        for (uint r = 0; r < 16u; r++) {
++            const float p = r < nr ? exp(s[r] - m) : 0.f; l += p;
++            #pragma unroll
++            for (uint k = 0; k < 4u; k++) o[k] += p * float4(kvs[r * 128u + lane + 32u * k]);
++        }
++        device float * pp = part + ((uint64_t)tg.x * a.n_head + h) * 516u;
++        if (lane == 0) { pp[0] = nr ? m : -INFINITY; pp[1] = l; }
++        #pragma unroll
++        for (uint k = 0; k < 4u; k++) ((device float4 *)(pp + 4))[lane + 32u * k] = o[k];
++    }
++}
++
++kernel void llms_mqa4_reduce(constant llms_mqa4_args & a [[buffer(0)]], device const float * part [[buffer(1)]], device const float * sinks [[buffer(2)]],
++        device float * heads [[buffer(3)]], uint h [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
++    const float sk = sinks[h];
++    const uint nc = a.n_chunk;
++    float M = sk;
++    for (uint c = 0; c < nc; c++) M = max(M, part[((uint64_t)c * a.n_head + h) * 516u]);
++    float L = exp(sk - M); float4 O = float4(0.f);
++    uint c = 0;
++    for (; c + 4u <= nc; c += 4u) {
++        device const float * p0 = part + ((uint64_t)(c + 0u) * a.n_head + h) * 516u; device const float * p1 = part + ((uint64_t)(c + 1u) * a.n_head + h) * 516u;
++        device const float * p2 = part + ((uint64_t)(c + 2u) * a.n_head + h) * 516u; device const float * p3 = part + ((uint64_t)(c + 3u) * a.n_head + h) * 516u;
++        const float4 o0 = ((device const float4 *)(p0 + 4))[tid], o1 = ((device const float4 *)(p1 + 4))[tid], o2 = ((device const float4 *)(p2 + 4))[tid], o3 = ((device const float4 *)(p3 + 4))[tid];
++        const float w0 = exp(p0[0] - M), w1 = exp(p1[0] - M), w2 = exp(p2[0] - M), w3 = exp(p3[0] - M);
++        L += p0[1] * w0; O += w0 * o0; L += p1[1] * w1; O += w1 * o1; L += p2[1] * w2; O += w2 * o2; L += p3[1] * w3; O += w3 * o3;
++    }
++    for (; c < nc; c++) {
++        device const float * pp = part + ((uint64_t)c * a.n_head + h) * 516u;
++        const float w = exp(pp[0] - M);
++        L += pp[1] * w;
++        O += w * ((device const float4 *)(pp + 4))[tid];
++    }
++    ((device float4 *)(heads + (uint64_t)h * 512u))[tid] = O / L;
++}
++
++kernel void kernel_astra_mqa_reduce_group(constant llms_mqa4_args & a [[buffer(0)]], device const float * part [[buffer(1)]], device const float * sinks [[buffer(2)]],
++        device float * heads [[buffer(3)]], uint h [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
++    threadgroup float groupmax[4], maximum, weights[128], denominator;
++    const uint nc=a.n_chunk, lane=tid&31u, sg=tid>>5;
++    const float sk=sinks[h];
++    float own=tid<nc?part[((ulong)tid*a.n_head+h)*516u]:-INFINITY;
++    const float gm=simd_max(own);
++    if(lane==0u)groupmax[sg]=gm;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if(tid==0u){float m=sk;for(uint j=0;j<4;j++)m=max(m,groupmax[j]);maximum=m;}
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if(tid<nc)weights[tid]=exp(own-maximum);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if(tid==0u){
++        float l=exp(sk-maximum);uint c=0;
++        for(;c+4u<=nc;c+=4u){
++            l+=part[((ulong)(c+0u)*a.n_head+h)*516u+1u]*weights[c+0u];
++            l+=part[((ulong)(c+1u)*a.n_head+h)*516u+1u]*weights[c+1u];
++            l+=part[((ulong)(c+2u)*a.n_head+h)*516u+1u]*weights[c+2u];
++            l+=part[((ulong)(c+3u)*a.n_head+h)*516u+1u]*weights[c+3u];
++        }
++        for(;c<nc;c++)l+=part[((ulong)c*a.n_head+h)*516u+1u]*weights[c];
++        denominator=l;
++    }
++    float4 O=float4(0.f);uint c=0;
++    for(;c+4u<=nc;c+=4u){
++        device const float *p0=part+((ulong)(c+0u)*a.n_head+h)*516u;
++        device const float *p1=part+((ulong)(c+1u)*a.n_head+h)*516u;
++        device const float *p2=part+((ulong)(c+2u)*a.n_head+h)*516u;
++        device const float *p3=part+((ulong)(c+3u)*a.n_head+h)*516u;
++        const float4 o0=((device const float4*)(p0+4))[tid],o1=((device const float4*)(p1+4))[tid];
++        const float4 o2=((device const float4*)(p2+4))[tid],o3=((device const float4*)(p3+4))[tid];
++        O+=weights[c+0u]*o0;O+=weights[c+1u]*o1;O+=weights[c+2u]*o2;O+=weights[c+3u]*o3;
++    }
++    for(;c<nc;c++){device const float *pp=part+((ulong)c*a.n_head+h)*516u;O+=weights[c]*((device const float4*)(pp+4))[tid];}
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    ((device float4*)(heads+(ulong)h*512u))[tid]=O/denominator;
++}
++
++
++
++// 16 heads per threadgroup, 256 threads, the same (m, l, o[512]) partial layout and the same llms_mqa4_reduce). Q is rounded to half
++// exactly as mqa4 does (float4(half4(q))), K/V staged as half; products are exact in fp32, the summation ORDER differs (MMA tiles) --
++// not bit-identical; judged against the double reference beside mqa4's own error (mqa_bench.m). Threadgroup memory: K 16 KB + Q 16 KB.
++kernel void llms_mqa7_partial(constant llms_mqa4_args & a [[buffer(0)]], device const float * q [[buffer(1)]], device const float * raw [[buffer(2)]],
++        device const half * comp [[buffer(3)]], device const int * sel [[buffer(4)]], device float * part [[buffer(5)]], threadgroup half4 * kvs [[threadgroup(0)]],
++        uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]]) {
++    const uint N = a.n_raw + a.n_comp, j0 = tg.x * 16u, j1 = min(N, j0 + 16u), nr = j1 > j0 ? j1 - j0 : 0u;
++    threadgroup half4 * qs = kvs + 16u * 128u;                 // 16 heads x 512 dims as half
++    for (uint idx = tid; idx < 16u * 128u; idx += 256u) {
++        const uint r = idx >> 7, e4 = idx & 127u, j = j0 + min(r, nr - 1u);
++        half4 v;
++        if (j < a.n_raw) v = half4(((device const float4 *)(raw + (uint64_t)((a.raw_start + j) % a.raw_cap) * 512u))[e4]);
++        else { const uint cj = a.has_sel ? (uint)sel[j - a.n_raw] : j - a.n_raw; v = ((device const half4 *)(comp + (uint64_t)cj * 512u))[e4]; }
++        kvs[idx] = v;
++        const uint h = tg.y * 16u + r;
++        qs[idx] = half4(((device const float4 *)(q + (uint64_t)h * 512u))[e4]);
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    // S[16 heads x 16 keys] = Qh[16 x 512] * K^T[512 x 16]: sg -> tile (sg & 3) = (head block, key block), k half (sg >> 2)
++    const uint tb = sg & 3u, hb = tb >> 1, kb = tb & 1u, kh = sg >> 2;
++    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.f);
++    threadgroup const half * qh = (threadgroup const half *)qs;
++    threadgroup const half * kh8 = (threadgroup const half *)kvs;
++    for (uint s = 0; s < 32u; s++) {
++        const uint d0 = kh * 256u + s * 8u;
++        simdgroup_half8x8 A, B;
++        simdgroup_load(A, qh + (hb * 8u) * 512u + d0, 512);                 // rows = heads, cols = dims
++        simdgroup_load(B, kh8 + (kb * 8u) * 512u + d0, 512, ulong2(0, 0), true);   // K^T: rows = dims, cols = keys
++        simdgroup_multiply_accumulate(acc, A, B, acc);
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);              // Q no longer needed: its 16 KB hold the S halves (2 x 16 x 16 floats)
++    threadgroup float * sh = (threadgroup float *)qs;
++    simdgroup_store(acc, sh + kh * 256u + (hb * 8u) * 16u + kb * 8u, 16);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    // softmax per head over the chunk's 16 keys: thread tid -> head tid / 16, key tid % 16 (16-lane groups inside a simdgroup)
++    threadgroup float * ph = sh + 512u;                           // P[16 heads x 16 keys]
++    {
++        const uint hh = tid >> 4, kk = tid & 15u;
++        float s = (sh[hh * 16u + kk] + sh[256u + hh * 16u + kk]) * a.scale;
++        const bool ok = kk < nr;
++        float m = ok ? s : -INFINITY;
++        m = max(m, simd_shuffle_xor(m, (ushort)1)); m = max(m, simd_shuffle_xor(m, (ushort)2)); m = max(m, simd_shuffle_xor(m, (ushort)4)); m = max(m, simd_shuffle_xor(m, (ushort)8));
++        const float p = ok ? exp(s - m) : 0.f;
++        float l = p;
++        l += simd_shuffle_xor(l, (ushort)1); l += simd_shuffle_xor(l, (ushort)2); l += simd_shuffle_xor(l, (ushort)4); l += simd_shuffle_xor(l, (ushort)8);
++        ph[hh * 16u + kk] = p;
++        if (kk == 0u) {
++            device float * pp = part + ((uint64_t)tg.x * a.n_head + tg.y * 16u + hh) * 516u;
++            pp[0] = nr ? m : -INFINITY; pp[1] = l;
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    // O[16 heads x 512] = P[16 x 16] * V[16 keys x 512]: 2 x 64 tiles, sg -> head block (sg & 1), 32 dim blocks (sg >> 1) * 16 .. + 16
++    {
++        const uint hb2 = sg & 1u, db0 = (sg >> 1) * 16u;
++        simdgroup_float8x8 P0, P1;
++        simdgroup_load(P0, ph + (hb2 * 8u) * 16u + 0u, 16);
++        simdgroup_load(P1, ph + (hb2 * 8u) * 16u + 8u, 16);
++        for (uint db = 0; db < 16u; db++) {
++            const uint d = (db0 + db) * 8u;
++            simdgroup_half8x8 V0, V1;
++            simdgroup_load(V0, kh8 + 0u * 512u + d, 512);             // rows = keys 0..7, cols = dims
++            simdgroup_load(V1, kh8 + 8u * 512u + d, 512);             // keys 8..15
++            simdgroup_float8x8 O = make_filled_simdgroup_matrix<float, 8>(0.f);
++            simdgroup_multiply_accumulate(O, P0, V0, O);
++            simdgroup_multiply_accumulate(O, P1, V1, O);
++            device float * dst = part + ((uint64_t)tg.x * a.n_head + tg.y * 16u + hb2 * 8u) * 516u + 4u + d;
++            simdgroup_store(O, dst, 516);
++        }
++    }
++}
++
++
++
++struct astra_candidate_args { uint visible; float scale; };
++kernel void astra_candidate_tail(constant astra_candidate_args &a [[buffer(0)]],
++    device const half *keys [[buffer(1)]], device half *tail [[buffer(2)]],
++    uint i [[thread_position_in_grid]]) {
++    if (i >= 1024u || a.visible == 0u) return;
++    const uint row = ((a.visible - 1u) / 8u) * 8u + i / 128u;
++    tail[i] = row < a.visible ? keys[(ulong)row * 128u + i % 128u] : half(0);
++}
++kernel void astra_candidate_score_t4(constant astra_candidate_args &a [[buffer(0)]],
++    device const float *q [[buffer(1)]], device const float *weights [[buffer(2)]],
++    device const half *keys [[buffer(3)]], device float *scores [[buffer(4)]],
++    device const uint *blocks [[buffer(5)]], device const half *tail [[buffer(6)]],
++    threadgroup float *shmem [[threadgroup(0)]], uint tg [[threadgroup_position_in_grid]],
++    uint ntg [[threadgroups_per_grid]], ushort lane [[thread_index_in_simdgroup]],
++    ushort sg [[simdgroup_index_in_threadgroup]]) {
++    if (a.visible <= 16384u) return; // dense identity path belongs to caller
++    threadgroup half *qs = (threadgroup half *)(shmem + 32u * 32u);
++    for (uint i = (uint)sg * 32u + lane; i < 32u * 128u; i += 128u) qs[i] = half(q[i]);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    threadgroup const half *Q = qs + (uint)sg * 8u * 128u;
++    for (uint blk = tg; blk < 512u; blk += ntg) {
++        simdgroup_float8x8 C[4];
++#pragma clang loop unroll(full)
++        for (short t = 0; t < 4; t++) C[t] = make_filled_simdgroup_matrix<float,8>(0.f);
++        for (short kt = 0; kt < 16; kt++) {
++            simdgroup_half8x8 B; simdgroup_load(B,Q + kt * 8,128,ulong2(0,0),true);
++#pragma clang loop unroll(full)
++            for (short t = 0; t < 4; t++) {
++                const ulong base = (ulong)blocks[blk * 4u + (uint)t] * 8u;
++                device const half *K = base + 8u <= a.visible ? keys + base * 128u : tail;
++                simdgroup_half8x8 A; simdgroup_load(A,K + kt * 8,128);
++                simdgroup_multiply_accumulate(C[t],A,B,C[t]);
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++#pragma clang loop unroll(full)
++        for (short t = 0; t < 4; t++) simdgroup_store(C[t],shmem + (t * 8) * 32 + sg * 8,32);
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (sg == 0) {
++#pragma clang fp reassociate(off)
++#pragma clang fp contract(off)
++            const uint slot = blk * 32u + lane;
++            const ulong original = (ulong)blocks[slot / 8u] * 8u + slot % 8u;
++            float acc = 0.0f;
++            for (uint h = 0; h < 32u; h++) acc = acc + max(shmem[lane * 32u + h] * a.scale,0.0f) * weights[h];
++            scores[slot] = original < a.visible ? acc : -INFINITY;
++        }
++    }
++}
++kernel void astra_candidate_remap(device const uint *blocks [[buffer(0)]],
++    device const int *compact [[buffer(1)]], device int *original [[buffer(2)]],
++    uint i [[thread_position_in_grid]]) {
++    if (i >= 512u) return;
++    const int c = compact[i];
++    original[i] = c >= 0 && c < 16384 ? int(blocks[uint(c)/8u]*8u+uint(c)%8u) : -1;
++}
++
++kernel void astra_mask_list(device const float *mask [[buffer(0)]],
++    device uint *list [[buffer(1)]], device uint *count [[buffer(2)]],
++    constant uint &nb [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
++    ushort sg [[simdgroup_index_in_threadgroup]]) {
++    threadgroup uint starts[32];
++    const uint span=((nb+1023u)/1024u)*32u;
++    const uint lo=uint(sg)*span, hi=min(lo+span,nb);
++    uint local=0u;
++    for(uint i=lo+lane;i<hi;i+=32u) local+=uint(mask[i]==0.0f);
++    const uint total=simd_sum(local);
++    if(lane==0u) starts[sg]=total;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if(sg==0u) {
++        const uint v=starts[lane];
++        const uint prefix=simd_prefix_exclusive_sum(v);
++        starts[lane]=prefix;
++        if(lane==31u) count[0]=prefix+v;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    uint offset=starts[sg];
++    for(uint i0=lo;i0<hi;i0+=32u) {
++        const uint i=i0+lane;
++        const uint active=(i<hi && mask[i]==0.0f)?1u:0u;
++        const uint rank=offset+simd_prefix_exclusive_sum(active);
++        // Concrete guard: an invalid mask with >2048 entries may not corrupt memory.
++        // count exposes that invalid input; the fixture checker must reject it.
++        if(active && rank<2048u) list[rank]=i;
++        offset+=simd_sum(active);
++    }
++}
++
++
++kernel void llms_idxc_remap_canary(device const uint *blocks [[buffer(0)]], device const int *compact [[buffer(1)]], device int *original [[buffer(2)]], uint i [[thread_position_in_grid]]) {
++    if (i >= 512u) return; const int c = compact[i];
++    original[i] = c >= 0 && c < 16384 ? int(blocks[uint(c) / 8u] * 8u) : -1;   // the position within the block dropped: wrong IDs by construction
++}
++kernel void llms_idxc_compare(device const int *full [[buffer(0)]], device const int *comp [[buffer(1)]], device atomic_uint *ctr [[buffer(2)]], constant uint &rows [[buffer(3)]],
++                              uint row [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
++    if (row >= rows || tid >= 512) return;
++    const int c = comp[row * 512u + tid]; bool found = false;
++    for (uint j = 0; j < 512u; j++) found = found || (full[row * 512u + j] == c);
++    if (!found) atomic_fetch_add_explicit(&ctr[1], 1u, memory_order_relaxed);
++    if (tid == 0) atomic_fetch_add_explicit(&ctr[0], 1u, memory_order_relaxed);
++}
++
++
++kernel void kernel_llms_att2_r16qi(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        device const char *q, device const char *raw_kv, device const char *comp_kv, device const char *topk, device char *tmp,
++        threadgroup half4 *kv_shared [[threadgroup(0)]],
++        uint3 tgpig [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const uint token = tgpig.x, head0 = tgpig.y * 8u, split = tgpig.z, n_splits = args.n_splits;
++    if (token >= args.n_tokens || head0 >= args.n_head || n_splits < 2u || n_splits > 31u || split >= n_splits) return;
++    threadgroup half  * kh = (threadgroup half *) kv_shared;             // K chunk 16 x 512 half; before the loop: Q 8 x 512 half
++    threadgroup float * sp = (threadgroup float *) (kh + 16u * 512u);   // partial scores: 8 sg x 8 heads x 16 keys
++    threadgroup float * pp = sp + 1024u;                          // P: 8 heads x 16 keys
++    threadgroup float * dg = pp + 128u;                              // diag(alpha): 8 x 8
++    threadgroup int * six = (threadgroup int *) (dg + 64u);              // IDX: the split's row codes (<= 320)
++    for (uint i = tid; i < 8u * 128u; i += 256u) {
++        const uint h = i >> 7, c = i & 127u;
++        device const float4 *q4 = (device const float4 *)(q + (uint64_t)token * args.q_token_stride + (uint64_t)(head0 + h) * args.q_head_stride);
++        kv_shared[i] = (half4) q4[c];
++    }
++    if (tid < 64u) dg[tid] = 0.0f;
++    const uint qpos = args.pos0 + token;
++    const uint last_pos = args.pos0 + args.n_tokens - 1u;
++    const uint first_raw_pos = last_pos + 1u - args.n_raw;
++    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
++    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ? qpos + 1u - args.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first);
++    const uint raw_last = min(qpos, raw_last_pos);
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint total_rows = raw_count + args.top_k;
++    const uint rows_per_split = (total_rows + n_splits - 1u) / n_splits;
++    const uint split_first = min(split * rows_per_split, total_rows);
++    const uint split_last = min(split_first + rows_per_split, total_rows);
++    const uint visible = min((qpos + 1u) / args.ratio, args.n_comp);
++    device const int32_t *row_topk = (device const int32_t *)(topk + (uint64_t)token * args.topk_token_stride);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    const uint d_sg = (uint)sg * 64u;
++    simdgroup_half8x8 A[8];
++    for (uint k = 0; k < 8u; k++) simdgroup_load(A[k], kh + d_sg + k * 8u, 512);
++    simdgroup_float8x8 O[8];
++    for (uint n = 0; n < 8u; n++) O[n] = make_filled_simdgroup_matrix<float, 8>(0.f);
++    float m_run = -FLT_MAX / 2.0f, l_run = 0.0f;
++    const uint hh = (uint)tid >> 4, kk = (uint)tid & 15u;
++    for (uint i = tid; i < split_last - split_first; i += 256u) {
++        const uint seq = split_first + i; int code;
++        if (seq < raw_count) { const uint pos = raw_first + seq, logical = pos - first_raw_pos; code = -2 - (int)((args.raw_start + logical) % args.raw_cap); }
++        else { const int32_t idx = row_topk[seq - raw_count]; code = (idx >= 0 && (uint)idx < visible) ? idx : -1; }
++        six[i] = code;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);                       // every simdgroup holds its Q slice: the area becomes K
++    for (uint seq0 = split_first; seq0 < split_last; seq0 += 16u) {
++        for (uint off = tid; off < 16u * 128u; off += 256u) {
++            const uint r = off >> 7, c = off & 127u, seq = seq0 + r;
++            half4 value = half4(0.0h);
++            const int code = seq < split_last ? six[seq - split_first] : -1;
++            if (code >= 0) value = dsv4_load_cache_h4(comp_kv, args.comp_row_stride, (uint)code, c, args.comp_kv_f16 != 0u);
++            else if (code <= -2) value = (half4) ((device const float4 *)(raw_kv + (uint64_t)(-2 - code) * args.raw_row_stride))[c];
++            kv_shared[off] = value;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        {
++            simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8>(0.f), s1 = make_filled_simdgroup_matrix<float, 8>(0.f);
++            for (uint k = 0; k < 8u; k++) {
++                simdgroup_half8x8 B0; simdgroup_load(B0, kh + 0u * 512u + d_sg + k * 8u, 512, ulong2(0, 0), true); simdgroup_multiply_accumulate(s0, A[k], B0, s0);
++                simdgroup_half8x8 B1; simdgroup_load(B1, kh + 8u * 512u + d_sg + k * 8u, 512, ulong2(0, 0), true); simdgroup_multiply_accumulate(s1, A[k], B1, s1);
++            }
++            simdgroup_store(s0, sp + (uint)sg * 128u + 0u, 16);
++            simdgroup_store(s1, sp + (uint)sg * 128u + 8u, 16);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (tid < 128u) {
++            float s = 0.0f;
++            for (uint j = 0; j < 8u; j++) s += sp[j * 128u + hh * 16u + kk];
++            s *= args.scale;
++            const uint seq = seq0 + kk;
++            const bool ok = seq < split_last && six[seq - split_first] != -1;
++            float mc = ok ? s : -INFINITY;
++            mc = max(mc, simd_shuffle_xor(mc, (ushort)1)); mc = max(mc, simd_shuffle_xor(mc, (ushort)2)); mc = max(mc, simd_shuffle_xor(mc, (ushort)4)); mc = max(mc, simd_shuffle_xor(mc, (ushort)8));
++            const float m_new = max(m_run, mc);
++            const float alpha = exp(m_run - m_new);
++            const float p = ok ? exp(s - m_new) : 0.0f;
++            float lc = p;
++            lc += simd_shuffle_xor(lc, (ushort)1); lc += simd_shuffle_xor(lc, (ushort)2); lc += simd_shuffle_xor(lc, (ushort)4); lc += simd_shuffle_xor(lc, (ushort)8);
++            l_run = l_run * alpha + lc; m_run = m_new;
++            pp[hh * 16u + kk] = p;
++#if LLMS_ATT2_RS
++            if (kk == 0u) dg[hh] = LLMS_ATT2_RS == 2 ? alpha * alpha : alpha;
++#else
++            if (kk == 0u) dg[hh * 8u + hh] = alpha;
++#endif
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        {
++#if LLMS_ATT2_RS
++            simdgroup_float8x8 Dm; simdgroup_load(Dm, dg, 0, ulong2(0, 0), true);   /* llms ATT2_RS: Dm(i, j) = dg[i] */
++#else
++            simdgroup_float8x8 Dm; simdgroup_load(Dm, dg, 8);
++#endif
++            simdgroup_float8x8 P0; simdgroup_load(P0, pp + 0u, 16);
++            simdgroup_float8x8 P1; simdgroup_load(P1, pp + 8u, 16);
++            for (uint n = 0; n < 8u; n++) {
++#if LLMS_ATT2_RS
++                simdgroup_float8x8 t = O[n]; t.thread_elements() *= Dm.thread_elements();   /* llms ATT2_RS: row i scaled by alpha_i, no MMA */
++#else
++                simdgroup_float8x8 t; simdgroup_multiply(t, Dm, O[n]);
++#endif
++                simdgroup_half8x8 V0; simdgroup_load(V0, kh + 0u * 512u + d_sg + n * 8u, 512);
++                simdgroup_multiply_accumulate(t, P0, V0, t);
++                simdgroup_half8x8 V1; simdgroup_load(V1, kh + 8u * 512u + d_sg + n * 8u, 512);
++                simdgroup_multiply_accumulate(O[n], P1, V1, t);
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    device float4 *partials = (device float4 *)tmp;
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    threadgroup float * of = (threadgroup float *) kv_shared;              // O staged in 8 KB pieces of 8 heads x 512 dims
++    const uint PD = 512u;                                   // dims per piece: the K area holds 8 x PD floats
++    for (uint d0 = 0; d0 < 512u; d0 += PD) {
++        for (uint n = 0; n < 8u; n++) { const uint d = d_sg + n * 8u; if (d >= d0 && d < d0 + PD) simdgroup_store(O[n], of + (d - d0), PD); }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (uint i = tid; i < 8u * (PD / 4u); i += 256u) {
++            const uint h = i / (PD / 4u), v = i % (PD / 4u);
++            const uint64_t row = (uint64_t)token * args.n_head + head0 + h;
++            partials[(row * 128u + d0 / 4u + v) * n_splits + split] = ((threadgroup float4 *) of)[i];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    if (tid < 128u && kk == 0u) {
++        device float *stats = (device float *)(partials + n_rows * 128u * n_splits);
++        const uint64_t row = (uint64_t)token * args.n_head + head0 + hh;
++        stats[(row * n_splits + split) * 2u + 0u] = l_run;
++        stats[(row * n_splits + split) * 2u + 1u] = m_run;
++    }
++}
++
++
++
++// partials (latency: 128 threadgroups x 128-step simd_sum loops). Same partial layout, same sink rule, same arithmetic per element:
++// out = sum_s e^(M_s - M*) o_s / (sum_s S_s e^(M_s - M*) + e^(sink - M*)), M* = max(M_s, sink); each thread recomputes its row's split scales.
++kernel void kernel_llms_att_reduce_v2(constant ds4_metal_args_dsv4_indexed_attention & args, device const char *tmp, device const char *sinks, device char *dst,
++        uint2 gid [[thread_position_in_grid]]) {
++    const uint v = gid.x, row = gid.y, ns = args.n_splits; const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    if (v >= 128u || row >= n_rows || ns < 2u || ns > 31u) return;
++    device const float4 *partials = (device const float4 *)tmp; device const float *stats = (device const float *)(partials + n_rows * 128u * ns);
++    const float sink = ((device const float *)sinks)[row % args.n_head];
++    float gmax = sink;
++    for (uint s = 0; s < ns; s++) gmax = max(gmax, stats[(row * ns + s) * 2u + 1u]);
++    float den = exp(sink - gmax); float4 acc = float4(0.f);
++    for (uint s = 0; s < ns; s++) {
++        const float S = stats[(row * ns + s) * 2u + 0u], M = stats[(row * ns + s) * 2u + 1u];
++        const float sc = S > 0.0f ? exp(M - gmax) : 0.0f;
++        den += S * sc; acc += partials[(row * 128u + v) * ns + s] * sc;
++    }
++    ((device float4 *)dst)[row * 128u + v] = den > 0.0f ? acc / den : float4(0.f);
++}
++
++kernel void kernel_llms_att2_r16qj(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        device const char *q, device const char *raw_kv, device const char *comp_kv, device const char *topk, device char *tmp,
++        threadgroup half4 *kv_shared [[threadgroup(0)]],
++        uint3 tgpig [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const uint token = tgpig.x, head0 = tgpig.y * 8u, split = tgpig.z, n_splits = args.n_splits;
++    if (token >= args.n_tokens || head0 >= args.n_head || n_splits < 2u || n_splits > 31u || split >= n_splits) return;
++    threadgroup half  * kh = (threadgroup half *) kv_shared;             // K chunk 16 x 512 half; before the loop: Q 8 x 512 half
++    threadgroup float * sp = (threadgroup float *) (kh + 16u * 512u);   // partial scores: 8 sg x 8 heads x 16 keys
++    threadgroup float * pp = sp + 1024u;                          // P: 8 heads x 16 keys
++    threadgroup float * dg = pp + 128u;                              // diag(alpha): 8 x 8
++    threadgroup int * six = (threadgroup int *) (dg + 64u);              // IDX: the split's row codes (<= 320)
++    for (uint i = tid; i < 8u * 128u; i += 256u) {
++        const uint h = i >> 7, c = i & 127u;
++        device const float4 *q4 = (device const float4 *)(q + (uint64_t)token * args.q_token_stride + (uint64_t)(head0 + h) * args.q_head_stride);
++        kv_shared[i] = (half4) q4[c];
++    }
++    if (tid < 64u) dg[tid] = 0.0f;
++    const uint qpos = args.pos0 + token;
++    const uint last_pos = args.pos0 + args.n_tokens - 1u;
++    const uint first_raw_pos = last_pos + 1u - args.n_raw;
++    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
++    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ? qpos + 1u - args.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first);
++    const uint raw_last = min(qpos, raw_last_pos);
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint total_rows = raw_count + args.top_k;
++    const uint rows_per_split = (total_rows + n_splits - 1u) / n_splits;
++    const uint split_first = min(split * rows_per_split, total_rows);
++    const uint split_last = min(split_first + rows_per_split, total_rows);
++    const uint visible = min((qpos + 1u) / args.ratio, args.n_comp);
++    device const int32_t *row_topk = (device const int32_t *)(topk + (uint64_t)token * args.topk_token_stride);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    const uint d_sg = (uint)sg * 64u;
++    simdgroup_half8x8 A[8];
++    for (uint k = 0; k < 8u; k++) simdgroup_load(A[k], kh + d_sg + k * 8u, 512);
++    simdgroup_float8x8 O[8];
++    for (uint n = 0; n < 8u; n++) O[n] = make_filled_simdgroup_matrix<float, 8>(0.f);
++    float m_run = -FLT_MAX / 2.0f, l_run = 0.0f;
++    const uint hh = (uint)tid >> 4, kk = (uint)tid & 15u;
++    for (uint i = tid; i < split_last - split_first; i += 256u) {
++        const uint seq = split_first + i; int code;
++        if (seq < raw_count) { const uint pos = raw_first + seq, logical = pos - first_raw_pos; code = -2 - (int)((args.raw_start + logical) % args.raw_cap); }
++        else { const int32_t idx = row_topk[seq - raw_count]; code = (idx >= 0 && (uint)idx < visible) ? idx : -1; }
++        six[i] = code;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);                       // every simdgroup holds its Q slice: the area becomes K
++    for (uint seq0 = split_first; seq0 < split_last; seq0 += 16u) {
++        for (uint off = tid; off < 16u * 128u; off += 256u) {
++            const uint r = off >> 7, c = off & 127u, seq = seq0 + r;
++            half4 value = half4(0.0h);
++            const int code = seq < split_last ? six[seq - split_first] : -1;
++            if (code >= 0) value = dsv4_load_cache_h4(comp_kv, args.comp_row_stride, (uint)code, c, args.comp_kv_f16 != 0u);
++            else if (code <= -2) value = (half4) ((device const float4 *)(raw_kv + (uint64_t)(-2 - code) * args.raw_row_stride))[c];
++            kv_shared[off] = value;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        {
++            simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8>(0.f), s1 = make_filled_simdgroup_matrix<float, 8>(0.f);
++            for (uint k = 0; k < 8u; k++) {
++                simdgroup_half8x8 B0; simdgroup_load(B0, kh + 0u * 512u + d_sg + k * 8u, 512, ulong2(0, 0), true); simdgroup_multiply_accumulate(s0, A[k], B0, s0);
++                simdgroup_half8x8 B1; simdgroup_load(B1, kh + 8u * 512u + d_sg + k * 8u, 512, ulong2(0, 0), true); simdgroup_multiply_accumulate(s1, A[k], B1, s1);
++            }
++            simdgroup_store(s0, sp + (uint)sg * 128u + 0u, 16);
++            simdgroup_store(s1, sp + (uint)sg * 128u + 8u, 16);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (tid < 128u) {
++            float s = 0.0f;
++            for (uint j = 0; j < 8u; j++) s += sp[j * 128u + hh * 16u + kk];
++            s *= args.scale;
++            const uint seq = seq0 + kk;
++            const bool ok = seq < split_last && six[seq - split_first] != -1;
++            float mc = ok ? s : -INFINITY;
++            mc = max(mc, simd_shuffle_xor(mc, (ushort)1)); mc = max(mc, simd_shuffle_xor(mc, (ushort)2)); mc = max(mc, simd_shuffle_xor(mc, (ushort)4)); mc = max(mc, simd_shuffle_xor(mc, (ushort)8));
++            const float m_new = max(m_run, mc);
++            const float alpha = exp(m_run - m_new);
++            const float p = ok ? exp(s - m_new) : 0.0f;
++            float lc = p;
++            lc += simd_shuffle_xor(lc, (ushort)1); lc += simd_shuffle_xor(lc, (ushort)2); lc += simd_shuffle_xor(lc, (ushort)4); lc += simd_shuffle_xor(lc, (ushort)8);
++            l_run = l_run * alpha + lc; m_run = m_new;
++            pp[hh * 16u + kk] = p;
++#if LLMS_ATT2_RS
++            if (kk == 0u) dg[hh] = LLMS_ATT2_RS == 2 ? alpha * alpha : alpha;
++#else
++            if (kk == 0u) dg[hh * 8u + hh] = alpha;
++#endif
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        {
++#if LLMS_ATT2_RS
++            simdgroup_float8x8 Dm; simdgroup_load(Dm, dg, 0, ulong2(0, 0), true);   /* llms ATT2_RS: Dm(i, j) = dg[i] */
++#else
++            simdgroup_float8x8 Dm; simdgroup_load(Dm, dg, 8);
++#endif
++            simdgroup_float8x8 P0; simdgroup_load(P0, pp + 0u, 16);
++            simdgroup_float8x8 P1; simdgroup_load(P1, pp + 8u, 16);
++            for (uint n = 0; n < 8u; n++) {
++#if LLMS_ATT2_RS
++                simdgroup_float8x8 t = O[n]; t.thread_elements() *= Dm.thread_elements();   /* llms ATT2_RS: row i scaled by alpha_i, no MMA */
++#else
++                simdgroup_float8x8 t; simdgroup_multiply(t, Dm, O[n]);
++#endif
++                simdgroup_half8x8 V0; simdgroup_load(V0, kh + 0u * 512u + d_sg + n * 8u, 512);
++                simdgroup_multiply_accumulate(t, P0, V0, t);
++                simdgroup_half8x8 V1; simdgroup_load(V1, kh + 8u * 512u + d_sg + n * 8u, 512);
++                simdgroup_multiply_accumulate(O[n], P1, V1, t);
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    device float4 *partials = (device float4 *)tmp;
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    threadgroup float * of = (threadgroup float *) kv_shared;              // O staged in 8 KB pieces of 8 heads x 512 dims
++    const uint PD = 512u;                                   // dims per piece: the K area holds 8 x PD floats
++    for (uint d0 = 0; d0 < 512u; d0 += PD) {
++        for (uint n = 0; n < 8u; n++) { const uint d = d_sg + n * 8u; if (d >= d0 && d < d0 + PD) simdgroup_store(O[n], of + (d - d0), PD); }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (uint i = tid; i < 8u * (PD / 4u); i += 256u) {
++            const uint h = i / (PD / 4u), v = i % (PD / 4u);
++            const uint64_t row = (uint64_t)token * args.n_head + head0 + h;
++            partials[((uint64_t)split * n_rows + row) * 128u + d0 / 4u + v] = ((threadgroup float4 *) of)[i];   // j: split-major partials, contiguous per row
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    if (tid < 128u && kk == 0u) {
++        device float *stats = (device float *)(partials + n_rows * 128u * n_splits);
++        const uint64_t row = (uint64_t)token * args.n_head + head0 + hh;
++        stats[(row * n_splits + split) * 2u + 0u] = l_run;
++        stats[(row * n_splits + split) * 2u + 1u] = m_run;
++    }
++}
++
++// reduce_v3 (07:3x): kernel_llms_att_reduce_v2 for the SPLIT-MAJOR partials of kernel_llms_att2_r16qj ([split][row][128] float4; stats unchanged)
++kernel void kernel_llms_att_reduce_v3(constant ds4_metal_args_dsv4_indexed_attention & args, device const char *tmp, device const char *sinks, device char *dst,
++        uint2 gid [[thread_position_in_grid]]) {
++    const uint v = gid.x, row = gid.y, ns = args.n_splits; const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    if (v >= 128u || row >= n_rows || ns < 2u || ns > 31u) return;
++    device const float4 *partials = (device const float4 *)tmp; device const float *stats = (device const float *)(partials + n_rows * 128u * ns);
++    const float sink = ((device const float *)sinks)[row % args.n_head];
++    float gmax = sink;
++    for (uint s = 0; s < ns; s++) gmax = max(gmax, stats[(row * ns + s) * 2u + 1u]);
++    float den = exp(sink - gmax); float4 acc = float4(0.f);
++    for (uint s = 0; s < ns; s++) {
++        const float S = stats[(row * ns + s) * 2u + 0u], M = stats[(row * ns + s) * 2u + 1u];
++        const float sc = S > 0.0f ? exp(M - gmax) : 0.0f;
++        den += S * sc; acc += partials[((uint64_t)s * n_rows + row) * 128u + v] * sc;
++    }
++    ((device float4 *)dst)[row * 128u + v] = den > 0.0f ? acc / den : float4(0.f);
++}
++
++
++kernel void kernel_llms_att2_r16qjh(
++        constant ds4_metal_args_dsv4_indexed_attention & args,
++        device const char *q, device const char *raw_kv, device const char *comp_kv, device const char *topk, device char *tmp,
++        device const char *new_kv,   /* llms ATT2_RING: buffer 6, the step's new kv rows (a dummy when ring_prev is 0) */
++        threadgroup half4 *kv_shared [[threadgroup(0)]],
++        uint3 tgpig [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const uint token = tgpig.y, head0 = tgpig.x * 8u, split = tgpig.z, n_splits = args.n_splits;   /* llms ATT2_HFIRST: heads fastest */
++    if (token >= args.n_tokens || head0 >= args.n_head || n_splits < 2u || n_splits > 31u || split >= n_splits) return;
++    threadgroup half  * kh = (threadgroup half *) kv_shared;             // K chunk 16 x 512 half; before the loop: Q 8 x 512 half
++    threadgroup float * sp = (threadgroup float *) (kh + 16u * 512u);   // partial scores: 8 sg x 8 heads x 16 keys
++    threadgroup float * pp = sp + 1024u;                          // P: 8 heads x 16 keys
++    threadgroup float * dg = pp + 128u;                              // diag(alpha): 8 x 8
++    threadgroup int * six = (threadgroup int *) (dg + 64u);              // IDX: the split's row codes (<= 320)
++    for (uint i = tid; i < 8u * 128u; i += 256u) {
++        const uint h = i >> 7, c = i & 127u;
++        device const float4 *q4 = (device const float4 *)(q + (uint64_t)token * args.q_token_stride + (uint64_t)(head0 + h) * args.q_head_stride);
++        kv_shared[i] = (half4) q4[c];
++    }
++    if (tid < 64u) dg[tid] = 0.0f;
++    const uint qpos = args.pos0 + token;
++    const uint last_pos = args.pos0 + args.n_tokens - 1u;
++    const uint first_raw_pos = last_pos + 1u - args.n_raw;
++    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
++    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ? qpos + 1u - args.window : 0u;
++    const uint raw_first = max(first_raw_pos, window_first);
++    const uint raw_last = min(qpos, raw_last_pos);
++    const uint raw_count = raw_first <= raw_last ? raw_last - raw_first + 1u : 0u;
++    const uint total_rows = raw_count + args.top_k;
++    const uint rows_per_split = (total_rows + n_splits - 1u) / n_splits;
++    const uint split_first = min(split * rows_per_split, total_rows);
++    const uint split_last = min(split_first + rows_per_split, total_rows);
++    const uint visible = min((qpos + 1u) / args.ratio, args.n_comp);
++    device const int32_t *row_topk = (device const int32_t *)(topk + (uint64_t)token * args.topk_token_stride);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    const uint d_sg = (uint)sg * 64u;
++    simdgroup_half8x8 A[8];
++    for (uint k = 0; k < 8u; k++) simdgroup_load(A[k], kh + d_sg + k * 8u, 512);
++    simdgroup_float8x8 O[8];
++    for (uint n = 0; n < 8u; n++) O[n] = make_filled_simdgroup_matrix<float, 8>(0.f);
++    float m_run = -FLT_MAX / 2.0f, l_run = 0.0f;
++    const uint hh = (uint)tid >> 4, kk = (uint)tid & 15u;
++    for (uint i = tid; i < split_last - split_first; i += 256u) {
++        const uint seq = split_first + i; int code;
++        if (seq < raw_count) { const uint pos = raw_first + seq, logical = pos - first_raw_pos;
++            code = (args.ring_prev != 0u && logical >= args.ring_prev) ? (-200 - (int)(logical - args.ring_prev))   /* llms ATT2_RING: a new row */
++                                                                       : (-2 - (int)((args.raw_start + logical) % args.raw_cap)); }
++        else { const int32_t idx = row_topk[seq - raw_count]; code = (idx >= 0 && (uint)idx < visible) ? idx : -1; }
++        six[i] = code;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);                       // every simdgroup holds its Q slice: the area becomes K
++    for (uint seq0 = split_first; seq0 < split_last; seq0 += 16u) {
++        for (uint off = tid; off < 16u * 128u; off += 256u) {
++            const uint r = off >> 7, c = off & 127u, seq = seq0 + r;
++            half4 value = half4(0.0h);
++            const int code = seq < split_last ? six[seq - split_first] : -1;
++            if (code >= 0) value = dsv4_load_cache_h4(comp_kv, args.comp_row_stride, (uint)code, c, args.comp_kv_f16 != 0u);
++            else if (args.ring_prev != 0u && code <= -200) value = (half4) ((device const float4 *)(new_kv + (uint64_t)(-200 - code) * args.raw_row_stride))[c];   /* llms ATT2_RING */
++            else if (code <= -2) value = (half4) ((device const float4 *)(raw_kv + (uint64_t)(-2 - code) * args.raw_row_stride))[c];
++            kv_shared[off] = value;
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        {
++            simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8>(0.f), s1 = make_filled_simdgroup_matrix<float, 8>(0.f);
++            for (uint k = 0; k < 8u; k++) {
++                simdgroup_half8x8 B0; simdgroup_load(B0, kh + 0u * 512u + d_sg + k * 8u, 512, ulong2(0, 0), true); simdgroup_multiply_accumulate(s0, A[k], B0, s0);
++                simdgroup_half8x8 B1; simdgroup_load(B1, kh + 8u * 512u + d_sg + k * 8u, 512, ulong2(0, 0), true); simdgroup_multiply_accumulate(s1, A[k], B1, s1);
++            }
++            simdgroup_store(s0, sp + (uint)sg * 128u + 0u, 16);
++            simdgroup_store(s1, sp + (uint)sg * 128u + 8u, 16);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (tid < 128u) {
++            float s = 0.0f;
++            for (uint j = 0; j < 8u; j++) s += sp[j * 128u + hh * 16u + kk];
++            s *= args.scale;
++            const uint seq = seq0 + kk;
++            const bool ok = seq < split_last && six[seq - split_first] != -1;
++            float mc = ok ? s : -INFINITY;
++            mc = max(mc, simd_shuffle_xor(mc, (ushort)1)); mc = max(mc, simd_shuffle_xor(mc, (ushort)2)); mc = max(mc, simd_shuffle_xor(mc, (ushort)4)); mc = max(mc, simd_shuffle_xor(mc, (ushort)8));
++            const float m_new = max(m_run, mc);
++            const float alpha = exp(m_run - m_new);
++            const float p = ok ? exp(s - m_new) : 0.0f;
++            float lc = p;
++            lc += simd_shuffle_xor(lc, (ushort)1); lc += simd_shuffle_xor(lc, (ushort)2); lc += simd_shuffle_xor(lc, (ushort)4); lc += simd_shuffle_xor(lc, (ushort)8);
++            l_run = l_run * alpha + lc; m_run = m_new;
++            pp[hh * 16u + kk] = p;
++#if LLMS_ATT2_RS
++            if (kk == 0u) dg[hh] = LLMS_ATT2_RS == 2 ? alpha * alpha : alpha;
++#else
++            if (kk == 0u) dg[hh * 8u + hh] = alpha;
++#endif
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        {
++#if LLMS_ATT2_RS
++            simdgroup_float8x8 Dm; simdgroup_load(Dm, dg, 0, ulong2(0, 0), true);   /* llms ATT2_RS: Dm(i, j) = dg[i] */
++#else
++            simdgroup_float8x8 Dm; simdgroup_load(Dm, dg, 8);
++#endif
++            simdgroup_float8x8 P0; simdgroup_load(P0, pp + 0u, 16);
++            simdgroup_float8x8 P1; simdgroup_load(P1, pp + 8u, 16);
++            for (uint n = 0; n < 8u; n++) {
++#if LLMS_ATT2_RS
++                simdgroup_float8x8 t = O[n]; t.thread_elements() *= Dm.thread_elements();   /* llms ATT2_RS: row i scaled by alpha_i, no MMA */
++#else
++                simdgroup_float8x8 t; simdgroup_multiply(t, Dm, O[n]);
++#endif
++                simdgroup_half8x8 V0; simdgroup_load(V0, kh + 0u * 512u + d_sg + n * 8u, 512);
++                simdgroup_multiply_accumulate(t, P0, V0, t);
++                simdgroup_half8x8 V1; simdgroup_load(V1, kh + 8u * 512u + d_sg + n * 8u, 512);
++                simdgroup_multiply_accumulate(O[n], P1, V1, t);
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    device float4 *partials = (device float4 *)tmp;
++    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
++    threadgroup float * of = (threadgroup float *) kv_shared;              // O staged in 8 KB pieces of 8 heads x 512 dims
++    const uint PD = 512u;                                   // dims per piece: the K area holds 8 x PD floats
++    for (uint d0 = 0; d0 < 512u; d0 += PD) {
++        for (uint n = 0; n < 8u; n++) { const uint d = d_sg + n * 8u; if (d >= d0 && d < d0 + PD) simdgroup_store(O[n], of + (d - d0), PD); }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (uint i = tid; i < 8u * (PD / 4u); i += 256u) {
++            const uint h = i / (PD / 4u), v = i % (PD / 4u);
++            const uint64_t row = (uint64_t)token * args.n_head + head0 + h;
++            partials[((uint64_t)split * n_rows + row) * 128u + d0 / 4u + v] = ((threadgroup float4 *) of)[i];   // j: split-major partials, contiguous per row
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    if (tid < 128u && kk == 0u) {
++        device float *stats = (device float *)(partials + n_rows * 128u * n_splits);
++        const uint64_t row = (uint64_t)token * args.n_head + head0 + hh;
++        stats[(row * n_splits + split) * 2u + 0u] = l_run;
++        stats[(row * n_splits + split) * 2u + 1u] = m_run;
++    }
++}
++
+ // ---- upstream antirez/ds4 5379c1c (PR #1135, e5b19e2), verbatim ----
+ // Copy the selected compressed-key mask while retaining causal visibility.
+ // Image bidirectionality applies to raw keys only, never compressed keys.
