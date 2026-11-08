@@ -1773,6 +1773,10 @@ static eval_config parse_options(int argc, char **argv) {
             c.think_mode = DS4_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {
             c.think_mode = DS4_THINK_NONE;
+        } else if (!strcmp(arg, "--think-level")) {   /* llms THINK_LEVEL: the agent's numeric reasoning level 0-100 (ds4_think_mode_parse_level), off unless given */
+            ds4_think_mode lm;
+            if (!ds4_think_mode_parse_level(need_arg(&i, argc, argv, arg), &lm)) { fprintf(stderr, "ds4-eval: --think-level needs an integer from 0 to 100\n"); exit(2); }
+            c.think_mode = lm;
         } else if (!strcmp(arg, "--plain")) {
             c.plain = true;
         } else if (!strcmp(arg, "--self-test-extractors")) {
@@ -4179,6 +4183,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     char err[256];
     ds4_session_set_progress(session, eval_prefill_progress, ui);
     ds4_session_set_display_progress(session, eval_prefill_progress, ui);
+    { const char *cxe = getenv("LLMS_DS4_CLOSE_EXACT"); if (cxe && *cxe && atoi(cxe) > 0) ds4_session_escalate(session, 0); }   /* llms CLOSE_EXACT (ds4-eval port): a previous case may have ended inside its exact window */
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
@@ -4236,6 +4241,14 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
 
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
+    static ds4_tokens llms_cp_toks; static int llms_cp_state = -1; int llms_cp_pos = -1;   /* llms CLOSE_PREFIX (ds4-eval port) */
+    if (llms_cp_state < 0) { const char *cpe = getenv("LLMS_DS4_CLOSE_PREFIX"); llms_cp_state = 0; if (cpe && *cpe) { ds4_tokenize_text(engine, cpe, &llms_cp_toks); llms_cp_state = llms_cp_toks.len > 0; if (llms_cp_state) fprintf(stderr, "llms: close prefix '%s' (ds4-eval: %d tokens forced right after the thinking's close) -- FIDELITY DIAL\n", cpe, llms_cp_toks.len); } }
+    int llms_cx_left = 0; static int llms_cx_n = -1;   /* llms CLOSE_EXACT (ds4-eval port) */
+    if (llms_cx_n < 0) { const char *cxe = getenv("LLMS_DS4_CLOSE_EXACT"); llms_cx_n = cxe && *cxe ? atoi(cxe) : 0; if (llms_cx_n < 0) llms_cx_n = 0; if (llms_cx_n) fprintf(stderr, "llms: close exact %d (ds4-eval: from the thinking's close token on the decode runs on exact routing for %d generated tokens) -- FIDELITY DIAL\n", llms_cx_n, llms_cx_n); }
+    static int llms_cs = -1;   /* llms EVAL_CLOSE_SPECIAL (ds4-eval): the hard-forced close is the single trained close token (the CLI's budget close is that token) instead of the plain-text pieces of "</think>" */
+    if (llms_cs < 0) { const char *cse = getenv("LLMS_DS4_EVAL_CLOSE_SPECIAL"); llms_cs = cse && *cse && *cse != '0'; if (llms_cs) fprintf(stderr, "llms: eval close special (the hard-forced close is the single close token %d instead of the %d plain-text pieces of '</think>'; the soft close stays off) -- FIDELITY DIAL\n", ds4_token_think_end(engine), think_close_tokens.len); }
+    if (llms_cs && generation_in_think && ds4_token_think_end(engine) >= 0 && think_close_tokens.len != 1) { ds4_tokens_free(&think_close_tokens); think_close_tokens.v = NULL; think_close_tokens.len = 0; think_close_tokens.cap = 0; ds4_tokens_push(&think_close_tokens, ds4_token_think_end(engine)); }
+    int spec_blocks = 0, spec_tokens = 0, spec_plain = 0;   /* llms EVAL_SPEC: the execution witness, printed per case when the switch is on */
     for (int i = 0; i < generation_limit; i++) {
         if (tty) {
             tui_consume_input(ui);
@@ -4306,6 +4319,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             }
         }
 
+        if (ui->generated >= generation_limit) break;   /* llms EVAL_SPEC: a speculative block commits several tokens an iteration; off, ui->generated == i here */
         int remaining_budget = generation_limit - ui->generated;
         int close_rank = 0;
         int token = -1;
@@ -4327,7 +4341,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 token = think_close_tokens.v[0];
                 forced_close_pos = think_close_tokens.len > 1 ? 1 : -1;
             } else if (remaining_budget <= cfg->soft_limit_reply_budget &&
-                       think_close_tokens.len == 1) {
+                       think_close_tokens.len == 1 && !llms_cs) {   /* llms EVAL_CLOSE_SPECIAL: the soft close stays off, as with the 3-piece close */
                 close_rank = token_rank_in_top(session, think_close_tokens.v[0],
                                                cfg->soft_limit_think_close_rank);
                 if (close_rank > 0) {
@@ -4336,10 +4350,13 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 }
             }
         }
+        if (token < 0 && llms_cp_pos >= 0) { token = llms_cp_toks.v[llms_cp_pos++]; if (llms_cp_pos >= llms_cp_toks.len) llms_cp_pos = -1; }   /* llms CLOSE_PREFIX: the forced answer opening */
         if (token < 0)
             token = ds4_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
         if (ds4_token_is_stop(engine, token)) break;
+        if (llms_cx_n > 0 && generation_in_think && llms_cx_left == 0 && (token == ds4_token_think_end(engine) || (close_kind != EVAL_THINK_CLOSE_NONE && think_close.kind == EVAL_THINK_CLOSE_NONE))) { ds4_session_escalate(session, 1); llms_cx_left = llms_cx_n + (close_kind != EVAL_THINK_CLOSE_NONE ? think_close_tokens.len : 1); fprintf(stderr, "llms: close exact armed at generated token %d (window %d tokens)\n", ui->generated, llms_cx_n); }   /* llms CLOSE_EXACT: arms on the close token the model writes, or on the FIRST piece of a forced close (06:05 gate: the forced close is 3 plain pieces, none equal to the close token) */
+        if (llms_cs && close_kind == EVAL_THINK_CLOSE_HARD) fprintf(stderr, "llms: eval close special forced the close token %d (%d close token)\n", token, think_close_tokens.len);
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
             think_close.kind = close_kind;
@@ -4347,7 +4364,23 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             think_close.remaining_budget = remaining_budget;
             think_close.rank = close_rank;
         }
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+        int spec_toks[65];   /* llms EVAL_SPEC (apply_eval_spec.py): LLMS_DS4_EVAL_SPEC=1 -- the agent's drafted path */
+        int spec_n = 0;
+        {
+            static int eval_spec = -1;
+            if (eval_spec < 0) { const char *e = getenv("LLMS_DS4_EVAL_SPEC"); eval_spec = e && *e && *e != '0';
+                                 if (eval_spec) fprintf(stderr, "llms: eval spec (ds4-eval decodes through ds4_session_eval_speculative, the agent's drafted path; the think-close controller's last %d tokens one at a time)\n", cfg->soft_limit_reply_budget); }
+            const int spec_cap = generation_in_think ? remaining_budget - cfg->soft_limit_reply_budget : remaining_budget;
+            if (eval_spec && close_kind == EVAL_THINK_CLOSE_NONE && forced_close_pos < 0 && spec_cap >= 2 &&
+                ds4_engine_mtp_draft_tokens(engine) > 1 && getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+                spec_n = ds4_session_eval_speculative(session, token, spec_cap, ds4_token_eos(engine), cfg->temperature, 0, cfg->top_p, cfg->min_p, rng,
+                                                      spec_toks, (int)(sizeof(spec_toks) / sizeof(spec_toks[0])), err, sizeof(err));
+                if (spec_n == 0) snprintf(err, sizeof(err), "speculative decode returned no tokens");
+                if (spec_n <= 0) spec_n = -1; else { spec_blocks++; spec_tokens += spec_n; }
+            }
+        }
+        if (spec_n == 0) spec_plain++;
+        if (spec_n < 0 || (spec_n == 0 && ds4_session_eval(session, token, err, sizeof(err)) != 0)) {
             plain_reset_color(use_plain_color);
             ui->generated_tokens[idx] = ui->generated;
             tui_run_clock_stop(ui);
@@ -4362,15 +4395,22 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             buf_free(&raw);
             return EVAL_RUN_ERROR;
         }
-
+        if (spec_n == 0) { spec_toks[0] = token; spec_n = 1; }
+        bool spec_stop = false;
+        for (int sj = 0; sj < spec_n; sj++) {
+        token = spec_toks[sj];
+        if (sj > 0 && ds4_token_is_stop(engine, token)) { spec_stop = true; break; }
+        if (sj > 0) remaining_budget = generation_limit - ui->generated;
         size_t len = 0;
         char *text = ds4_token_text(engine, token, &len);
         buf_append(&raw, text, len);
         ui->generated++;
+        if (llms_cx_left > 0 && --llms_cx_left == 0) ds4_session_escalate(session, 0);   /* llms CLOSE_EXACT: the shipped dials return */
         ui->generated_tokens[idx] = ui->generated;
         tui_run_clock_tick(ui);
         if (generation_in_think && raw.v && strstr(raw.v, "</think>")) {
             generation_in_think = false;
+            if (llms_cp_state > 0) llms_cp_pos = 0;   /* llms CLOSE_PREFIX: the next tokens are the prefix */
             if (think_close.kind == EVAL_THINK_CLOSE_NONE) {
                 think_close.kind = EVAL_THINK_CLOSE_NATURAL;
                 think_close.token_index = ui->generated;
@@ -4393,7 +4433,11 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             fflush(stdout);
         }
         free(text);
+        }   /* llms EVAL_SPEC: the committed tokens */
+        if (spec_stop) break;
     }
+    { const char *e = getenv("LLMS_DS4_EVAL_SPEC");
+      if (e && *e && *e != '0') fprintf(stderr, "llms eval spec: case %s: %d speculative blocks committed %d tokens; %d plain evals\n", tc->id, spec_blocks, spec_tokens, spec_plain); }
     if (tty) {
         stream_append_token_text(ui, NULL, 0, true);
         tui_draw_stream(ui);
@@ -4809,6 +4853,7 @@ int main(int argc, char **argv) {
     }
 
     ds4_engine *engine = NULL;
+    { const char *e = getenv("LLMS_DS4_EVAL_SPEC"); if (e && *e && *e != '0') llms_adopted_engine_defaults(&opt); }   /* llms EVAL_SPEC: the agent's / CLI's engine options -- SSD streaming on, the adopted cache budget (ds4_help.c) */
     if (ds4_engine_open(&engine, &opt) != 0) {
         if (trace) fclose(trace);
         free(case_sequence);

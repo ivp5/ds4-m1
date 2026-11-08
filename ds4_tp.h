@@ -30,9 +30,9 @@ enum {
     DS4_TP_GATE_ATTN = 0,
     DS4_TP_GATE_FFN = 1,
     DS4_TP_GATES_PER_LAYER = 2,
-    /* Includes the seed row as well as drafted tokens. */
-    DS4_TP_BATCH_MAX_ROWS = 128,
-    DS4_TP_BATCH_GATES_PER_LAYER = 2,
+    /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
+    DS4_TP_BATCH_MAX_ROWS = 1024,   /* llms ROWS_CAP3 2026-10-22: was 128 (the ROWS_CAP experiment: calls of up to 1,024 rows; the batch arrays follow) */   /* llms ROWS128 2026-10-13: was 64 (apply_ds4_rows128.py; runtime caps stay 64 unless LLMS_DS4_ROWS128=1); 2026-10-10: was 32 (2026-10-09: 16; 2026-10-08: 8); apply_ds4_rows64.py */
+    DS4_TP_BATCH_GATES_PER_LAYER = 2,   /* upstream fc80bd6 */
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -115,8 +115,9 @@ enum {
     DS4_TP_MODE_V41_DSPARK = 8u,
 };
 /* Call on both engines before binding the GPU slab. Resident layouts and
- * shared-expert ownership must match before either rank can reduce results. */
-int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t errlen);
+ * shared-expert ownership must match before either rank can reduce results.
+ * full_experts is a local capability on entry, the intersection on return. */
+int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, bool *full_experts, char *err, size_t errlen);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
 

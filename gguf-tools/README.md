@@ -224,7 +224,9 @@ python3 gguf-tools/deepseek41_quantize.py \
 
 Omit `--dry-run` to write the file. Add `--resume` after an interrupted conversion.
 Use `libds4quants.so` on Linux. Gate/up experts use IQ2_XXS and down experts use
-Q2_K; attention, shared experts and the output head use Q8_0. Engram rows retain
+Q2_K; attention, shared experts and the output head use Q8_0. `--quant q4` uses
+Q4_K experts instead and `--quant mxfp4` keeps the released MXFP4 experts
+unchanged, repacked into GGUF blocks without calibration. Engram rows retain
 their original FP8 values and scales, packed together at the end of the GGUF for
 disk lookups. Vision and DSpark weights are not included.
 
@@ -378,9 +380,3 @@ pre-tokenizer from a current `regex` release.
 `make test-qwen4-kernels` runs the Metal kernel tests and
 `make test-qwen4-vision` checks the vision tower against the HF implementation
 (`tests/qwen4_vision_ref.py`).
-
-## Local Metal weight layouts
-
-See [the setup guide](../docs/METAL_SETUP.md) for BS64 gate/up, G32 down, dense Q4L,
-draft support and lookahead generation. Bundled [calibration](calibration/README.md)
-is independent of evaluation workloads. `assets.py` validates a generated pack.

@@ -1899,7 +1899,7 @@ int raxIteratorPrevStep(raxIterator *it, int noup) {
 int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len) {
     int eq = 0, lt = 0, gt = 0, first = 0, last = 0;
 
-    it->stack.items = 0; /* Just resetting. Initialized by raxStart(). */
+    it->stack.items = 0; /* Just resetting. Initialized by raxStart. */
     it->flags |= RAX_ITER_JUST_SEEKED;
     it->flags &= ~(RAX_ITER_EOF|RAX_ITER_INLINE_LEAF);
     it->key_len = 0;

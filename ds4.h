@@ -493,6 +493,9 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+void ds4_session_escalate(ds4_session *s, int on);   /* llms ESCALATE: exact decode routing for the rest of a derailing task (1) / the shipped dials (0) */
+void ds4_session_dry_feed(int tok, int inside);   /* llms DRY (apply_dry.py): one generated token into the repeat-penalty history */
+void ds4_session_set_next_bias(ds4_session *s, int tok, float delta);   /* llms CLOSE_BIAS: +delta on token tok at the NEXT ds4_session_sample call only */
 #ifdef DS4_TEST_HOOKS
 /* Teacher-force a V4.1 verification block, returning logits after each token. */
 int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
@@ -529,6 +532,11 @@ uint64_t ds4_test_mixed_native_count(void);
 uint64_t ds4_test_ds41_batch_count(void);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
+/* Score a target and top-k from one immutable logit row and one normalizer.
+ * score may be NULL; otherwise token must be valid and score must not overlap out.
+ * Returns k clamped to the vocabulary size; unused entries have id -1. */
+int ds4_session_top_logprobs_and_token(ds4_session *s, ds4_token_score *out, int k,
+                                     int token, ds4_token_score *score);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_copy_tail(ds4_session *s, int row, float *x, float *pre, float *split, float *f);
@@ -541,6 +549,8 @@ void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_rows(ds4_session *s, const int *tokens, int k, float *row_logits, char *err, size_t errlen);   /* llms VERIFY_ROWS */
 int ds4_session_rollback_rows(ds4_session *s, int keep, int k);   /* llms SPEC_COPY */
+int ds4_session_llms_scrub_mark(ds4_session *s);      /* llms THINK_SCRUB_NATIVE: the graph's position state into static buffers */
+int ds4_session_llms_scrub_restore(ds4_session *s);   /* llms THINK_SCRUB_NATIVE: a rollback to the marked position, rows below it kept */
 
 typedef struct {
     ds4_session *session;
@@ -627,6 +637,7 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 bool ds4_session_dsp41_restore_raw(ds4_session *s);
 int ds4_session_dsp41_sample_row(ds4_session *s, int pos, int row, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 void ds4_session_set_draft_hint_seq(ds4_session *s, const int *tokens, int n);   /* llms GRAMMAR_DEPTH: up to 3 grammar-fixed tokens for the next cycle (greedy) */
+void ds4_session_set_route_class(ds4_session *s, int noncall);   /* llms UCAP_CLASS: the step's text class for the union cap (1 = think / answer, 0 = a tool call) */
 void ds4_session_set_draft_hint(ds4_session *s, int token);   /* llms DSML_HINT: a one-shot block-1 draft for the next speculative cycle (greedy steps only) */   /* llms FLIPKEEP */
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

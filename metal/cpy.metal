@@ -142,14 +142,18 @@ struct ds4_metal_args_flash_kv_stage_f16 {
 // by an already-F16 compressed cache. Pack both regions into the contiguous
 // F16 FlashAttention scratch in one dispatch. The raw conversion expression
 // and compressed ushort4 transport exactly match the standalone copy kernels.
-kernel void kernel_dsv4_flash_kv_stage_f16(
+// GATHER reads the compressed rows as f32 through ids (DeepSeek V4.1's
+// cache) instead of contiguous f16 rows.
+template<bool GATHER>
+static inline void dsv4_flash_kv_stage_body(
         constant ds4_metal_args_flash_kv_stage_f16 & args,
         device const char * raw_src,
         device const char * comp_src,
         device       char * dst,
         device const char * mask_src,
         device       char * pad_dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint gid,
+        device const int  * ids) {
     constexpr uint row_vecs = 128;
     const uint raw_vecs = args.n_raw * row_vecs;
     const uint n_keys = args.n_raw + args.n_comp;
@@ -172,6 +176,16 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
     }
 
     if (gid < total_vecs) {
+        if (GATHER) {
+            const uint comp_gid = gid - raw_vecs;
+            device const packed_float4 *comp =
+                (device const packed_float4 *)comp_src;
+            device packed_half4 *dst_half = (device packed_half4 *)dst;
+            const float4 value =
+                float4(comp[(uint)ids[comp_gid >> 7] * row_vecs + (comp_gid & 127u)]);
+            dst_half[gid] = packed_half4(half4(value));
+            return;
+        }
         device const packed_ushort4 *comp =
             (device const packed_ushort4 *)comp_src;
         device packed_ushort4 *dst_bits = (device packed_ushort4 *)dst;
@@ -215,6 +229,16 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
             if (!args.shared_pad) {
                 pad_half[pad_vecs + pad_gid] = value_half;
             }
+        } else if (GATHER) {
+            device const packed_float4 *comp =
+                (device const packed_float4 *)comp_src;
+            const float4 value =
+                float4(comp[(uint)ids[logical_row - args.n_raw] * row_vecs + col]);
+            const packed_half4 value_half = packed_half4(half4(value));
+            pad_half[pad_gid] = value_half;
+            if (!args.shared_pad) {
+                pad_half[pad_vecs + pad_gid] = value_half;
+            }
         } else {
             device const packed_ushort4 *comp =
                 (device const packed_ushort4 *)comp_src;
@@ -240,6 +264,28 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
     }
 }
 
+kernel void kernel_dsv4_flash_kv_stage_f16(
+        constant ds4_metal_args_flash_kv_stage_f16 & args,
+        device const char * raw_src,
+        device const char * comp_src,
+        device       char * dst,
+        device const char * mask_src,
+        device       char * pad_dst,
+        uint gid [[thread_position_in_grid]]) {
+    dsv4_flash_kv_stage_body<false>(args, raw_src, comp_src, dst, mask_src, pad_dst, gid, (device const int *)mask_src);
+}
+
+kernel void kernel_dsv41_flash_kv_stage(
+        constant ds4_metal_args_flash_kv_stage_f16 & args,
+        device const char * raw_src,
+        device const char * comp_src,
+        device       char * dst,
+        device const char * mask_src,
+        device       char * pad_dst,
+        device const int  * ids,
+        uint gid [[thread_position_in_grid]]) {
+    dsv4_flash_kv_stage_body<true>(args, raw_src, comp_src, dst, mask_src, pad_dst, gid, ids);
+}
 
 // Tiled-row expansion of a small table: dst row t = src row (pos0 + t) % ratio.
 // Replaces the per-segment copies the compressor store used to encode (one
@@ -274,4 +320,26 @@ kernel void kernel_cpy_tile_rows_f32_f32(
     const uint e = gid - t * args.width;
     const uint r = (args.pos0 + t) % args.ratio;
     dst[gid] = src[r * args.width + e];
+}
+
+// llms SNAP_BATCH (apply_snap_batch.py): the pre-step snapshot (dir 0: ring slots -> rows) and the deep rollback's restore (dir 1: rows -> ring slots)
+// of the per-layer raw windows, twenty layers to a dispatch. One threadgroup copies one 2 KB slot (256 threads x 8 bytes), bitwise like kernel_cpy_contig_f16_f16_bits_4.
+struct llms_snap_args { uint pos0; uint row0; uint nrows; uint layer0; uint snap_rows; uint dir; uint pad0; uint pad1; };
+kernel void kernel_llms_snap_rows20(
+        constant llms_snap_args & a [[buffer(0)]],
+        device uchar * w0  [[buffer(1)]],  device uchar * w1  [[buffer(2)]],  device uchar * w2  [[buffer(3)]],  device uchar * w3  [[buffer(4)]],
+        device uchar * w4  [[buffer(5)]],  device uchar * w5  [[buffer(6)]],  device uchar * w6  [[buffer(7)]],  device uchar * w7  [[buffer(8)]],
+        device uchar * w8  [[buffer(9)]],  device uchar * w9  [[buffer(10)]], device uchar * w10 [[buffer(11)]], device uchar * w11 [[buffer(12)]],
+        device uchar * w12 [[buffer(13)]], device uchar * w13 [[buffer(14)]], device uchar * w14 [[buffer(15)]], device uchar * w15 [[buffer(16)]],
+        device uchar * w16 [[buffer(17)]], device uchar * w17 [[buffer(18)]], device uchar * w18 [[buffer(19)]], device uchar * w19 [[buffer(20)]],
+        device uchar * lin [[buffer(21)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        uint3 tp [[thread_position_in_threadgroup]]) {
+    const uint tid = tp.x;
+    device uchar * ws[20] = { w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15, w16, w17, w18, w19 };
+    const uint il = tg.x;                    // the layer inside this dispatch
+    const uint j = a.row0 + tg.y;            // the step row (1-based): its ring slot is (pos0 + j) % 128
+    device ulong * ring = (device ulong *)(ws[il] + (ulong)((a.pos0 + j) & 127u) * 2048ul);
+    device ulong * line = (device ulong *)(lin + ((ulong)(a.layer0 + il) * (ulong)a.snap_rows + (ulong)(j - 1u)) * 2048ul);
+    if (a.dir == 0u) line[tid] = ring[tid]; else ring[tid] = line[tid];
 }

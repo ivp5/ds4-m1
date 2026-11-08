@@ -10,10 +10,14 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#include <pthread/qos.h>
+#include <sys/sysctl.h>
 #endif
 
 bool ds4_engram_layout_valid(const ds4_engram_layout *l) {
@@ -125,10 +129,10 @@ void ds4_engram_table_close(ds4_engram_table *t) {
     *t = (ds4_engram_table){.fd = -1};
 }
 
-static bool read_row(int fd, uint64_t offset, uint8_t row[DS4_ENGRAM_ROW_BYTES]) {
+static bool read_row(int fd, uint64_t offset, uint8_t *row, size_t bytes) {   /* llms ENGRAM_IQ4: the row size is the table's */
     size_t done = 0;
-    while (done < DS4_ENGRAM_ROW_BYTES) {
-        ssize_t n = pread(fd, row + done, DS4_ENGRAM_ROW_BYTES - done,
+    while (done < bytes) {
+        ssize_t n = pread(fd, row + done, bytes - done,
                           (off_t)(offset + done));
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
@@ -168,6 +172,55 @@ static void init_engram_bf16(void) {
     }
 }
 
+/* llms ENGRAM_IQ4: the IQ4_NL decode -- 8 blocks of {fp16 d, 16 bytes}; value j of a block = d * kvalues[nibble], low nibbles first; bf16-rounded like the reference */
+enum { ENGRAM_IQ4_ROW = 144 };
+static const int8_t engram_iq4_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+static void engram_decode_iq4(const uint8_t *raw, float *out) {
+    for (int b = 0; b < 8; b++) {
+        uint16_t dh; memcpy(&dh, raw + 18 * b, 2); const float d = ({
+            uint16_t h = dh;
+            uint32_t sign = (uint32_t)(h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 0x3ffu, bits;
+            if (e == 0) {
+                if (m == 0) bits = sign;
+                else { e = 113u; while (!(m & 0x400u)) { m <<= 1; e--; } bits = sign | (e << 23) | ((m & 0x3ffu) << 13); }
+            } else if (e == 31u) bits = sign | 0x7f800000u | (m << 13);
+            else bits = sign | ((e + 112u) << 23) | (m << 13);
+            float f; memcpy(&f, &bits, sizeof f);
+            (float)(f);
+        }); const uint8_t *qs = raw + 18 * b + 2;
+        for (int j = 0; j < 16; j++) {
+            const uint8_t q = qs[j];
+            const float v[2] = { d * (float)engram_iq4_values[q & 15u], d * (float)engram_iq4_values[q >> 4] };
+            for (int k = 0; k < 2; k++) {
+                uint32_t bits; memcpy(&bits, &v[k], sizeof bits); bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+                memcpy(out + 32 * b + j + 16 * k, &bits, sizeof bits);
+            }
+        }
+    }
+}
+bool ds4_engram_table_open_iq4(ds4_engram_table *t, const char *path, uint64_t gguf_offset, uint32_t rows) {
+    if (!t || !path) return false;
+    *t = (ds4_engram_table){.fd = -1};
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    uint8_t h[80]; struct stat st;
+    if (pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h || fstat(fd, &st) != 0 || memcmp(h, "EIQ4", 4) != 0) goto fail;
+    uint32_t ver, nt, rb; memcpy(&ver, h + 4, 4); memcpy(&nt, h + 8, 4); memcpy(&rb, h + 12, 4);
+    if (ver != 1u || nt != 2u || rb != (uint32_t)ENGRAM_IQ4_ROW) goto fail;
+    for (unsigned k = 0; k < 2u; k++) {
+        uint64_t off, n, data; memcpy(&off, h + 16 + 32 * k, 8); memcpy(&n, h + 24 + 32 * k, 8); memcpy(&data, h + 32 + 32 * k, 8);
+        if (off != gguf_offset) continue;
+        if (n != rows || data + n * rb > (uint64_t)st.st_size) goto fail;
+#ifdef __APPLE__
+        if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto fail;
+#endif
+        *t = (ds4_engram_table){.fd = fd, .offset = data, .rows = rows, .row_bytes = rb};
+        return true;
+    }
+fail:
+    close(fd); errno = EINVAL; return false;
+}
+
 bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
                      size_t count, float *out) {
     if (!t || t->fd < 0 || (count && (!rows || !out)) ||
@@ -183,8 +236,10 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
     }
     pthread_once(&engram_bf16_once, init_engram_bf16);
     uint8_t raw[DS4_ENGRAM_ROW_BYTES];
+    const uint32_t rb = ds4_engram_row_bytes(t);
     for (size_t i = 0; i < count; i++) {
-        if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * sizeof(raw), raw)) return false;
+        if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * rb, raw, rb)) return false;
+        if (rb == (uint32_t)ENGRAM_IQ4_ROW) { engram_decode_iq4(raw, out + i * DS4_ENGRAM_DIM); continue; }   /* llms ENGRAM_IQ4 */
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
             const uint16_t value = engram_bf16[raw[DS4_ENGRAM_DIM + j / 32]][raw[j]];
             if (value == UINT16_MAX) {
@@ -212,24 +267,15 @@ bool ds4_engram_read_mapped(const ds4_engram_table *t, const uint8_t *map, uint6
             return false;
         }
     }
+    pthread_once(&engram_bf16_once, init_engram_bf16);
     for (size_t i = 0; i < count; i++) {
-        const uint8_t *raw = map + (t->offset - map_file_off) + (uint64_t)rows[i] * DS4_ENGRAM_ROW_BYTES;
+        const uint8_t *raw = map + (t->offset - map_file_off) + (uint64_t)rows[i] * ds4_engram_row_bytes(t);
+        if (t->row_bytes == (uint32_t)ENGRAM_IQ4_ROW) { engram_decode_iq4(raw, out + i * DS4_ENGRAM_DIM); continue; }   /* llms ENGRAM_IQ4 */
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
-            uint8_t code = raw[j], scale = raw[DS4_ENGRAM_DIM + j / 32];
-            if ((code & 127) == 127 || scale == 255) {
-                errno = EDOM;
-                return false;
-            }
-            float value = ldexpf(e4m3(code), (int)scale - 127);
-            uint32_t bits;
-            memcpy(&bits, &value, sizeof(bits));
-            bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
-            memcpy(&value, &bits, sizeof(value));
-            if (!isfinite(value)) {
-                errno = EDOM;
-                return false;
-            }
-            out[i * DS4_ENGRAM_DIM + j] = value;
+            const uint16_t value = engram_bf16[raw[DS4_ENGRAM_DIM + j / 32]][raw[j]];
+            if (value == UINT16_MAX) { errno = EDOM; return false; }
+            const uint32_t bits = (uint32_t)value << 16;
+            memcpy(out + i * DS4_ENGRAM_DIM + j, &bits, sizeof(bits));
         }
     }
     return true;
@@ -293,7 +339,7 @@ static void *read_batch_thread(void *context) {
 }
 #endif
 
-bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
+static bool ds4_engram_read_batch_impl(const ds4_engram_table *t, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out) {
     if (!t || t->fd < 0 || (tokens && (!rows || !out || stride < DS4_ENGRAM_COLS)) ||
         tokens > SIZE_MAX / (DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(*out)) ||
@@ -330,7 +376,7 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= ENGRAM_PARALLEL_MIN_ROWS) {
-            batch.readers = ENGRAM_READERS;
+            batch.readers = count < ENGRAM_READERS ? count : ENGRAM_READERS;
 #ifdef __APPLE__
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
@@ -364,6 +410,232 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     int saved = errno;
     free(request);
     errno = saved;
+    return ok;
+}
+
+/* llms ENGRAM_TIME (apply_engram_time.py): LLMS_DS4_ENGRAM_TIME=1 times every batch read; off = one getenv, then a branch. */
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+static unsigned long long engram_time_calls[2], engram_time_tokens[2], engram_time_ns[2];
+static void engram_time_report(void) {
+    for (int k = 1; k >= 0; k--)
+        fprintf(stderr, "llms engram time (%s thread): %llu batch reads, %llu tokens, %.1f ms\n", k ? "main" : "other", engram_time_calls[k], engram_time_tokens[k], engram_time_ns[k] * 1e-6);
+}
+bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows, size_t tokens, size_t stride, float *out) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ENGRAM_TIME"); on = e && *e && *e != '0'; if (on) { fprintf(stderr, "llms: engram time (every batch read timed)\n"); atexit(engram_time_report); } }
+    if (!on) return ds4_engram_read_batch_impl(t, rows, tokens, stride, out);
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    const bool ok = ds4_engram_read_batch_impl(t, rows, tokens, stride, out);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    const int mainthread = pthread_main_np() ? 1 : 0; const unsigned long long ns = (unsigned long long)((b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec));
+    __atomic_fetch_add(&engram_time_calls[mainthread], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&engram_time_tokens[mainthread], tokens, __ATOMIC_RELAXED); __atomic_fetch_add(&engram_time_ns[mainthread], ns, __ATOMIC_RELAXED);
+    if (tokens >= 32) fprintf(stderr, "llms engram read: t=%.3f tokens %zu stride %zu main %d ok %d ms %.2f\n", a.tv_sec + a.tv_nsec * 1e-9, tokens, stride, mainthread, ok ? 1 : 0, ns * 1e-6);
+    return ok;
+}
+
+struct ds4_engram_prefetch {
+    const ds4_engram_table *table;
+    const uint32_t *rows;
+    size_t tokens, stride;
+    float *out;
+    bool ok;
+    int error;
+#ifdef __APPLE__
+    dispatch_group_t group;
+#else
+    pthread_t thread;
+    bool threaded;
+#endif
+};
+
+static void prefetch_run(void *context) {
+    ds4_engram_prefetch *p = context;
+    p->ok = ds4_engram_read_batch(p->table, p->rows, p->tokens, p->stride, p->out);
+    if (!p->ok) p->error = errno ? errno : EIO;
+}
+
+#ifndef __APPLE__
+static void *prefetch_thread(void *context) {
+    prefetch_run(context);
+    return NULL;
+}
+#endif
+
+ds4_engram_prefetch *ds4_engram_read_batch_start(const ds4_engram_table *table, const uint32_t *rows,
+                                                 size_t tokens, size_t stride, float *out) {
+    ds4_engram_prefetch *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    *p = (ds4_engram_prefetch){.table = table, .rows = rows, .tokens = tokens, .stride = stride, .out = out};
+#ifdef __APPLE__
+    p->group = dispatch_group_create();
+    dispatch_group_async_f(p->group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), p, prefetch_run);
+#else
+    p->threaded = pthread_create(&p->thread, NULL, prefetch_thread, p) == 0;
+    if (!p->threaded) prefetch_run(p);
+#endif
+    return p;
+}
+
+/* Page-cache warmer.  Sequential reads fill the kernel's cache with the table
+ * once; the uncached row readers then hit it instead of the device.  Spread
+ * prefill rows are the worst access pattern for external SSDs: a USB drive
+ * served ~6K random rows/s over the 189 GiB span, ~12 s per 2K prefill, but
+ * streams the whole span at ~1 GB/s.  Clean cached pages stay reclaimable, so
+ * the warmer is a hint, never a reservation: it stops at memory pressure. */
+enum { WARM_THREADS = 4 };
+#define WARM_CHUNK ((uint64_t)8 << 20)
+
+struct ds4_engram_warm {
+    int fd;
+    uint64_t begin, end, next;
+    _Atomic bool stop;
+    bool done, ok;
+    double started, seconds;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    unsigned running;
+    pthread_t thread[WARM_THREADS];
+    unsigned threads;
+};
+
+static double warm_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static bool warm_pressure(void) {
+#ifdef __APPLE__
+    int level = 0;
+    size_t len = sizeof(level);
+    /* 1 normal, 2 warn, 4 critical. */
+    return sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) == 0 &&
+           level > 1;
+#else
+    return false;
+#endif
+}
+
+static void *warm_thread(void *arg) {
+    ds4_engram_warm *w = arg;
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+    uint8_t *buf = malloc(WARM_CHUNK);
+    bool ok = buf != NULL;
+    for (unsigned n = 0; ok && !w->stop; n++) {
+        const uint64_t off = __atomic_fetch_add(&w->next, WARM_CHUNK, __ATOMIC_RELAXED);
+        if (off >= w->end) break;
+        if (!(n & 63) && warm_pressure()) {
+            w->stop = true;
+            ok = false;
+            break;
+        }
+        size_t left = (size_t)(w->end - off < WARM_CHUNK ? w->end - off : WARM_CHUNK);
+        const uint64_t end = off + left;
+        while (left) {
+            /* A short read still warms those pages; only the file offset advances. */
+            const ssize_t got = pread(w->fd, buf, left, (off_t)(end - left));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0 || (size_t)got > left) {
+                ok = false;
+                break;
+            }
+            left -= (size_t)got;
+        }
+    }
+    free(buf);
+    pthread_mutex_lock(&w->lock);
+    if (!ok) w->ok = false;
+    if (--w->running == 0) {
+        w->done = true;
+        w->seconds = warm_now() - w->started;
+        pthread_cond_broadcast(&w->cond);
+    }
+    pthread_mutex_unlock(&w->lock);
+    return NULL;
+}
+
+uint64_t ds4_engram_physical_memory(void) {
+#ifdef __APPLE__
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    return sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) == 0 ? bytes : 0;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0;
+#endif
+}
+
+ds4_engram_warm *ds4_engram_warm_start(const char *path, uint64_t offset, uint64_t bytes) {
+    if (!path || !bytes || offset > INT64_MAX || bytes > INT64_MAX - offset) return NULL;
+    ds4_engram_warm *w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
+    w->fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (w->fd < 0) {
+        free(w);
+        return NULL;
+    }
+    w->begin = w->next = offset;
+    w->end = offset + bytes;
+    w->ok = true;
+    w->started = warm_now();
+    pthread_mutex_init(&w->lock, NULL);
+    pthread_cond_init(&w->cond, NULL);
+    for (unsigned i = 0; i < WARM_THREADS; i++) {
+        pthread_mutex_lock(&w->lock);
+        w->running++;
+        pthread_mutex_unlock(&w->lock);
+        if (pthread_create(&w->thread[i], NULL, warm_thread, w)) {
+            pthread_mutex_lock(&w->lock);
+            w->running--;
+            pthread_mutex_unlock(&w->lock);
+            break;
+        }
+        w->threads++;
+    }
+    if (!w->threads) {
+        ds4_engram_warm_stop(w);
+        return NULL;
+    }
+    return w;
+}
+
+bool ds4_engram_warm_wait(ds4_engram_warm *w, double *seconds) {
+    if (!w) return false;
+    pthread_mutex_lock(&w->lock);
+    while (!w->done) pthread_cond_wait(&w->cond, &w->lock);
+    const bool ok = w->ok;
+    if (seconds) *seconds = w->seconds;
+    pthread_mutex_unlock(&w->lock);
+    return ok;
+}
+
+void ds4_engram_warm_stop(ds4_engram_warm *w) {
+    if (!w) return;
+    w->stop = true;
+    for (unsigned i = 0; i < w->threads; i++)
+        if (pthread_join(w->thread[i], NULL)) abort();
+    pthread_mutex_destroy(&w->lock);
+    pthread_cond_destroy(&w->cond);
+    close(w->fd);
+    free(w);
+}
+
+bool ds4_engram_read_batch_finish(ds4_engram_prefetch *p) {
+    if (!p) return false;
+#ifdef __APPLE__
+    dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+    dispatch_release(p->group);
+#else
+    if (p->threaded && pthread_join(p->thread, NULL)) abort();
+#endif
+    const bool ok = p->ok;
+    if (!ok) errno = p->error;
+    free(p);
     return ok;
 }
 
