@@ -193,7 +193,7 @@ static void linenoiseFoldClear(struct linenoiseState *l);
 
 static struct termios orig_termios; /* In order to restore at exit.*/
 static int maskmode = 0; /* Show "***" instead of input. For passwords. */
-static int rawmode = 0; /* For atexit function to check if restore is needed*/
+static int rawmode = 0; /* For atexit() function to check if restore is needed*/
 static int rawmode_output = STDOUT_FILENO; /* fd used for terminal escapes. */
 static int mlmode = 0;  /* Multi line mode. Default is single line. */
 static int atexit_registered = 0; /* Register atexit just 1 time. */
@@ -721,7 +721,7 @@ static int getColumns(int ifd, int ofd) {
     if (cols_env) return atoi(cols_env);
 
     if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
-        /* ioctl failed. Try to query the terminal itself. */
+        /* ioctl() failed. Try to query the terminal itself. */
         int start, cols;
 
         /* Get the initial position so we can restore it later. */

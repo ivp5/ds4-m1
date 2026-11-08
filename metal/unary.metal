@@ -252,7 +252,7 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_EXPM1) {
-            // Metal target profiles used here do not all expose expm1; this
+            // Metal target profiles used here do not all expose expm1(); this
             // generic unary branch is not used by the DS4 inference graph.
             dst_ptr[i0] = (T) (exp(x) - 1);
         }

@@ -227,7 +227,7 @@ kernel void kernel_dsv4_qkv_rms_norm_f32_4(
 
 #ifdef DS4_METAL_NORM_RSQRT_DISABLE
     // Match the formula used by kernel_rms_norm_fuse_impl above so both RMSNorm
-    // entry points produce bit-identical scales. Hardware rsqrt and 1.0f/sqrt
+    // entry points produce bit-identical scales. Hardware rsqrt() and 1.0f/sqrt()
     // can differ by ~1 ULP and that difference compounds across 43 layers.
     const float scale = 1.0f / sqrt(sumf / float(n) + args.eps);
 #else

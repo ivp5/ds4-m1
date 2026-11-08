@@ -6266,7 +6266,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_split_reduce(
 }
 
 
-kernel void kernel_astra_indexed_reduce_t32(
+kernel void kernel_llms_indexed_reduce_t32(
         constant ds4_metal_args_dsv4_indexed_attention & args,
         device const char *tmp,
         device const char *sinks,
@@ -8384,7 +8384,7 @@ kernel void llms_mqa4_reduce(constant llms_mqa4_args & a [[buffer(0)]], device c
     ((device float4 *)(heads + (uint64_t)h * 512u))[tid] = O / L;
 }
 
-kernel void kernel_astra_mqa_reduce_group(constant llms_mqa4_args & a [[buffer(0)]], device const float * part [[buffer(1)]], device const float * sinks [[buffer(2)]],
+kernel void kernel_llms_mqa_reduce_group(constant llms_mqa4_args & a [[buffer(0)]], device const float * part [[buffer(1)]], device const float * sinks [[buffer(2)]],
         device float * heads [[buffer(3)]], uint h [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float groupmax[4], maximum, weights[128], denominator;
     const uint nc=a.n_chunk, lane=tid&31u, sg=tid>>5;
@@ -8500,15 +8500,15 @@ kernel void llms_mqa7_partial(constant llms_mqa4_args & a [[buffer(0)]], device 
 
 
 // ---- llms IDX_COMPACT:
-struct astra_candidate_args { uint visible; float scale; };
-kernel void astra_candidate_tail(constant astra_candidate_args &a [[buffer(0)]],
+struct llms_candidate_args { uint visible; float scale; };
+kernel void llms_candidate_tail(constant llms_candidate_args &a [[buffer(0)]],
     device const half *keys [[buffer(1)]], device half *tail [[buffer(2)]],
     uint i [[thread_position_in_grid]]) {
     if (i >= 1024u || a.visible == 0u) return;
     const uint row = ((a.visible - 1u) / 8u) * 8u + i / 128u;
     tail[i] = row < a.visible ? keys[(ulong)row * 128u + i % 128u] : half(0);
 }
-kernel void astra_candidate_score_t4(constant astra_candidate_args &a [[buffer(0)]],
+kernel void llms_candidate_score_t4(constant llms_candidate_args &a [[buffer(0)]],
     device const float *q [[buffer(1)]], device const float *weights [[buffer(2)]],
     device const half *keys [[buffer(3)]], device float *scores [[buffer(4)]],
     device const uint *blocks [[buffer(5)]], device const half *tail [[buffer(6)]],
@@ -8549,7 +8549,7 @@ kernel void astra_candidate_score_t4(constant astra_candidate_args &a [[buffer(0
         }
     }
 }
-kernel void astra_candidate_remap(device const uint *blocks [[buffer(0)]],
+kernel void llms_candidate_remap(device const uint *blocks [[buffer(0)]],
     device const int *compact [[buffer(1)]], device int *original [[buffer(2)]],
     uint i [[thread_position_in_grid]]) {
     if (i >= 512u) return;
@@ -8557,7 +8557,7 @@ kernel void astra_candidate_remap(device const uint *blocks [[buffer(0)]],
     original[i] = c >= 0 && c < 16384 ? int(blocks[uint(c)/8u]*8u+uint(c)%8u) : -1;
 }
 
-kernel void astra_mask_list(device const float *mask [[buffer(0)]],
+kernel void llms_mask_list(device const float *mask [[buffer(0)]],
     device uint *list [[buffer(1)]], device uint *count [[buffer(2)]],
     constant uint &nb [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -9468,7 +9468,7 @@ void masked_impl(constant ds4_metal_args_glm_indexer_score_one & args, device co
 kernel void masked_rows(constant ds4_metal_args_glm_indexer_score_one *a [[buffer(0)]], device const char *q [[buffer(1)]], device const float *w [[buffer(2)]],device const char *k [[buffer(3)]], device float *s [[buffer(4)]], constant llms_idx_rows_batch &b [[buffer(5)]], device const float *m [[buffer(6)]],constant uint &ms [[buffer(7)]],threadgroup float *sm [[threadgroup(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 ntg [[threadgroups_per_grid]], ushort lane [[thread_index_in_simdgroup]],ushort sg [[simdgroup_index_in_threadgroup]]) { if(tg.y>=b.rows)return; masked_impl<4>(a[tg.y],q+(ulong)tg.y*4096u*4u,w+(ulong)tg.y*32u,k,s+(ulong)tg.y*b.score_stride,m+(ulong)tg.y*ms,sm,tg.x,ntg.x,lane,sg); }
 
 // ---- llms ATT2_H32:, appended verbatim from  ----
-kernel void kernel_astra_att2_h32d128(
+kernel void kernel_llms_att2_h32d128(
         constant ds4_metal_args_dsv4_indexed_attention & args,
         device const char *q, device const char *raw_kv, device const char *comp_kv, device const char *topk, device char *tmp,
         device const char *new_kv,   /* llms ATT2_RING: buffer 6, the step's new kv rows (a dummy when ring_prev is 0) */
@@ -9621,7 +9621,7 @@ kernel void kernel_astra_att2_h32d128(
     }
 }
 
-// ---- llms ATT2_PV2: kernel_astra_att2_h32d128 with its K / V rows padded to 520 halves and PV register-blocked ----
+// ---- llms ATT2_PV2: kernel_llms_att2_h32d128 with its K / V rows padded to 520 halves and PV register-blocked ----
 #if LLMS_ATT2_RS
 kernel void kernel_llms_att2_h32pv2(
         constant ds4_metal_args_dsv4_indexed_attention & args,

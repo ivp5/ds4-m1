@@ -63,7 +63,7 @@ static inline float dsv4_e4m3fn_value(int i) {
         : (1.0f + float(mant) * 0.125f) * dsv4_e4m3fn_exp_scale[exp];
 }
 
-static inline float astra_binary_round(float x, uint shift, float minimum_normal,
+static inline float llms_binary_round(float x, uint shift, float minimum_normal,
                                         float units_per_one, float unit, float ceiling) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = min(abs(x), ceiling);
@@ -73,10 +73,10 @@ static inline float astra_binary_round(float x, uint shift, float minimum_normal
     return sign * as_type<float>(b & ~((1u << shift) - 1u));
 }
 static inline float dsv4_e4m3fn_dequant(float x) {
-    return astra_binary_round(x, 20u, 0.015625f, 512.0f, 0.001953125f, 448.0f);
+    return llms_binary_round(x, 20u, 0.015625f, 512.0f, 0.001953125f, 448.0f);
 }
 static inline float dsv4_e2m1fn_dequant(float x) {
-    return astra_binary_round(x, 22u, 1.0f, 2.0f, 0.5f, 6.0f);
+    return llms_binary_round(x, 22u, 1.0f, 2.0f, 0.5f, 6.0f);
 }
 
 // Quantizes the non-RoPE part of a KV row through E4M3FN and writes the

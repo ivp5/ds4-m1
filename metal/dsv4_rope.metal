@@ -146,7 +146,7 @@ kernel void kernel_dsv4_rope_tail_f32(
             const int rel_i0 = 2*ic;
 #ifdef DS4_METAL_ROPE_EXP2_LOG2
             // Equivalent to pow(freq_base, k) but expressed through IEEE-754
-            // primitives that have tighter precision guarantees than Metal's pow.
+            // primitives that have tighter precision guarantees than Metal's pow().
             const float theta = theta_base * exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
 #else
             const float theta = theta_base * pow(args.freq_base, inv_ndims*rel_i0);
