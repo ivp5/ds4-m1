@@ -696,4 +696,6 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
+#include "llms_diag.h"   /* llms DIAG: last, after every declaration that names fprintf */
+
 #endif

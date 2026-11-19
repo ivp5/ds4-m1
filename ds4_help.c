@@ -1,4 +1,5 @@
 #include "ds4_help.h"
+#include "llms_diag.h"   /* llms DIAG */
 
 #include <stdbool.h>
 #include <stdio.h>

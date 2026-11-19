@@ -448,6 +448,23 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 #include "ds4_gpu.h"
 #endif
 
+/* llms DIAG (llms_diag.h): the one place a diagnostic is printed or dropped. */
+#undef fprintf
+int llms_diag_fprintf(FILE *f, const char *fmt, ...) {
+    static int show = -1, open_drop = 0;
+    if (f == stderr) {
+        if (show < 0) { const char *e = getenv("LLMS_DS4_DIAG"); show = e && *e ? *e != '0' : !isatty(STDERR_FILENO); }
+        if (!show) {
+            const size_t n = strlen(fmt); const int ends = n > 0 && fmt[n - 1] == '\n';
+            if (open_drop) { if (ends) open_drop = 0; return 0; }
+            if (!strncmp(fmt, "llms", 4) && !strstr(fmt, "FATAL") && !strstr(fmt, "efus") && !strstr(fmt, "REFUS") && !strstr(fmt, "failed") && !strstr(fmt, "FAILED") && !strstr(fmt, "cannot") &&
+                !strstr(fmt, "ignored") && !strstr(fmt, "STOP") && !strstr(fmt, "exit")) { if (!ends) open_drop = 1; return 0; }
+        }
+    }
+    va_list ap; va_start(ap, fmt); const int r = vfprintf(f, fmt, ap); va_end(ap); return r;
+}
+#define fprintf(...) llms_diag_fprintf(__VA_ARGS__)
+
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
  * stubs for the multi-GPU plumbing multi-GPU functions and globals declared in
  * ds4_gpu_mgpu.h. These keep the linker happy on Mac/Metal and on CPU

@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "ds4_engram.h"
+#include "llms_diag.h"   /* llms DIAG */
 
 #include <errno.h>
 #include <fcntl.h>
