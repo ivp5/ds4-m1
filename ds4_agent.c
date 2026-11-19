@@ -14983,8 +14983,20 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 }
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
+/* llms AGENT_QUIET: the terminal kept for one line when start-up fails with stderr in the file */
+static int llms_quiet_tty = -1, llms_quiet_ready = 0; static char llms_quiet_path[512];
+static void llms_quiet_report(void) { if (llms_quiet_tty >= 0 && !llms_quiet_ready) dprintf(llms_quiet_tty, "ds4-agent: start-up did not complete; the reason is in %s\n", llms_quiet_path); }
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    {   /* llms AGENT_QUIET (11-19 06:3x; the user: the engine's diagnostic lines drew over the interactive screen): an interactive session on a terminal sends stderr to a
+         * file in the launch directory; LLMS_DS4_AGENT_STDERR=1 keeps it on the screen, LLMS_DS4_AGENT_STDERR_LOG names the file. Non-interactive runs are untouched. */
+        const char *qe = getenv("LLMS_DS4_AGENT_STDERR");
+        if (!cfg.non_interactive && isatty(STDERR_FILENO) && isatty(STDOUT_FILENO) && !(qe && *qe && *qe != '0')) {
+            const char *qp = getenv("LLMS_DS4_AGENT_STDERR_LOG"); if (!qp || !*qp) qp = "ds4-agent.stderr.log";
+            llms_quiet_tty = dup(STDERR_FILENO); snprintf(llms_quiet_path, sizeof llms_quiet_path, "%s", qp);
+            if (freopen(qp, "a", stderr)) { setvbuf(stderr, NULL, _IOLBF, 0); atexit(llms_quiet_report); fprintf(stdout, "ds4-agent: engine diagnostics go to %s (LLMS_DS4_AGENT_STDERR=1 shows them here)\n", qp); fflush(stdout); }
+        }
+    }
     {   /* llms FOOTPRINT at start (apply_fpstart.py): every process reads the switch -- a single-task session has no '/new' */
         const char *fe = getenv("LLMS_DS4_FOOTPRINT");
         if (fe && *fe && *fe != '0') { task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT;
@@ -15050,6 +15062,7 @@ int main(int argc, char **argv) {
     } else if ((llms_adopted_engine_defaults(&cfg.engine), ds4_engine_open(&engine, &cfg.engine)) != 0) {
         return 1;
     }
+    llms_quiet_ready = 1;   /* llms AGENT_QUIET: the engine is open */
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
         fprintf(stderr, "ds4-agent: --think-level requires a DeepSeek V4.1 model\n");
         ds4_engine_close(engine);

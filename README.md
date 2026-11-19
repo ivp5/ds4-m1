@@ -173,6 +173,8 @@ expert-streaming layer (Qwen MoE streaming and the GLM exact-typed indexed decod
 128 GB-class machines. The merged engine computes exactly what was measured above: its deterministic dump on the published model files is
 identical to the measured engine's, all 818 positions.
 
+**Interactive sessions keep the screen clean.** `ds4-agent` on a terminal writes the engine's diagnostic lines to `ds4-agent.stderr.log` in the directory it was started from; `LLMS_DS4_AGENT_STDERR=1` shows them on the screen instead. Non-interactive runs print them as before.
+
 ## Known issues
 
 - With memory limits lower than step 2's the engine cannot lock all of its tables (it prints `NOT locked (mlock failed)`) and can run at

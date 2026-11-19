@@ -48347,7 +48347,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     }
     int qa_pending_layer = -1;   /* llms HC_FUSEQA: the layer whose attention-side transition was deferred to its top */
     bool qa_transition_done = false;
-    if (ok && count > 128) { for (int i = 0; i < count; i++) if (positions[i] >= 1048576u) { fill_bad_rows++; if (fill_bad_rows == 1) fprintf(stderr, "llms rows dbg: after the fill, positions[%d] = %u (first bad of %d rows)\n", i, positions[i], count); } if (!fill_bad_rows) fprintf(stderr, "llms rows dbg: after the fill all %d positions < 1048576 (positions[138] = %u)\n", count, positions[138]); }   /* llms rows dbg 3 */
+    if (ok && count > 128) { for (int i = 0; i < count; i++) if (positions[i] >= 1048576u) { fill_bad_rows++; if (fill_bad_rows == 1) fprintf(stderr, "llms rows dbg: after the fill, positions[%d] = %u (first bad of %d rows)\n", i, positions[i], count); } }   /* llms rows dbg 3 */
     for (; ok && il < DS4_N_LAYER; il++) {
         if (il == 0u && sp_my_role == 2) sp_baton_hold(1);   /* llms SP_BATON d9 */
         if (ledger_layer_on()) ds4_gpu_llms_set_ledger_tag(2, 3, il);
