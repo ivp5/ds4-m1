@@ -1,6 +1,6 @@
 # ds4-m1
 
-**DeepSeek V4.1 Flash 1017 on one 64 GB M1 Max: 41 tok/s decode · 313 tok/s prefill at a 1,045 MHz GPU clock (39 / 299 per GHz) · 595 tokens and 17.9 s per solved coding task.**
+**DeepSeek V4.1 Flash 1017 on one 64 GB M1 Max: 41 tok/s decode · 313 tok/s prefill at a 1,045 MHz GPU clock (39 / 299 per GHz) · 595 tokens and 17.9 s per solved coding task.** **At the GPU's full 1,296 MHz clock that is an estimated ~48 tok/s decode and ~378 tok/s prefill** (the measured rates scaled by the clock with the exponents measured inside levels, 0.69 for decode and 0.88 for prefill; a laptop under sustained load settles near 1,000-1,050 MHz, which is where the measured rates were taken).
 
 [antirez/ds4](https://github.com/antirez/ds4) with Metal kernels, Neural Engine programs, SSD expert streaming and a trained speculative drafter
 for a 64-GB Apple Silicon Mac. The whole model runs: all 384 routed experts, the Engram tables, thinking and tool calls. The experts stream from
