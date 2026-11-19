@@ -8,7 +8,7 @@
 #include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
-void ds4_gpu_llms_startup_mark(const char *label);   /* llms STARTUP_LOG */
+void ds4_gpu_llms_startup_mark(const char *label);
 
 #include <errno.h>
 #include <ctype.h>
@@ -162,7 +162,7 @@ typedef struct {
     pthread_t thread;
     pthread_mutex_t mu;
     pthread_cond_t cond;
-    pthread_cond_t bash_cv;   /* llms BASH_KQ: a bash job ended, or an interrupt / stop arrived */
+    pthread_cond_t bash_cv;
     int wake_fd[2];
     FILE *trace;
     bool wake_pending;
@@ -317,7 +317,6 @@ typedef enum {
     AGENT_DSML_ERROR,
 } agent_dsml_state;
 
-/* llms DSML_LINSCAN: the closing-tag recognizer fed * each parameter byte once. dsml_linear_scan gates its use; off = the original repeated scans. */
 #ifndef DSML_CLOSE_SCANNER_H
 #define DSML_CLOSE_SCANNER_H
 #include <stdio.h>
@@ -347,7 +346,7 @@ static void dsml_close_scan_byte(dsml_close_scanner *s,unsigned char c) {
 }
 #endif
 
-static const int dsml_linear_scan = 1;   /* llms DSML_LINSCAN (adopted for agent + cli; the switch removed 10-27): 0 restores antirez's repeated scans of the parameter bytes */
+static const int dsml_linear_scan = 1;
 
 typedef struct {
     agent_tool_syntax syntax;
@@ -424,7 +423,7 @@ typedef struct {
     bool dsml_in_think;
     bool dsml_in_think_reported;
     bool post_think_gap;
-    bool prev_nl, lt_line_start;   /* llms GREEDY_LT: the last byte was a newline; the held '<' opens a line */
+    bool prev_nl, lt_line_start;
     bool tool_preflight_error;
     char tool_preflight_error_msg[256];
 } agent_stream_renderer;
@@ -435,8 +434,8 @@ typedef struct {
 } agent_edit_upto_forcer;
 
 static volatile sig_atomic_t agent_sigint;
-static volatile sig_atomic_t agent_term;   /* llms AGENT_TERM_CLEAN (apply_term_clean.py) */
-static void agent_term_handler(int sig) { (void)sig; agent_term = 1; }   /* llms AGENT_TERM_CLEAN */
+static volatile sig_atomic_t agent_term;
+static void agent_term_handler(int sig) { (void)sig; agent_term = 1; }
 static agent_worker *agent_completion_worker;
 
 static void worker_apply_pending_power(agent_worker *w);
@@ -756,7 +755,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     return argv[++(*i)];
 }
 
-static int llms_think_arg_seen;   /* llms AGENT_THINK_LEVEL: a think option was given on the command line */
+static int llms_think_arg_seen;
 static agent_config parse_options(int argc, char **argv) {
     agent_config c = {
         .engine = {
@@ -911,17 +910,17 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think-level")) {
-            llms_think_arg_seen = 1;   /* llms AGENT_THINK_LEVEL */
+            llms_think_arg_seen = 1;
             if (!ds4_think_mode_parse_level(need_arg(&i, argc, argv, arg), &c.gen.think_mode)) {
                 fprintf(stderr, "ds4-agent: --think-level requires an integer from 0 to 100\n");
                 exit(2);
             }
         } else if (!strcmp(arg, "--think")) {
-            c.gen.think_mode = DS4_THINK_HIGH; llms_think_arg_seen = 1;   /* llms AGENT_THINK_LEVEL */
+            c.gen.think_mode = DS4_THINK_HIGH; llms_think_arg_seen = 1;
         } else if (!strcmp(arg, "--think-max")) {
-            c.gen.think_mode = DS4_THINK_MAX; llms_think_arg_seen = 1;   /* llms AGENT_THINK_LEVEL */
+            c.gen.think_mode = DS4_THINK_MAX; llms_think_arg_seen = 1;
         } else if (!strcmp(arg, "--nothink")) {
-            c.gen.think_mode = DS4_THINK_NONE; llms_think_arg_seen = 1;   /* llms AGENT_THINK_LEVEL */
+            c.gen.think_mode = DS4_THINK_NONE; llms_think_arg_seen = 1;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--metal")) {
@@ -1353,7 +1352,7 @@ static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
     memcpy(out + a + b, agent_tools_prompt_after_edit, schemas);
     if (vision) snprintf(out + a + b + schemas, v + 1, "%s%s}\n", vision_start, agent_vision_tool_schema);
     memcpy(out + a + b + schemas + v, rules, c - schemas + 1);
-    {   /* llms SCHEMA_DIET (apply_schema_diet.py): LLMS_DS4_AGENT_SCHEMA_DIET=1 -- bash without timeout_sec / refresh_sec in its schema and the prompt's call to pass them */
+    {
         const char *e = getenv("LLMS_DS4_AGENT_SCHEMA_DIET");
         if (e && *e && *e != '0') {
             static const char *cut[3][2] = {
@@ -1367,37 +1366,37 @@ static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
                 const size_t n = strlen(cut[i][0]), w = strlen(cut[i][1]); if (w > n) continue;
                 memmove(p + w, p + n, strlen(p + n) + 1); memcpy(p, cut[i][1], w); made++;
             }
-            static int said; if (!said) { said = 1; fprintf(stderr, "llms: agent schema diet (bash without timeout_sec / refresh_sec in its schema and the prompt's call to pass them: %d of 3 cuts)\n", made); }
+            static int said; if (!said) { said = 1; ((void)0); }
         }
     }
-    {   /* llms AGENT_ACT_RULE (apply_act_rule.py): LLMS_DS4_AGENT_ACT_RULE=1 -- test a suspicion by editing and running the tests, not by hand-tracing */
+    {
         const char *e = getenv("LLMS_DS4_AGENT_ACT_RULE");
         if (e && *e && *e != '0') {
             static const char rule[] = "\n# Debugging\n\nWhen you suspect a specific line is wrong, change it with the edit tool right away and run the tests. "
                 "An edit and a test run cost less than tracing the code by hand, and if the tests still fail you can undo the edit. "
                 "Prefer running code to simulating it in your head.\n";
             size_t n = strlen(out), r = strlen(rule); char *o2 = xmalloc(n + r + 1); memcpy(o2, out, n); memcpy(o2 + n, rule, r + 1); free(out); out = o2;
-            static int said2; if (!said2) { said2 = 1; fprintf(stderr, "llms: agent act rule (the system prompt asks to test a suspicion by editing and running the tests)\n"); }
+            static int said2; if (!said2) { said2 = 1; ((void)0); }
         }
     }
-    {   /* llms AGENT_READ_RULE (apply_read_rule.py): LLMS_DS4_AGENT_READ_RULE=1 -- read the exercised code line by line before running experiments */
+    {
         const char *e = getenv("LLMS_DS4_AGENT_READ_RULE");
         if (e && *e && *e != '0') {
             static const char rule[] = "\n# Debugging\n\nBefore you run experiments, read the code that the failing test exercises, one function at a time, "
                 "and say for each line whether it does what the function is meant to do. "
                 "Most bugs are visible in the code once you read it closely; experiments are for checking what you found.\n";
             size_t n = strlen(out), r = strlen(rule); char *o2 = xmalloc(n + r + 1); memcpy(o2, out, n); memcpy(o2 + n, rule, r + 1); free(out); out = o2;
-            static int said3; if (!said3) { said3 = 1; fprintf(stderr, "llms: agent read rule (the system prompt asks to read the exercised code line by line before running experiments)\n"); }
+            static int said3; if (!said3) { said3 = 1; ((void)0); }
         }
     }
-    {   /* llms AGENT_ORIGIN_RULE (apply_origin_rule.py): LLMS_DS4_AGENT_ORIGIN_RULE=1 -- the tests decide; no search for an original of the code */
+    {
         const char *e = getenv("LLMS_DS4_AGENT_ORIGIN_RULE");
         if (e && *e && *e != '0') {
             static const char rule[] = "\n# Debugging\n\nThe tests decide what is correct. Do not look for an original or upstream copy of the code you are fixing, "
                 "and do not rely on remembering one: with the modified code in front of you, a remembered version tends to repeat what you just read. "
                 "When the code or a test run shows which line causes the failure, edit that line and run the tests.\n";
             size_t n = strlen(out), r = strlen(rule); char *o2 = xmalloc(n + r + 1); memcpy(o2, out, n); memcpy(o2 + n, rule, r + 1); free(out); out = o2;
-            static int said4; if (!said4) { said4 = 1; fprintf(stderr, "llms: agent origin rule (the system prompt says the tests decide and asks not to seek an original of the code)\n"); }
+            static int said4; if (!said4) { said4 = 1; ((void)0); }
         }
     }
     return out;
@@ -1551,8 +1550,8 @@ static void agent_worker_note_system_prompt_seen(agent_worker *w) {
     w->last_system_prompt_reminder_at = w->transcript.len;
 }
 
-static time_t llms_agent_now(void) {   /* llms AGENT_NOW (apply_agent_datetime.py): the prompt's datetime pinned for forced-trajectory arms */
-    const char *e = getenv("LLMS_DS4_AGENT_NOW"); if (e && *e) { const long long v = atoll(e); if (v > 0) { static int warning_printed; if (!warning_printed) { warning_printed = 1; fprintf(stderr, "llms: agent now pinned to %lld (the system prompt's datetime)\n", v); } return (time_t)v; } }
+static time_t llms_agent_now(void) {
+    const char *e = getenv("LLMS_DS4_AGENT_NOW"); if (e && *e) { const long long v = atoll(e); if (v > 0) { static int warning_printed; if (!warning_printed) { warning_printed = 1; ((void)0); } return (time_t)v; } }
     return time(NULL);
 }
 static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
@@ -1833,16 +1832,14 @@ static void agent_tool_calls_push(agent_tool_calls *calls, agent_tool_call *call
     memset(call, 0, sizeof(*call));
 }
 
-/* llms AGENT_CANON_CALLS: off unless LLMS_DS4_AGENT_CANON_CALLS=1. The history keeps each completed call * as it RAN: a repeated parameter element (the executor read the first) is cut and the DSML block re-tokenised, so a malformed shape never re-enters the context. */
 static long g_llms_canon_checked, g_llms_canon_rewritten, g_llms_canon_cut;
-/* Cut every later occurrence of a repeated parameter element inside each invoke of a DSML41 block. Returns the number of elements cut; *out is malloc'd (the block, edited). */
 static int llms_canon_dsml_text(const char *in, char **out) {
     const char *P_OPEN = "<｜DSML｜ parameter name=\"", *P_CLOSE = "</｜DSML｜ parameter>", *I_OPEN = "<｜DSML｜ invoke", *I_CLOSE = "</｜DSML｜ invoke>";
     size_t n = strlen(in); char *o = xmalloc(n + 1); size_t w = 0; int cut = 0;
     char names[32][96]; int nn = 0;
     const char *p = in, *end = in + n;
     while (p < end) {
-        if (!strncmp(p, I_OPEN, strlen(I_OPEN)) || !strncmp(p, I_CLOSE, strlen(I_CLOSE))) nn = 0;   /* a new invoke (or its close): names reset */
+        if (!strncmp(p, I_OPEN, strlen(I_OPEN)) || !strncmp(p, I_CLOSE, strlen(I_CLOSE))) nn = 0;
         if (!strncmp(p, P_OPEN, strlen(P_OPEN))) {
             const char *nm = p + strlen(P_OPEN); const char *q = strchr(nm, '"'); const char *cl = q ? strstr(q, P_CLOSE) : NULL;
             if (q && cl && (size_t)(q - nm) < 95) {
@@ -1862,12 +1859,11 @@ static int llms_canon_calls_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("LLMS_DS4_AGENT_CANON_CALLS"); on = e && *e && *e != '0';
-        if (on) {   /* the canary: a fixed block with a repeated name must come back with exactly the later copy cut */
+        if (on) {
             const char *a = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">ls</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"refresh_sec\" string=\"false\">60</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"refresh_sec\" string=\"false\">60</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"refresh_sec\" string=\"false\">5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
             const char *b = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">ls</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"refresh_sec\" string=\"false\">60</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"refresh_sec\" string=\"false\">5</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
             char *r = NULL; int c = llms_canon_dsml_text(a, &r); char *r2 = NULL; int c2 = llms_canon_dsml_text(b, &r2);
             bool ok = c == 1 && !strcmp(r, b) && c2 == 0 && !strcmp(r2, b); free(r); free(r2);
-            fprintf(stderr, "llms: agent canon calls on (a completed call that repeats a parameter name is kept in the history with its first occurrence only, the block re-tokenised; canary %s)\n", ok ? "PASS" : "FAIL");
             if (!ok) exit(78);
         }
     }
@@ -1892,7 +1888,7 @@ static void llms_canon_calls(agent_worker *w, int assistant_start, const agent_t
     offs[nt] = len; txt[len] = 0;
     const char *start = "<｜DSML｜ calls>"; char *blk = NULL; for (char *q = strstr(txt, start); q; q = strstr(q + 1, start)) blk = q;
     int k = -1; if (blk) { size_t at = (size_t)(blk - txt); for (int i = 0; i < nt; i++) if (offs[i] == at) { k = i; break; } }
-    if (k < 0) { fprintf(stderr, "llms canon calls: the block does not start on a token boundary -- left as generated\n"); free(txt); free(offs); return; }
+    if (k < 0) { ((void)0); free(txt); free(offs); return; }
     char *edited = NULL; int cut = llms_canon_dsml_text(blk, &edited);
     if (cut > 0) {
         ds4_tokens tk = {0}; ds4_tokenize_rendered_chat(w->engine, edited, &tk);
@@ -1900,7 +1896,6 @@ static void llms_canon_calls(agent_worker *w, int assistant_start, const agent_t
         for (int i = 0; i < tk.len; i++) ds4_tokens_push(&w->transcript, tk.v[i]);
         g_llms_canon_rewritten++; g_llms_canon_cut += cut;
         agent_trace(w, "llms canon calls: %d repeated parameter elements cut, block %d -> %d tokens", cut, before, tk.len);
-        fprintf(stderr, "llms canon calls: %d repeated parameter elements cut, block %d -> %d tokens\n", cut, before, tk.len);
         ds4_tokens_free(&tk);
     }
     free(edited); free(txt); free(offs);
@@ -2026,7 +2021,7 @@ static bool agent_tool_value_close_tail(agent_tool_syntax syntax,
 }
 
 static void agent_dsml_update_param_close_prefix(agent_dsml_parser *p) {
-    if (dsml_linear_scan && !agent_syntax_is_xml_tool_call(p->syntax)) {   /* llms DSML_LINSCAN */
+    if (dsml_linear_scan && !agent_syntax_is_xml_tool_call(p->syntax)) {
         p->param_close_prefix = p->state == AGENT_DSML_PARAM_VALUE &&
                                 p->param_scanner.partial;
         return;
@@ -2102,7 +2097,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
         if (p->state == AGENT_DSML_PARAM_VALUE) {
             size_t end_tag_len = 0;
             char *end;
-            if (dsml_linear_scan) {   /* llms DSML_LINSCAN: only the bytes appended since the last call */
+            if (dsml_linear_scan) {
                 dsml_close_scanner *scan = &p->param_scanner;
                 while (scan->offset < p->raw_len - p->param_value_start && scan->found == SIZE_MAX)
                     dsml_close_scan_byte(scan, (unsigned char)p->raw[p->param_value_start + scan->offset]);
@@ -2170,7 +2165,7 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
             }
             p->parse_pos += tag_len;
             p->param_value_start = p->parse_pos;
-            dsml_close_scan_init(&p->param_scanner, parameter);   /* llms DSML_LINSCAN */
+            dsml_close_scan_init(&p->param_scanner, parameter);
             p->param_close_prefix = false;
             p->state = AGENT_DSML_PARAM_VALUE;
         } else {
@@ -4120,7 +4115,7 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
  * the DSML detector.  The detector must hold short prefixes because the model
  * can split "<｜DSML｜tool_calls>" across arbitrary tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
-    const bool glt_was_nl = sr->prev_nl; sr->prev_nl = c == '\n';   /* llms GREEDY_LT */
+    const bool glt_was_nl = sr->prev_nl; sr->prev_nl = c == '\n';
     const char *canonical_invoke = sr->syntax == AGENT_TOOL_SYNTAX_DSML41 ?
         "<｜DSML｜ invoke" : "<｜DSML｜invoke";
     const char *start = agent_tool_start(sr->syntax);
@@ -4140,7 +4135,7 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     }
 
     if (sr->dsml_start_len || c == start[0]) {
-        if (sr->dsml_start_len == 0) sr->lt_line_start = glt_was_nl || sr->post_think_gap;   /* llms GREEDY_LT: the held '<' opens a line */
+        if (sr->dsml_start_len == 0) sr->lt_line_start = glt_was_nl || sr->post_think_gap;
         if (sr->dsml_start_len < sizeof(sr->dsml_start_tail))
             sr->dsml_start_tail[sr->dsml_start_len++] = c;
         bool complete = false, implicit_invoke = false;
@@ -5097,7 +5092,7 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     ds4_session_set_progress(w->session, NULL, NULL);
     ds4_session_set_display_progress(w->session, NULL, NULL);
     agent_trace(w, "prefill sync done prompt=%d cached=%d suffix=%d rc=%d %.3f ms pos=%d common=%d",
-                tokens->len, cached, suffix, rc, (t_sync1 - t_sync0) * 1000.0, old_pos, common);   /* llms 04:1x: the cache rule's two inputs (apply_sync_trace.py) */
+                tokens->len, cached, suffix, rc, (t_sync1 - t_sync0) * 1000.0, old_pos, common);
     return rc;
 }
 
@@ -5106,37 +5101,36 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
  * rendered prompt text still matches the file.  The same fixed path is shared
  * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
  * model families rebuilds this cache instead of restoring incompatible KV. */
-void ds4_llms_set_exact_sync(int on);   /* llms SYSPROMPT_EXACT: ds4.c */
-void ds4_llms_set_append_exact(int on);   /* llms TOOLREAD: ds4.c */
+void ds4_llms_set_exact_sync(int on);
+void ds4_llms_set_append_exact(int on);
 
-static int llms_exact_append_rounds(void) {   /* llms TOOLREAD (apply_toolread.py): LLMS_DS4_AGENT_EXACT_APPEND=tools | task */
+static int llms_exact_append_rounds(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LLMS_DS4_AGENT_EXACT_APPEND"); v = (!e || !*e || !strcmp(e, "0")) ? 0 : !strcmp(e, "tools") ? 1 : !strcmp(e, "task") ? 2 : 0;
-                 if (v) fprintf(stderr, "llms: agent exact append -- the append route policy OFF for the %s only (as LLMS_DS4_APPEND_ROUTE_POLICY=0 there; every other dial as shipped) -- FIDELITY DIAL [LLMS_DS4_AGENT_EXACT_APPEND]\n",
-                                v == 1 ? "tool-output rounds (round >= 1)" : "task prompt (round 0)"); }
+                 if (v) ((void)0); }
     return v;
 }
-static unsigned long long llms_tx_syncs, llms_tx_rows;   /* llms AGENT_TASK_EXACT (apply_task_exact.py): the counters of its exit line */
-static int llms_task_exact(void) {   /* llms AGENT_TASK_EXACT: LLMS_DS4_AGENT_TASK_EXACT=N -- 1: round 0's append (the task prompt) under exact sync; N >= 2: also later appends of at most N rows. Off unless set. */
+static unsigned long long llms_tx_syncs, llms_tx_rows;
+static int llms_task_exact(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LLMS_DS4_AGENT_TASK_EXACT"); v = e && *e ? atoi(e) : 0; if (v < 0) v = 0;
-                 if (v) { fprintf(stderr, "llms: agent task exact %d (round 0's append under exact sync%s -- FIDELITY DIAL) [LLMS_DS4_AGENT_TASK_EXACT]\n", v, v >= 2 ? ", and later appends of at most that many rows" : "");
-                          atexit_b(^{ fprintf(stderr, "llms agent task exact: %llu syncs under exact sync, %llu rows\n", llms_tx_syncs, llms_tx_rows); }); } }
+                 if (v) { ((void)0);
+                          atexit_b(^{ ((void)0); }); } }
     return v;
 }
-static int llms_sysprompt_exact(void) {   /* llms SYSPROMPT_EXACT (apply_sysprompt_exact.py): LLMS_DS4_AGENT_SYSPROMPT_EXACT=1 */
+static int llms_sysprompt_exact(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LLMS_DS4_AGENT_SYSPROMPT_EXACT"); v = e && *e && *e != '0';
-                 if (v) fprintf(stderr, "llms: sysprompt exact (the system-prompt checkpoint built with EXACT_DET's prefill dials, kept at sysprompt.exact.<hash of the rendered prompt>.kv)\n"); }
+                 if (v) ((void)0); }
     return v;
 }
-static volatile int llms_lb_attempt;   /* llms LB_RESTART (apply_lb_restart.py): loopbreaks in the current attempt; reset at each submit / resubmit */
-static volatile int llms_rs_edited;   /* 11-02 apply_restart_fix.py: set when a write / edit tool call runs; RESTART_NOEDIT reads it */
-static uint64_t llms_restart_salt;   /* llms AGENT_RESTART (apply_agent_restart.py): 0 unless a restart fired -- the seed expression is then unchanged */
+static volatile int llms_lb_attempt;
+static volatile int llms_rs_edited;
+static uint64_t llms_restart_salt;
 
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
     agent_worker_images_clear(w);
-    const int llms_spx = llms_sysprompt_exact();   /* llms SYSPROMPT_EXACT: read at every start (the env audit) */
+    const int llms_spx = llms_sysprompt_exact();
     ds4_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
 
@@ -5148,9 +5142,9 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
         return false;
     }
 
-    if (llms_spx) {   /* llms SYSPROMPT_EXACT2 (apply_sysprompt_exact2.py): one exact checkpoint per rendered prompt */
+    if (llms_spx) {
         uint64_t llms_h = 1469598103934665603ull; for (size_t i = 0; i < text_len; i++) { llms_h ^= (uint8_t)text[i]; llms_h *= 1099511628211ull; }
-        {   /* llms SYSPROMPT_PAYLOAD (apply_sysprompt_payload.py): LLMS_DS4_AGENT_SYSPROMPT_PAYLOAD=1 keys the checkpoint by the payload too */
+        {
             const char *llms_pk = getenv("LLMS_DS4_AGENT_SYSPROMPT_PAYLOAD");
             if (llms_pk && *llms_pk && *llms_pk != '0') {
                 static const char *const llms_pv[] = {"LLMS_DS4_GATEUP_BS64", "LLMS_DS4_DOWN_G32", "LLMS_DS4_ROUTE_GAIN", "LLMS_DS4_ROUTE_GAIN_LAYERS", "DS4_METAL_MOE_SOURCE",
@@ -5164,7 +5158,6 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
                         const uint64_t f[2] = {(uint64_t)llms_st.st_size, (uint64_t)llms_st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)llms_st.st_mtimespec.tv_nsec};
                         for (int j = 0; j < 2; j++) for (int b = 0; b < 8; b++) { llms_h ^= (uint8_t)(f[j] >> (8 * b)); llms_h *= 1099511628211ull; } }
                 }
-                fprintf(stderr, "llms: sysprompt payload key -- the exact checkpoint is keyed by the rendered prompt AND the payload (%016llx)\n", (unsigned long long)llms_h);
             }
         }
         char llms_nm[64]; snprintf(llms_nm, sizeof llms_nm, "sysprompt.exact.%016llx.kv", (unsigned long long)llms_h);
@@ -5178,7 +5171,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
                                     NULL,
                                     load_err, sizeof(load_err));
         if (loaded) {
-            ds4_gpu_llms_startup_mark("agent: sysprompt kv loaded");   /* llms STARTUP_LOG */
+            ds4_gpu_llms_startup_mark("agent: sysprompt kv loaded");
             agent_trace(w, "sysprompt kv hit file=%s tokens=%d",
                         w->sysprompt_path, w->transcript.len);
         }
@@ -5189,7 +5182,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
             agent_publish_system_status(w, "Updating system prompt cache...");
         ds4_tokens_free(&w->transcript);
         ds4_tokens_copy(&w->transcript, &sys);
-        if (llms_spx) { ds4_llms_set_exact_sync(1); fprintf(stderr, "llms: sysprompt exact build -- %d rows\n", (int)w->transcript.len); }   /* llms SYSPROMPT_EXACT */
+        if (llms_spx) { ds4_llms_set_exact_sync(1); ((void)0); }
         const int llms_spx_rc = agent_worker_sync_tokens(w, &w->transcript, true, err, err_len);
         if (llms_spx) ds4_llms_set_exact_sync(0);
         if (llms_spx_rc != 0) {
@@ -6673,12 +6666,11 @@ static int agent_read_default_lines(agent_worker *w) {
 /* Read file text for the model.  Normal mode shows plain line numbers.  Raw
  * mode is reserved for cases where line decoration would corrupt the payload
  * being inspected. */
-/* llms AGENT_READ_LINE_CAP (apply_read_line_cap.py): the read tool shows at most N characters of one line, then a marker */
 static int g_rlc = -1; static unsigned long long g_rlc_cut, g_rlc_chars;
 static int agent_read_line_cap(void) {
     if (g_rlc < 0) { const char *e = getenv("LLMS_DS4_AGENT_READ_LINE_CAP"); g_rlc = e && *e ? atoi(e) : 0; if (g_rlc < 0) g_rlc = 0;
-        if (g_rlc > 0) { fprintf(stderr, "llms: agent read line cap %d (the read tool shows at most %d characters of a line, then a marker with the bash command that prints it)\n", g_rlc, g_rlc);
-                         atexit_b(^{ fprintf(stderr, "llms agent read line cap: %llu lines cut, %llu characters hidden\n", g_rlc_cut, g_rlc_chars); }); } }
+        if (g_rlc > 0) { ((void)0);
+                         atexit_b(^{ ((void)0); }); } }
     return g_rlc;
 }
 static char *agent_read_range_from(agent_worker *w, const char *path, int start_line,
@@ -6706,7 +6698,7 @@ static char *agent_read_range_from(agent_worker *w, const char *path, int start_
         if (c == '\n' || c == '\r') line++;
     }
     bool beginning = !mid_line, prefix = true;
-    int last_line = 0; int rlc_col = 0; const int rlc_cap = bare ? 0 : agent_read_line_cap();   /* llms AGENT_READ_LINE_CAP */
+    int last_line = 0; int rlc_col = 0; const int rlc_cap = bare ? 0 : agent_read_line_cap();
     while ((whole_file || lines < max_lines) && (c = fgetc(fp)) != EOF) {
         if (body.len >= AGENT_TOOL_MAX_BYTES - 4096 &&
             ((c & 0xc0) != 0x80 || body.len >= AGENT_TOOL_MAX_BYTES - 4096 + 3)) {
@@ -6737,8 +6729,8 @@ static char *agent_read_range_from(agent_worker *w, const char *path, int start_
                 else ch = '\n';
             }
         }
-        if (rlc_cap > 0 && ch && ch != '\n') {   /* llms AGENT_READ_LINE_CAP: past the cap, the rest of the line is skipped and named */
-            if (rlc_col >= rlc_cap && (((unsigned char)ch) & 0xC0) != 0x80) {   /* llms AGENT_READ_LINE_CAP v2: cut only at a code-point boundary */
+        if (rlc_cap > 0 && ch && ch != '\n') {
+            if (rlc_col >= rlc_cap && (((unsigned char)ch) & 0xC0) != 0x80) {
                 long skipped = 1; int d;
                 while ((d = fgetc(fp)) != EOF && d != '\n' && d != '\r') skipped++;
                 if (d == '\r') { int n2 = fgetc(fp); if (n2 != '\n' && n2 != EOF) ungetc(n2, fp); }
@@ -6827,18 +6819,17 @@ static char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
                                  w->more_bare, true, w->more_byte_offset, w->more_mid_line);
 }
 
-/* llms EDIT_PYCHECK (apply_edit_pycheck.py): an edited or written .py file is parsed by python3; a SyntaxError is appended to the result */
 static int llms_edit_pycheck_state = -1; static unsigned long long llms_pycheck_runs, llms_pycheck_fails;
-static void llms_pycheck_exit(void) { fprintf(stderr, "llms agent edit pycheck: %llu parses, %llu syntax errors reported\n", llms_pycheck_runs, llms_pycheck_fails); }
+static void llms_pycheck_exit(void) { ((void)0); }
 static int llms_edit_pycheck_on(void) {
     if (llms_edit_pycheck_state < 0) { const char *e = getenv("LLMS_DS4_AGENT_EDIT_PYCHECK"); llms_edit_pycheck_state = e && *e && *e != '0';
-        if (llms_edit_pycheck_state) { fprintf(stderr, "llms: agent edit pycheck (an edited or written .py file is parsed by python3; a syntax error is reported in the tool result)\n"); atexit(llms_pycheck_exit); } }
+        if (llms_edit_pycheck_state) { ((void)0); atexit(llms_pycheck_exit); } }
     return llms_edit_pycheck_state;
 }
 static char *llms_pycheck_append(const char *path, char *result) {
     if (!result || !path || !llms_edit_pycheck_on()) return result;
     const size_t pl = strlen(path); if (pl < 3 || strcmp(path + pl - 3, ".py") != 0) return result;
-    static const char prog[] =   /* llms EDIT_PYCHECK_FIX (apply_pycheck_fix.py): generated from pycheck_fix_prog.py verbatim */
+    static const char prog[] =
                                "import ast, sys\n"
                                "try:\n"
                                "    ast.parse(open(sys.argv[1], 'rb').read(), sys.argv[1])\n"
@@ -6885,9 +6876,9 @@ static char *llms_pycheck_append(const char *path, char *result) {
     int fds[2]; if (pipe(fds) != 0) return result;
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, fds[1], 1); posix_spawn_file_actions_addclose(&fa, fds[0]); posix_spawn_file_actions_addclose(&fa, fds[1]);
-    const char *ev = getenv("LLMS_DS4_AGENT_EDIT_PYCHECK"), *interp = (ev && strchr(ev, '/')) ? ev : "python3";   /* a path names the parser: the sandbox's /usr/bin/python3 is 3.9.6, whose message on a dropped bracket points at the NEXT line; >= 3.10 names the opener */
-    const char *dv = getenv("LLMS_DS4_AGENT_EDIT_PYCHECK_DETAIL"); const int detail = dv && (*dv == '1' || *dv == '2');   /* llms EDIT_PYCHECK_DETAIL (apply_pycheck_detail.py) */
-    char *argv[] = {(char *)interp, "-c", (char *)prog, (char *)path, detail ? (char *)(*dv == '2' ? "fix" : "detail") : NULL, NULL};   /* llms EDIT_PYCHECK_FIX: '2' = the computed repair too */
+    const char *ev = getenv("LLMS_DS4_AGENT_EDIT_PYCHECK"), *interp = (ev && strchr(ev, '/')) ? ev : "python3";
+    const char *dv = getenv("LLMS_DS4_AGENT_EDIT_PYCHECK_DETAIL"); const int detail = dv && (*dv == '1' || *dv == '2');
+    char *argv[] = {(char *)interp, "-c", (char *)prog, (char *)path, detail ? (char *)(*dv == '2' ? "fix" : "detail") : NULL, NULL};
     pid_t pid; const int rc = posix_spawnp(&pid, interp, &fa, NULL, argv, environ); posix_spawn_file_actions_destroy(&fa); close(fds[1]);
     if (rc != 0) { close(fds[0]); return result; }
     char buf[1024]; size_t n = 0; ssize_t r; while (n < sizeof(buf) - 1 && (r = read(fds[0], buf + n, sizeof(buf) - 1 - n)) > 0) n += (size_t)r;
@@ -6916,7 +6907,7 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     }
     char msg[PATH_MAX + 160];
     snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, path);
-    return llms_pycheck_append(path, xstrdup(msg));   /* llms EDIT_PYCHECK */
+    return llms_pycheck_append(path, xstrdup(msg));
 }
 
 static char *agent_tool_list(const agent_tool_call *call) {
@@ -7189,9 +7180,8 @@ static const char *agent_memmem_simple(const char *hay, size_t hay_len,
     return NULL;
 }
 
-/* llms EDIT_HINT (apply_edit_hint.py): LLMS_DS4_AGENT_EDIT_HINT=1 -- an edit whose old text is not found is told where its first non-blank line occurs with indentation ignored (up to 3 lines, each with its count of leading spaces or tabs); the edit is still refused */
 static int llms_edit_hint_state = -1; static unsigned long long llms_edit_hint_given, llms_edit_hint_none;
-static void llms_edit_hint_report(void) { fprintf(stderr, "llms edit hint: %llu not-found anchors given a hint, %llu with no matching line\n", llms_edit_hint_given, llms_edit_hint_none); }
+static void llms_edit_hint_report(void) { ((void)0); }
 static void llms_edit_hint(const char *data, size_t len, const char *needle, size_t needle_len, char *err, size_t err_len) {
     if (llms_edit_hint_state < 0) { const char *e = getenv("LLMS_DS4_AGENT_EDIT_HINT"); llms_edit_hint_state = e && *e && *e != '0'; if (llms_edit_hint_state) atexit(llms_edit_hint_report); }
     if (!llms_edit_hint_state || !data || !needle || !err || err_len == 0) return;
@@ -7226,7 +7216,7 @@ static bool agent_find_unique(const char *data, size_t len,
     const char *first = agent_memmem_simple(data, len, needle, needle_len);
     if (!first) {
         snprintf(err, err_len, "%s anchor not found", label);
-        llms_edit_hint(data, len, needle, needle_len, err, err_len);   /* llms EDIT_HINT */
+        llms_edit_hint(data, len, needle, needle_len, err, err_len);
         return false;
     }
     size_t after_first = (size_t)(first - data) + 1;
@@ -8180,7 +8170,7 @@ static char *agent_apply_file_splice(const char *path,
     char *result = agent_edit_result(path, start_line, end_line, delta,
                                      out, out_len, kind);
     free(out);
-    return llms_pycheck_append(path, result);   /* llms EDIT_PYCHECK */
+    return llms_pycheck_append(path, result);
 }
 
 /* Old/new editing is intentionally conservative: exact old text must be unique.
@@ -8644,14 +8634,14 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
  * are tail-biased and report the total captured output size.
  */
 
-static int agent_bash_head_lines_v = -1, agent_bash_head_bytes_v = -1;   /* llms AGENT_BASH_HEAD (apply_bash_head.py) */
+static int agent_bash_head_lines_v = -1, agent_bash_head_bytes_v = -1;
 static void agent_bash_head_init(void) {
     if (agent_bash_head_lines_v >= 0) return;
     agent_bash_head_lines_v = 100; agent_bash_head_bytes_v = 8 * 1024;
     const char *e = getenv("LLMS_DS4_AGENT_BASH_HEAD");
     if (e && *e && strchr(e, ':')) { int l = atoi(e), b = atoi(strchr(e, ':') + 1);
         if (l >= 10 && l <= 5000 && b >= 1024 && b <= 120 * 1024) { agent_bash_head_lines_v = l; agent_bash_head_bytes_v = b;
-            fprintf(stderr, "llms: agent bash head %d lines / %d bytes (the bash tool's inline output preview; compiled 100 / 8192)\n", l, b); } }
+            ((void)0); } }
 }
 static int agent_bash_head_lines(void) { agent_bash_head_init(); return agent_bash_head_lines_v; }
 static int agent_bash_head_bytes(void) { agent_bash_head_init(); return agent_bash_head_bytes_v; }
@@ -8664,8 +8654,8 @@ static int agent_bash_head_bytes(void) { agent_bash_head_init(); return agent_ba
 struct agent_bash_job {
     pthread_t thread;
     pthread_mutex_t mu;
-    int kq;   /* llms BASH_KQ: the monitor's kqueue (-1: none) */
-    int done;   /* llms BASH_KQ: set atomically by the monitor after the job ended; read without job->mu */
+    int kq;
+    int done;
     bool thread_started;
     int id;
     pid_t pid;
@@ -8717,7 +8707,7 @@ static void agent_bash_signal(agent_bash_job *job, int sig) {
         kill(-job->pid, sig);
         if (!job->reaped) kill(job->pid, sig);
 #ifdef __APPLE__
-        if (job->kq >= 0) { struct kevent t; EV_SET(&t, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL); kevent(job->kq, &t, 1, NULL, 0, NULL); }   /* llms BASH_KQ: the monitor re-reads the stop deadline now */
+        if (job->kq >= 0) { struct kevent t; EV_SET(&t, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL); kevent(job->kq, &t, 1, NULL, 0, NULL); }
 #endif
     }
     pthread_mutex_unlock(&job->mu);
@@ -8874,11 +8864,11 @@ static void agent_bash_poll(agent_bash_job *job) {
 }
 
 
-static int llms_bash_poll_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("LLMS_DS4_BASH_POLL"); v = e && *e ? atoi(e) : 0; if (v < 0 || v > 50) v = 0; } return v; }   /* llms BASH_POLL (apply_bash_poll.py) */
-static int llms_bash_kq_on(void) {   /* llms BASH_KQ (apply_bash_kq.py) */
+static int llms_bash_poll_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("LLMS_DS4_BASH_POLL"); v = e && *e ? atoi(e) : 0; if (v < 0 || v > 50) v = 0; } return v; }
+static int llms_bash_kq_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LLMS_DS4_BASH_KQ"); v = e && *e && *e != '0';
-                 if (v) fprintf(stderr, "llms: bash kq (the bash tool waits on the child's exit, its output and its own deadlines -- no polling)\n"); }
+                 if (v) ((void)0); }
     return v;
 }
 #ifdef __APPLE__
@@ -8892,7 +8882,7 @@ static void *agent_bash_monitor_kq(agent_bash_job *job) {
     if (job->pipe_fd >= 0) { EV_SET(&ch[nch], (uintptr_t)job->pipe_fd, EVFILT_READ, EV_ADD, 0, 0, NULL); nch++; }
     EV_SET(&ch[nch], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL); nch++;
     pthread_mutex_unlock(&job->mu);
-    for (int i = 0; i < nch; i++) (void)kevent(kq, &ch[i], 1, NULL, 0, NULL);   /* one at a time: NOTE_EXIT on a child already gone fails (ESRCH) and the poll below reaps it */
+    for (int i = 0; i < nch; i++) (void)kevent(kq, &ch[i], 1, NULL, 0, NULL);
     int read_fd = nch == 3 ? (int)ch[1].ident : -1;
     for (;;) {
         pthread_mutex_lock(&job->mu);
@@ -8906,15 +8896,14 @@ static void *agent_bash_monitor_kq(agent_bash_job *job) {
         double rel = dl - now_sec(); if (rel < 0) rel = 0;
         const struct timespec ts = { (time_t)rel, (long)((rel - (double)(time_t)rel) * 1e9) };
         struct kevent ev[4];
-        if (kevent(kq, NULL, 0, ev, 4, &ts) < 0 && errno != EINTR) usleep(50000);   /* a broken kqueue: stay bounded */
+        if (kevent(kq, NULL, 0, ev, 4, &ts) < 0 && errno != EINTR) usleep(50000);
     }
     pthread_mutex_lock(&job->mu); job->kq = -1; pthread_mutex_unlock(&job->mu);
     close(kq);
     __atomic_store_n(&job->done, 1, __ATOMIC_RELEASE);
-    if (job->worker) { pthread_mutex_lock(&job->worker->mu); pthread_cond_broadcast(&job->worker->bash_cv); pthread_mutex_unlock(&job->worker->mu); }   /* no job lock held here */
+    if (job->worker) { pthread_mutex_lock(&job->worker->mu); pthread_cond_broadcast(&job->worker->bash_cv); pthread_mutex_unlock(&job->worker->mu); }
     return NULL;
 }
-/* Wait until the kq monitor marks the job done, the deadline passes, or (honor_interrupt) an interrupt / stop arrives. Holds only w->mu: never job->mu (lock order). */
 static void agent_bash_wait_until(agent_worker *w, agent_bash_job *job, double deadline, bool honor_interrupt) {
     pthread_mutex_lock(&w->mu);
     for (;;) {
@@ -8931,7 +8920,7 @@ static void agent_bash_wait_until(agent_worker *w, agent_bash_job *job, double d
 static void *agent_bash_monitor(void *arg) {
     agent_bash_job *job = arg;
 #ifdef __APPLE__
-    if (llms_bash_kq_on()) return agent_bash_monitor_kq(job);   /* llms BASH_KQ */
+    if (llms_bash_kq_on()) return agent_bash_monitor_kq(job);
 #endif
     for (;;) {
         pthread_mutex_lock(&job->mu);
@@ -8941,10 +8930,10 @@ static void *agent_bash_monitor(void *arg) {
         pthread_mutex_unlock(&job->mu);
         if (!running) break;
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int rc = poll(&pfd, 1, llms_bash_poll_ms() ? llms_bash_poll_ms() : 50);   /* llms BASH_POLL */
+        int rc = poll(&pfd, 1, llms_bash_poll_ms() ? llms_bash_poll_ms() : 50);
         /* A closed stdout must not turn the deadline monitor into a busy loop. */
         if (rc > 0 && (pfd.revents & POLLHUP) && !(pfd.revents & POLLIN))
-            usleep(llms_bash_poll_ms() ? (useconds_t)llms_bash_poll_ms() * 1000u : 50000u);   /* llms BASH_POLL */
+            usleep(llms_bash_poll_ms() ? (useconds_t)llms_bash_poll_ms() * 1000u : 50000u);
     }
     return NULL;
 }
@@ -8985,10 +8974,10 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
                                         int timeout_sec, char *err, size_t err_len) {
     char tmp_path[PATH_MAX] = "/tmp/ds4_agent_output_XXXXXX";
     int tmpfd;
-    {   /* llms TOOL_STABLE2 (apply_tool_stable2.py): a deterministic spill path in measurement sessions (mkstemp's suffix reached the model) */
+    {
         static int ts2 = -1; static unsigned stable_n; static const char *sdir;
         if (ts2 < 0) { const char *e = getenv("LLMS_DS4_TOOL_STABLE"); sdir = getenv("LLMS_DS4_TOOL_STABLE_DIR"); ts2 = e && *e && *e != '0' && sdir && *sdir;
-                       if (ts2) { mkdir(sdir, 0700); fprintf(stderr, "llms: tool stable spill (bash output files at %s/ds4_agent_output_stable_<n> -- measurement only)\n", sdir); } }
+                       if (ts2) { mkdir(sdir, 0700); ((void)0); } }
         if (ts2) { snprintf(tmp_path, sizeof tmp_path, "%s/ds4_agent_output_stable_%u", sdir, ++stable_n); tmpfd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); }
         else tmpfd = mkstemp(tmp_path);
     }
@@ -9032,7 +9021,7 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     agent_bash_job *job = xmalloc(sizeof(*job));
     memset(job, 0, sizeof(*job));
     pthread_mutex_init(&job->mu, NULL);
-    job->kq = -1;   /* llms BASH_KQ */
+    job->kq = -1;
     if (w->next_bash_job_id <= 0) w->next_bash_job_id = 1;
     job->id = w->next_bash_job_id++;
     job->pid = pid;
@@ -9160,9 +9149,9 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed, boo
     int display_lines = agent_bash_display_lines(job);
     double elapsed = (job->running ? now_sec() : job->end_time) - job->start_time;
     long shown_pid = (long)job->pid;
-    {   /* llms TOOL_STABLE (apply_tool_stable.py): measurement sessions see no run-to-run values in the header */
+    {
         static int ts = -1; if (ts < 0) { const char *e = getenv("LLMS_DS4_TOOL_STABLE"); ts = e && *e && *e != '0';
-            if (ts) fprintf(stderr, "llms: tool stable (the bash header's pid = 1000 + job, elapsed in whole seconds -- measurement only)\n"); }
+            if (ts) ((void)0); }
         if (ts) { shown_pid = 1000L + (long)job->id; elapsed = (double)(long)elapsed; }
     }
 
@@ -9348,11 +9337,11 @@ static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
                                    int refresh_sec) {
     double start = now_sec();
 #ifdef __APPLE__
-    if (llms_bash_kq_on()) { agent_bash_wait_until(w, job, start + refresh_sec, true); return; }   /* llms BASH_KQ */
+    if (llms_bash_kq_on()) { agent_bash_wait_until(w, job, start + refresh_sec, true); return; }
 #endif
     while (agent_bash_is_running(job) && now_sec() - start < refresh_sec) {
         if (worker_should_interrupt(w)) break;
-        usleep(llms_bash_poll_ms() ? (useconds_t)llms_bash_poll_ms() * 1000u : 20000u);   /* llms BASH_POLL */
+        usleep(llms_bash_poll_ms() ? (useconds_t)llms_bash_poll_ms() * 1000u : 20000u);
     }
 }
 
@@ -9364,7 +9353,7 @@ static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
         agent_bash_signal(job, SIGTERM);
         double start = now_sec();
 #ifdef __APPLE__
-        if (llms_bash_kq_on()) agent_bash_wait_until(w, job, start + 1.0, false); else   /* llms BASH_KQ: the SIGTERM grace, unpolled */
+        if (llms_bash_kq_on()) agent_bash_wait_until(w, job, start + 1.0, false); else
 #endif
         while (agent_bash_is_running(job) && now_sec() - start < 1.0) {
             usleep(20000);
@@ -9481,12 +9470,10 @@ static void agent_tool_view_image(agent_worker *w,
 }
 
 
-/* llms GFORCE_NAME (apply_gforce_name.py): the DSML41 tool / parameter NAME values held to the agent's own names; off unless LLMS_DS4_GFORCE_NAME is set */
 static const char *const g_gfn_tools[] = {"bash", "bash_status", "bash_stop", "read", "more", "write", "edit", "search", "list", "google_search", "visit_page", "view_image"};
 static const char *const g_gfn_params[] = {"command", "content", "glob", "mode", "new", "old", "path", "query", "url", "case_sensitive", "context", "count", "job",
                                            "max_lines", "max_results", "pid", "raw", "refresh_sec", "start_line", "timeout_sec", "whole"};
 static uint64_t g_gfn_checks, g_gfn_fixed, g_gfn_fallback;
-/* llms AGENT_PARAM_UNIQ v2 (apply_param_uniq2.py): with LLMS_DS4_AGENT_PARAM_UNIQ set, a parameter NAME is held to the current tool's schema minus the parameters already completed in this invoke. g_pu_allow_n -1: inactive (the flat list). */
 static const char *const g_pu2_schema[][9] = { {"bash", "command", "timeout_sec", "refresh_sec", NULL}, {"bash_status", "job", "pid", "refresh_sec", NULL}, {"bash_stop", "job", "pid", "refresh_sec", NULL},
     {"read", "path", "start_line", "max_lines", "whole", "raw", NULL}, {"more", "count", NULL}, {"write", "path", "content", NULL}, {"edit", "path", "old", "new", NULL},
     {"search", "query", "path", "mode", "glob", "context", "max_results", "case_sensitive", NULL}, {"list", "path", NULL}, {"google_search", "query", NULL}, {"visit_page", "url", NULL} };
@@ -9494,17 +9481,17 @@ static const char *g_pu_allow[9]; static int g_pu_allow_n = -1; static uint64_t 
 static void agent_pu_set_allow(const char *raw, size_t rl) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("LLMS_DS4_AGENT_PARAM_UNIQ"); on = e && *e && *e != '0';
-                  if (on) atexit_b(^{ fprintf(stderr, "llms agent param uniq names: %llu name checks made against a reduced list, %llu with no name left\n", (unsigned long long)g_pu_name_rows, (unsigned long long)g_pu_name_empty); }); }
+                  if (on) atexit_b(^{ ((void)0); }); }
     g_pu_allow_n = -1;
     if (!on || !raw) return;
     static const char IV[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c invoke name=\"", PN[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c parameter name=\"", PC[] = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c parameter>";
     const size_t ivl = sizeof IV - 1, pnl = sizeof PN - 1, pcl = sizeof PC - 1; size_t iv = (size_t)-1, last_pc = 0;
-    for (size_t i = 0; i + ivl <= rl; i++) if (raw[i] == '<' && !memcmp(raw + i, IV, ivl)) iv = i;   /* the last invoke */
+    for (size_t i = 0; i + ivl <= rl; i++) if (raw[i] == '<' && !memcmp(raw + i, IV, ivl)) iv = i;
     if (iv == (size_t)-1) return;
     const char *tn = raw + iv + ivl; size_t tl = 0; while (iv + ivl + tl < rl && tn[tl] != '"' && tl < 40) tl++;
     int t = -1; for (size_t k = 0; k < sizeof g_pu2_schema / sizeof g_pu2_schema[0]; k++) if (strlen(g_pu2_schema[k][0]) == tl && !memcmp(g_pu2_schema[k][0], tn, tl)) t = (int)k;
-    if (t < 0) return;   /* a tool outside the table keeps the flat list */
-    for (size_t i = iv + ivl; i + pcl <= rl; i++) if (raw[i] == '<' && !memcmp(raw + i, PC, pcl)) last_pc = i;   /* the last completed parameter's close */
+    if (t < 0) return;
+    for (size_t i = iv + ivl; i + pcl <= rl; i++) if (raw[i] == '<' && !memcmp(raw + i, PC, pcl)) last_pc = i;
     int n = 0;
     for (int k = 1; g_pu2_schema[t][k]; k++) {
         const size_t kl = strlen(g_pu2_schema[t][k]); int used = 0;
@@ -9516,11 +9503,10 @@ static void agent_pu_set_allow(const char *raw, size_t rl) {
 static int agent_gfn_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("LLMS_DS4_GFORCE_NAME"); on = e && *e && *e != '0';
-                  if (on) { fprintf(stderr, "llms: gforce name (a DSML41 tool / parameter name token that continues no known name is replaced)\n");
-                            atexit_b(^{ fprintf(stderr, "llms gforce name: %llu name tokens checked, %llu replaced (%llu by the fallback)\n", (unsigned long long)g_gfn_checks, (unsigned long long)g_gfn_fixed, (unsigned long long)g_gfn_fallback); }); } }
+                  if (on) { ((void)0);
+                            atexit_b(^{ ((void)0); }); } }
     return on;
 }
-/* s: the text after the last '>' / newline. 0: not in a name form; 1 tool, 2 parameter -- *v / *vl the value so far, *closed when its quote arrived */
 static int agent_gfn_judge(const char *s, size_t n, const char **v, size_t *vl, int *closed) {
     static const char inv[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c invoke name=\"", par[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c parameter name=\"";
     int kind = 0; size_t fl = 0;
@@ -9532,7 +9518,7 @@ static int agent_gfn_judge(const char *s, size_t n, const char **v, size_t *vl, 
     return kind;
 }
 static int agent_gfn_ok(int kind, const char *v, size_t vl, int closed) {
-    if (kind == 2 && g_pu_allow_n >= 0) {   /* llms AGENT_PARAM_UNIQ v2: the current tool's unused schema parameters only */
+    if (kind == 2 && g_pu_allow_n >= 0) {
         g_pu_name_rows++; if (!g_pu_allow_n) g_pu_name_empty++;
         for (int i = 0; i < g_pu_allow_n; i++) { const size_t l = strlen(g_pu_allow[i]); if (closed ? (l == vl && !memcmp(g_pu_allow[i], v, vl)) : (vl <= l && !memcmp(g_pu_allow[i], v, vl))) return 1; }
         return 0;
@@ -9541,16 +9527,15 @@ static int agent_gfn_ok(int kind, const char *v, size_t vl, int closed) {
     for (size_t i = 0; i < nn; i++) { const size_t l = strlen(nm[i]); if (closed ? (l == vl && !memcmp(nm[i], v, vl)) : (vl <= l && !memcmp(nm[i], v, vl))) return 1; }
     return 0;
 }
-/* the token's verdict: 1 fits or not a name position, 0 breaks a name. tail: the parser's text after its last '>' / newline */
 static int agent_gfn_token_fits(const char *tail, size_t tl, const char *tok, size_t tk) {
     char comb[320]; if (tl + tk >= sizeof comb) return 1;
     const char *v; size_t vl; int closed;
-    if (agent_gfn_judge(tail, tl, &v, &vl, &closed) && closed) return 1;   /* the name was already complete before this token */
+    if (agent_gfn_judge(tail, tl, &v, &vl, &closed) && closed) return 1;
     memcpy(comb, tail, tl); memcpy(comb + tl, tok, tk);
     const int kind = agent_gfn_judge(comb, tl + tk, &v, &vl, &closed);
     return !kind || agent_gfn_ok(kind, v, vl, closed);
 }
-static size_t agent_gfn_tail(const agent_stream_renderer *sr, char *out, size_t cap) {   /* 0: not in a structural DSML41 position */
+static size_t agent_gfn_tail(const agent_stream_renderer *sr, char *out, size_t cap) {
     if (!sr || !sr->parser || sr->parser->syntax != AGENT_TOOL_SYNTAX_DSML41 || !sr->dsml_active || sr->parser->state != AGENT_DSML_STRUCTURAL) return 0;
     const char *raw = sr->parser->raw ? sr->parser->raw : ""; size_t rl = sr->parser->raw_len, k = rl;
     while (k > 0 && raw[k - 1] != '>' && raw[k - 1] != '\n') k--;
@@ -9560,26 +9545,25 @@ static size_t agent_gfn_tail(const agent_stream_renderer *sr, char *out, size_t 
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
-static int g_agent_escalated; static uint64_t g_agent_esc_lb, g_agent_esc_tool;   /* llms ESCALATE (apply_escalate.py) */
-static int g_think_esc; static float g_think_bonus = -1.0f; static uint64_t g_think_esc_rounds, g_think_esc_tokens;   /* llms THINK_BONUS: g_think_esc 1 exact, 2 bonus */
-static void think_esc_off(ds4_session *s) { extern void ds4_gpu_llms_think_bonus(int, float); if (g_think_esc == 2) ds4_gpu_llms_think_bonus(0, 0.0f); else if (g_think_esc == 1 && !g_agent_escalated) ds4_session_escalate(s, 0); g_think_esc = 0; }   /* llms THINK_ESCALATE (apply_think_escalate.py) */
+static int g_agent_escalated; static uint64_t g_agent_esc_lb, g_agent_esc_tool;
+static int g_think_esc; static float g_think_bonus = -1.0f; static uint64_t g_think_esc_rounds, g_think_esc_tokens;
+static void think_esc_off(ds4_session *s) { extern void ds4_gpu_llms_think_bonus(int, float); if (g_think_esc == 2) ds4_gpu_llms_think_bonus(0, 0.0f); else if (g_think_esc == 1 && !g_agent_escalated) ds4_session_escalate(s, 0); g_think_esc = 0; }
 static int agent_escalate_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LLMS_DS4_ESCALATE"); v = e && *e && *e != '0';
-                 if (v) { fprintf(stderr, "llms: escalate (a derail signature -- loop-break, syntax retry, unknown tool -- puts the rest of the task on exact decode routing)\n");
-                          atexit_b(^{ fprintf(stderr, "llms escalate agent: %llu by loop-break / syntax retry, %llu by an unknown tool\n", (unsigned long long)g_agent_esc_lb, (unsigned long long)g_agent_esc_tool); }); } }
+                 if (v) { ((void)0);
+                          atexit_b(^{ ((void)0); }); } }
     return v;
 }
-/* llms AGENT_EDIT_NUDGE (apply_edit_nudge.py): an in-band note once an attempt has run T s without an edit */
 static int g_en_on = -1, g_en_fired, g_en_edited; static double g_en_t, g_en_t0; static unsigned long long g_en_notes;
-static long g_en_hyp_n = -1, g_en_tok, g_en_hyp_tok = -1; static char g_en_win[97]; static size_t g_en_wl; static unsigned long long g_en_notes_hyp, g_en_hyps;   /* llms EDIT_NUDGE_HYP */
+static long g_en_hyp_n = -1, g_en_tok, g_en_hyp_tok = -1; static char g_en_win[97]; static size_t g_en_wl; static unsigned long long g_en_notes_hyp, g_en_hyps;
 static int agent_en_hyp_on(void) {
     if (g_en_hyp_n < 0) { const char *e = getenv("LLMS_DS4_AGENT_EDIT_NUDGE_HYP"); g_en_hyp_n = e && *e ? atol(e) : 0; if (g_en_hyp_n < 0) g_en_hyp_n = 0;
-        if (g_en_hyp_n > 0) { fprintf(stderr, "llms: agent edit nudge HYP (a note once a stated fix hypothesis is %ld tokens old with no edit, once an attempt)\n", g_en_hyp_n);
-            atexit_b(^{ fprintf(stderr, "llms agent edit nudge hyp: %llu hypotheses seen, %llu notes\n", g_en_hyps, g_en_notes_hyp); }); } }
+        if (g_en_hyp_n > 0) { ((void)0);
+            atexit_b(^{ ((void)0); }); } }
     return g_en_hyp_n > 0;
 }
-static void agent_en_feed(agent_worker *w, int token) {   /* the commit loop: every committed token; O(1) a token (a 96-byte window, fixed patterns) */
+static void agent_en_feed(agent_worker *w, int token) {
     if (!agent_en_hyp_on()) return;
     g_en_tok++;
     if (g_en_hyp_tok >= 0) return;
@@ -9588,36 +9572,35 @@ static void agent_en_feed(agent_worker *w, int token) {   /* the commit loop: ev
         if (g_en_wl == 96) { memmove(g_en_win, g_en_win + 48, 48); g_en_wl = 48; } g_en_win[g_en_wl++] = ch; }
     g_en_win[g_en_wl] = 0; free(tt);
     static const char *pat[] = { "should be `", "the bug is", "bug is that", "maybe bug", "maybe the bug", "that's the bug", "thats the bug", "seems bug", "seems a bug", "seems the bug", "this is the bug", "fix is to", "fix would be", NULL };
-    for (int i = 0; pat[i]; i++) if (strstr(g_en_win, pat[i])) { g_en_hyp_tok = g_en_tok; g_en_hyps++; fprintf(stderr, "llms agent edit nudge hyp: a stated fix ('%s') at token %ld of the attempt\n", pat[i], g_en_tok); break; }
+    for (int i = 0; pat[i]; i++) if (strstr(g_en_win, pat[i])) { g_en_hyp_tok = g_en_tok; g_en_hyps++; ((void)0); break; }
 }
 static int agent_en_on(void) {
     if (g_en_on >= 0) return g_en_on;
     const char *e = getenv("LLMS_DS4_AGENT_EDIT_NUDGE"); g_en_t = e && *e ? atof(e) : 0.0; g_en_on = g_en_t > 0.0;
-    if (g_en_on) { fprintf(stderr, "llms: agent edit nudge (a note on the next tool result once an attempt has run %.0f s without an edit, once an attempt)\n", g_en_t);
-                   atexit_b(^{ fprintf(stderr, "llms agent edit nudge: %llu notes\n", g_en_notes); }); }
+    if (g_en_on) { ((void)0);
+                   atexit_b(^{ ((void)0); }); }
     return g_en_on;
 }
-/* llms EDIT_NUDGE v3 (apply_edit_nudge3.py): 'edited' = a file present at the attempt's start changed (size or mtime); one stat sweep at the start */
 enum { EN_MAXF = 256 }; static char g_en_fn[EN_MAXF][128]; static off_t g_en_fsz[EN_MAXF]; static long long g_en_fmt[EN_MAXF]; static int g_en_nf = -1;
 static long long en_mtime_ns(const struct stat *st) { return (long long)st->st_mtimespec.tv_sec * 1000000000LL + st->st_mtimespec.tv_nsec; }
-static void agent_en_snapshot(void) {   /* O(entries of '.'), at most EN_MAXF regular files kept */
+static void agent_en_snapshot(void) {
     g_en_nf = 0; DIR *d = opendir("."); if (!d) return; struct dirent *e; struct stat st;
     while ((e = readdir(d)) && g_en_nf < EN_MAXF) {
         if (strlen(e->d_name) >= sizeof g_en_fn[0] || stat(e->d_name, &st) != 0 || !S_ISREG(st.st_mode)) continue;
         strcpy(g_en_fn[g_en_nf], e->d_name); g_en_fsz[g_en_nf] = st.st_size; g_en_fmt[g_en_nf] = en_mtime_ns(&st); g_en_nf++; }
     closedir(d);
 }
-static int agent_en_changed(void) {   /* O(k): one stat a recorded file */
+static int agent_en_changed(void) {
     if (g_en_nf < 0) agent_en_snapshot();
     struct stat st;
     for (int i = 0; i < g_en_nf; i++) if (stat(g_en_fn[i], &st) != 0 || st.st_size != g_en_fsz[i] || en_mtime_ns(&st) != g_en_fmt[i]) return 1;
     return 0;
 }
-static int g_rnc_on = -1; static unsigned long long g_rnc_kept, g_rnc_dropped;   /* llms RESTART_NOTE_IF_CHANGED (apply_restart_note_cond.py) */
+static int g_rnc_on = -1; static unsigned long long g_rnc_kept, g_rnc_dropped;
 static int agent_rnc_on(void) {
     if (g_rnc_on < 0) { const char *e = getenv("LLMS_DS4_AGENT_RESTART_NOTE_IF_CHANGED"); g_rnc_on = e && *e && *e != '0';
-        if (g_rnc_on) { fprintf(stderr, "llms: agent restart note only if a file changed (the retry gets the note when a file present at the first attempt's start changed)\n");
-                        atexit_b(^{ fprintf(stderr, "llms agent restart note if changed: %llu kept, %llu dropped\n", g_rnc_kept, g_rnc_dropped); }); } }
+        if (g_rnc_on) { ((void)0);
+                        atexit_b(^{ ((void)0); }); } }
     return g_rnc_on;
 }
 static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_call *call);
@@ -9625,22 +9608,21 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     char *res = agent_execute_tool_call_inner(w, call);
     if (!(agent_en_on() || agent_en_hyp_on()) || !call || !call->name) return res;
     if (g_en_t0 <= 0.0) g_en_t0 = now_sec();
-    if (!g_en_edited && agent_en_changed()) g_en_edited = 1;   /* llms EDIT_NUDGE v3: a file the attempt started with changed */
+    if (!g_en_edited && agent_en_changed()) g_en_edited = 1;
     const double age = now_sec() - g_en_t0;
-    const int by_time = g_en_t > 0.0 && age >= g_en_t, by_hyp = agent_en_hyp_on() && g_en_hyp_tok >= 0 && g_en_tok - g_en_hyp_tok >= g_en_hyp_n;   /* llms EDIT_NUDGE_HYP */
+    const int by_time = g_en_t > 0.0 && age >= g_en_t, by_hyp = agent_en_hyp_on() && g_en_hyp_tok >= 0 && g_en_tok - g_en_hyp_tok >= g_en_hyp_n;
     if (g_en_fired || g_en_edited || !(by_time || by_hyp) || !res) return res;
     g_en_fired = 1; if (by_hyp) g_en_notes_hyp++; else g_en_notes++;
     char note[320]; if (by_hyp) snprintf(note, sizeof note, "\n[note: you named a candidate fix %ld tokens ago and no file has been edited. Apply it now with the edit tool, then run the tests; if they fail, undo it.]\n", g_en_tok - g_en_hyp_tok);
     else snprintf(note, sizeof note, "\n[note: %.0f s into this attempt no file has been edited. If you have a candidate fix, apply it now with the edit tool, then run the tests.]\n", age);
     size_t a = strlen(res), b = strlen(note); char *out = xmalloc(a + b + 1); memcpy(out, res, a); memcpy(out + a, note, b + 1); free(res);
-    fprintf(stderr, "llms agent edit nudge: note at %.0f s into the attempt (%s)\n", age, by_hyp ? "by a stated fix" : "by time");
     return out;
 }
-static char g_at_cmd[2048]; static int g_at_on_v = -1; static uint64_t g_at_runs, g_at_seen;   /* llms AGENT_AUTO_TEST (apply_auto_test.py) */
+static char g_at_cmd[2048]; static int g_at_on_v = -1; static uint64_t g_at_runs, g_at_seen;
 static int agent_at_on(void) {
     if (g_at_on_v < 0) { const char *e = getenv("LLMS_DS4_AGENT_AUTO_TEST"); g_at_on_v = e && *e && *e != '0';
-        if (g_at_on_v) { fprintf(stderr, "llms: agent auto test (after a successful edit the session's last test command runs once and its output joins the edit's result)\n");
-            atexit_b(^{ fprintf(stderr, "llms agent auto test: %llu test commands remembered, %llu auto-runs after edits\n", (unsigned long long)g_at_seen, (unsigned long long)g_at_runs); }); } }
+        if (g_at_on_v) { ((void)0);
+            atexit_b(^{ ((void)0); }); } }
     return g_at_on_v;
 }
 static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_call *call) {
@@ -9649,10 +9631,10 @@ static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_cal
 
     if (!strcmp(call->name, "read")) return agent_tool_read(w, call);
     if (!strcmp(call->name, "more")) return agent_tool_more(w, call);
-    if (!strcmp(call->name, "write")) { llms_rs_edited = 1; return agent_tool_write(w, call); }   /* llms RESTART_NOEDIT */
+    if (!strcmp(call->name, "write")) { llms_rs_edited = 1; return agent_tool_write(w, call); }
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
-    if (!strcmp(call->name, "edit")) { llms_rs_edited = 1; char *r_ = agent_tool_edit(w, call);   /* llms RESTART_NOEDIT */
-        if (agent_at_on() && g_at_cmd[0] && r_ && strncmp(r_, "Tool error", 10)) {   /* llms AGENT_AUTO_TEST: CI on commit */
+    if (!strcmp(call->name, "edit")) { llms_rs_edited = 1; char *r_ = agent_tool_edit(w, call);
+        if (agent_at_on() && g_at_cmd[0] && r_ && strncmp(r_, "Tool error", 10)) {
             char err_[160] = {0}; agent_bash_job *j_ = agent_bash_start(w, g_at_cmd, 120, err_, sizeof err_);
             if (j_) { char *o_ = agent_bash_job_tool_result(w, j_, true, 30, false, true); agent_buf b_ = {0};
                       agent_buf_puts(&b_, r_); agent_buf_puts(&b_, "\n[auto-run after the edit: "); agent_buf_puts(&b_, g_at_cmd); agent_buf_puts(&b_, "]\n");
@@ -9665,7 +9647,7 @@ static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_cal
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
         if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
-        if (agent_at_on() && strstr(cmd, "python") && strstr(cmd, "test") && strlen(cmd) < sizeof g_at_cmd) { snprintf(g_at_cmd, sizeof g_at_cmd, "%s", cmd); g_at_seen++; }   /* llms AGENT_AUTO_TEST: the last test command */
+        if (agent_at_on() && strstr(cmd, "python") && strstr(cmd, "test") && strlen(cmd) < sizeof g_at_cmd) { snprintf(g_at_cmd, sizeof g_at_cmd, "%s", cmd); g_at_seen++; }
         int timeout = agent_parse_timeout(agent_tool_arg_value(call, "timeout_sec"));
         int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
                                               60, 1, 3600);
@@ -9704,11 +9686,11 @@ static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_cal
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
         agent_publish(w, header, strlen(header));
-        if (agent_escalate_on() && !g_agent_escalated) { g_agent_escalated = 1; g_agent_esc_tool++; ds4_session_escalate(w->session, 1); agent_trace(w, "escalate: exact decode routing for the rest of the task (unknown tool %s)", call->name); }   /* llms ESCALATE */
+        if (agent_escalate_on() && !g_agent_escalated) { g_agent_escalated = 1; g_agent_esc_tool++; ds4_session_escalate(w->session, 1); agent_trace(w, "escalate: exact decode routing for the rest of the task (unknown tool %s)", call->name); }
         agent_buf_puts(&result, "Tool error: unknown tool: ");
         agent_buf_puts(&result, call->name);
         agent_buf_puts(&result, "\n");
-        if (agent_gfn_on()) agent_buf_puts(&result, "The tool names are: bash, bash_status, bash_stop, read, more, write, edit, search, list, google_search, visit_page, view_image. Write the tool's own name in invoke name=\"...\" (and the parameter's own name in parameter name=\"...\"); $TOOL_NAME and $PARAMETER_NAME are placeholders in the format description.\n");   /* llms GFORCE_NAME */
+        if (agent_gfn_on()) agent_buf_puts(&result, "The tool names are: bash, bash_status, bash_stop, read, more, write, edit, search, list, google_search, visit_page, view_image. Write the tool's own name in invoke name=\"...\" (and the parameter's own name in parameter name=\"...\"); $TOOL_NAME and $PARAMETER_NAME are placeholders in the format description.\n");
         return agent_buf_take(&result);
     }
 }
@@ -9716,43 +9698,40 @@ static char *agent_execute_tool_call_inner(agent_worker *w, const agent_tool_cal
 static unsigned long long g_llms_tool_seq, g_llms_tool_replayed, g_llms_tool_live;
 static char **g_llms_tool_rec; static unsigned long long *g_llms_tool_rec_hash; static size_t g_llms_tool_rec_n; static int g_llms_tool_loaded;
 static void llms_tool_replay_summary(void) {
-    fprintf(stderr, "llms tool replay: %llu calls, %llu replayed, %llu kept live (record of %zu)\n", g_llms_tool_seq, g_llms_tool_replayed, g_llms_tool_live, g_llms_tool_rec_n);
 }
 static void llms_tool_replay_load(void) {
     g_llms_tool_loaded = 1;
     const char *p = getenv("LLMS_DS4_TOOL_REPLAY"); if (!p || !*p) return;
-    FILE *f = fopen(p, "rb"); if (!f) { fprintf(stderr, "llms tool replay: cannot open %s\n", p); return; }
+    FILE *f = fopen(p, "rb"); if (!f) { ((void)0); return; }
     atexit(llms_tool_replay_summary);
     for (;;) {
         unsigned long long seq, hash, len;
         if (fscanf(f, "R %llu %llx %llu\n", &seq, &hash, &len) != 3) break;
         char *buf = xmalloc((size_t)len + 1);
         if (fread(buf, 1, (size_t)len, f) != (size_t)len || seq != (unsigned long long)g_llms_tool_rec_n) { free(buf); break; }
-        buf[len] = 0; (void)fgetc(f);   /* the newline after the bytes */
+        buf[len] = 0; (void)fgetc(f);
         g_llms_tool_rec = realloc(g_llms_tool_rec, (g_llms_tool_rec_n + 1) * sizeof(*g_llms_tool_rec));
         g_llms_tool_rec_hash = realloc(g_llms_tool_rec_hash, (g_llms_tool_rec_n + 1) * sizeof(*g_llms_tool_rec_hash));
-        if (!g_llms_tool_rec || !g_llms_tool_rec_hash) { fprintf(stderr, "llms tool replay: out of memory\n"); exit(1); }
+        if (!g_llms_tool_rec || !g_llms_tool_rec_hash) { ((void)0); exit(1); }
         g_llms_tool_rec[g_llms_tool_rec_n] = buf; g_llms_tool_rec_hash[g_llms_tool_rec_n] = hash; g_llms_tool_rec_n++;
     }
-    fclose(f); fprintf(stderr, "llms tool replay: %zu recorded results from %s\n", g_llms_tool_rec_n, p);
+    fclose(f); ((void)0);
 }
 
-/* llms H1 (apply_h1.py): LLMS_DS4_AGENT_H1=1 -- after a successful edit (the last call of its round) the harness runs the last test command the session ran, appends the output to the observation, and ends the session when it exits 0. Off unless set. */
-static int g_h1_on = -1, g_h1_done; static char g_h1_cmd[480]; static int g_h1_soft;   /* llms H1 SOFT (apply_h1_soft.py): LLMS_DS4_AGENT_H1=2 runs and reports the test and does not end the session */
+static int g_h1_on = -1, g_h1_done; static char g_h1_cmd[480]; static int g_h1_soft;
 
-/* llms H1 STAGE (apply_h1_stage.py): remember only a STAGE of a bash line that is itself a test run, and only that stage (the status of a shell line is its last stage's) */
 static int h1_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
-static int h1_tok_has_test(const char *a, size_t n, size_t i) {   /* the non-space run starting at i contains "test" */
+static int h1_tok_has_test(const char *a, size_t n, size_t i) {
     size_t e = i; while (e < n && !h1_ws(a[e])) e++;
     for (size_t k = i; k + 4 <= e; k++) if (!memcmp(a + k, "test", 4)) return 1;
     return 0;
 }
-static int h1_stage_is_test(const char *a, size_t n) {   /* ^(python3?\s+(-m\s+(pytest|unittest)\s+)?\S*test\S*|pytest\b|\./\S*test\S*) on the trimmed stage a[0..n) */
+static int h1_stage_is_test(const char *a, size_t n) {
     if (n >= 6 && !memcmp(a, "python", 6)) {
         size_t i = 6; if (i < n && a[i] == '3') i++;
         if (i < n && h1_ws(a[i])) {
             while (i < n && h1_ws(a[i])) i++;
-            if (i + 2 < n && a[i] == '-' && a[i + 1] == 'm' && h1_ws(a[i + 2])) {   /* the optional -m pytest / -m unittest group, tried first as the regex does */
+            if (i + 2 < n && a[i] == '-' && a[i + 1] == 'm' && h1_ws(a[i + 2])) {
                 size_t j = i + 2; while (j < n && h1_ws(a[j])) j++;
                 size_t m = 0; if (n - j >= 6 && !memcmp(a + j, "pytest", 6)) m = 6; else if (n - j >= 8 && !memcmp(a + j, "unittest", 8)) m = 8;
                 if (m && j + m < n && h1_ws(a[j + m])) { size_t k = j + m; while (k < n && h1_ws(a[k])) k++; if (h1_tok_has_test(a, n, k)) return 1; }
@@ -9765,20 +9744,20 @@ static int h1_stage_is_test(const char *a, size_t n) {   /* ^(python3?\s+(-m\s+(
     if (n >= 2 && a[0] == '.' && a[1] == '/') return h1_tok_has_test(a, n, 2);
     return 0;
 }
-static void h1_remember(const char *c, char *dst, size_t cap) {   /* the last stage of line c that is a test run goes into dst (cap bytes); no such stage leaves dst as it was */
+static void h1_remember(const char *c, char *dst, size_t cap) {
     size_t n = strlen(c); if (n >= 480) return;
     const char *best = NULL; size_t best_n = 0, s = 0;
     while (s <= n) {
         size_t e = s; while (e < n && c[e] != ';' && c[e] != '|' && c[e] != '\n' && !(c[e] == '&' && e + 1 < n && c[e + 1] == '&')) e++;
         size_t a = s, b = e; while (a < b && h1_ws(c[a])) a++; while (b > a && h1_ws(c[b - 1])) b--;
-        if (b > a && c[b - 1] != '&' && h1_stage_is_test(c + a, b - a)) { best = c + a; best_n = b - a; }   /* a stage ending in '&' is backgrounded: its status is 0 at once */
+        if (b > a && c[b - 1] != '&' && h1_stage_is_test(c + a, b - a)) { best = c + a; best_n = b - a; }
         s = e + 1; if (e < n && c[e] == '&') s++;
     }
     if (best && best_n < cap) { memcpy(dst, best, best_n); dst[best_n] = 0; }
 }
 static int h1_enabled(void) {
     if (g_h1_on < 0) { const char *e = getenv("LLMS_DS4_AGENT_H1"); g_h1_on = e && *e && *e != '0'; g_h1_soft = e && *e == '2';
-        if (g_h1_on) fprintf(stderr, g_h1_soft ? "llms: agent H1 soft (after a successful edit the harness runs the last test-run stage and the session goes on) [stage rule] [LLMS_DS4_AGENT_H1=2]\n" : "llms: agent H1 (after a successful edit the harness runs the last test-run stage and ends the session on exit 0) [stage rule] [LLMS_DS4_AGENT_H1]\n"); }
+        if (g_h1_on) ((void)0); }
     return g_h1_on;
 }
 
@@ -9797,12 +9776,11 @@ static agent_tool_observation agent_execute_tool_observation(
         }
         char *res = ({
             char *inl_ret_llms_tool_replay;
-            const double llms_tt0 = now_sec();   /* llms TOOL_TIMING */
+            const double llms_tt0 = now_sec();
             char *res = agent_execute_tool_call(w, &calls->v[i]); const agent_tool_call *call = &calls->v[i];
-            { static int tt = -1; if (tt < 0) { const char *e = getenv("LLMS_DS4_TOOL_TIMING"); tt = e && *e && *e != '0'; }   /* llms TOOL_TIMING (apply_tool_timing.py) */
+            { static int tt = -1; if (tt < 0) { const char *e = getenv("LLMS_DS4_TOOL_TIMING"); tt = e && *e && *e != '0'; }
               if (tt) agent_trace(w, "llms tool timing: %s %.3f ms", call->name ? call->name : "?", (now_sec() - llms_tt0) * 1e3); }
             if (!g_llms_tool_loaded) llms_tool_replay_load();
-            /* llms TOOL_REPLAY (apply_tool_replay.py): LLMS_DS4_TOOL_RECORD=<file> appends every tool result's text, keyed by the * call's sequence number and an FNV-1a hash of the call; LLMS_DS4_TOOL_REPLAY=<file> feeds the model the recorded text for the call at the same * sequence number with the same hash (the tool still runs live; only the text the model reads is replaced). Forced-trajectory arms otherwise * differ at the agent's own 'pid=' header and at clock-bearing tool output (06:24). Off when unset. */
             const unsigned long long seq = g_llms_tool_seq++, h = ({
                 const agent_tool_call *c = call;
                 unsigned long long h = 1469598103934665603ULL;
@@ -9821,7 +9799,7 @@ static agent_tool_observation agent_execute_tool_observation(
             if (rec && *rec) {
                 FILE *f = fopen(rec, "ab");
                 if (f) { const size_t n = strlen(res); fprintf(f, "R %llu %llx %zu\n", seq, h, n); fwrite(res, 1, n, f); fputc('\n', f); fclose(f); }
-                else fprintf(stderr, "llms tool record: cannot open %s\n", rec);
+                else ((void)0);
             }
             if (g_llms_tool_rec_n == 0) { inl_ret_llms_tool_replay = (char *)(res); goto inl_end_llms_tool_replay; }
             if (seq < (unsigned long long)g_llms_tool_rec_n && g_llms_tool_rec_hash[seq] == h) {
@@ -9829,19 +9807,17 @@ static agent_tool_observation agent_execute_tool_observation(
                 free(res); g_llms_tool_replayed++; { inl_ret_llms_tool_replay = (char *)(d); goto inl_end_llms_tool_replay; }
             }
             g_llms_tool_live++;
-            fprintf(stderr, "llms tool replay: call %llu %s -- live result kept\n", seq, seq < (unsigned long long)g_llms_tool_rec_n ? "differs from the record" : "is beyond the record");
             inl_ret_llms_tool_replay = (char *)(res);
             inl_end_llms_tool_replay:;
             inl_ret_llms_tool_replay;
-        });   /* llms TOOL_REPLAY */
-        if (h1_enabled() && calls->v[i].name) {   /* llms H1 */
+        });
+        if (h1_enabled() && calls->v[i].name) {
             const char *h1nm = calls->v[i].name;
             if (!strcmp(h1nm, "bash")) {
                 const char *h1c = agent_tool_arg_value(&calls->v[i], "command");
-                if (h1c) h1_remember(h1c, g_h1_cmd, sizeof(g_h1_cmd));   /* llms H1 STAGE */
+                if (h1c) h1_remember(h1c, g_h1_cmd, sizeof(g_h1_cmd));
             } else if (!strcmp(h1nm, "edit") && i == calls->len - 1 && g_h1_cmd[0] && !strncmp(res, "Edited ", 7)) {
                 agent_tool_arg h1a[2] = {{(char *)"command", g_h1_cmd, true}, {(char *)"timeout_sec", (char *)"60", false}};
-                fprintf(stderr, "llms: agent H1 stage run: %s\n", g_h1_cmd);   /* llms H1 STAGE witness */
                 agent_tool_call h1call = {(char *)"bash", h1a, 2, 2};
                 char *h1r = agent_execute_tool_call(w, &h1call);
                 agent_tool_observation_puts(&obs, res);
@@ -9849,7 +9825,7 @@ static agent_tool_observation agent_execute_tool_observation(
                 agent_tool_observation_puts(&obs, "Harness test run after the edit (LLMS_DS4_AGENT_H1):\n");
                 agent_tool_observation_puts(&obs, h1r);
                 if (h1r[0] && h1r[strlen(h1r) - 1] != '\n') agent_tool_observation_puts(&obs, "\n");
-                if (strstr(h1r, "exit_status=0") && !g_h1_soft) g_h1_done = 1;   /* llms H1 SOFT */
+                if (strstr(h1r, "exit_status=0") && !g_h1_soft) g_h1_done = 1;
                 free(h1r); free(res);
                 continue;
             }
@@ -10011,17 +9987,16 @@ static char *agent_bash_jobs_compaction_observation(agent_worker *w) {
 /* Decide when to compact before an ordinary turn or before appending a large
  * tool result.  The fixed free-token threshold is capped proportionally for
  * smaller contexts so tests with tiny contexts still compact rather than fail. */
-/* llms COMPACT_SPEC (apply_compactspec.py): the compaction summary on the greedy speculative path; off unless LLMS_DS4_AGENT_COMPACT_SPEC=1 */
 
 static uint64_t llms_compact_spec_steps, llms_compact_spec_tokens;
 static int llms_compact_spec_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LLMS_DS4_AGENT_COMPACT_SPEC"); v = e && *e && *e != '0';
-                 if (v) { fprintf(stderr, "llms: compact spec (the compaction summary on the greedy speculative path)\n");
-                          atexit_b(^{ fprintf(stderr, "llms compact spec: %llu speculative steps, %llu summary tokens committed\n", (unsigned long long)llms_compact_spec_steps, (unsigned long long)llms_compact_spec_tokens); }); } }
+                 if (v) { ((void)0);
+                          atexit_b(^{ ((void)0); }); } }
     return v;
 }
-static int llms_compact_eval(agent_worker *w, int token, int cap, int *q, int *nq, int *iq, char *err, size_t errlen) {   /* 0 on success; q: the committed tokens after the first */
+static int llms_compact_eval(agent_worker *w, int token, int cap, int *q, int *nq, int *iq, char *err, size_t errlen) {
     *nq = 0; *iq = 0;
     if (!llms_compact_spec_on()) return ds4_session_eval(w->session, token, err, errlen);
     int acc[16]; if (cap > 16) cap = 16; if (cap < 1) cap = 1;
@@ -10146,16 +10121,15 @@ static int agent_compact_image_boundary(const ds4_vision_span *images, size_t co
     return pos;
 }
 
-/* llms COMPACT_GUARD (apply_compactguard.py): the summary is greedy, has no LOOPBREAK and goes into the rebuilt context; off unless LLMS_DS4_AGENT_COMPACT_LB / _EXACT / _TEST is set */
 #define CG_MAXT 8192
 #define CG_TAB (1u << 15)
 static uint64_t cg_tab[CG_TAB]; static uint8_t cg_seen[CG_MAXT]; static size_t cg_off[CG_MAXT]; static int cg_ids[CG_MAXT];
 static uint32_t cg_n, cg_cnt; static int cg_win = -1, cg_need, cg_exact, cg_test, cg_test_exact, cg_stop; static char cg_test_arm = 'S'; static const char *cg_test_case = "", *cg_test_out = ".";
-static uint64_t cg_calls, cg_fires, cg_cut_chars, cg_close_rows, cg_retries, cg_retry_kept_first;   /* llms COMPACT_RETRY: the second two */
+static uint64_t cg_calls, cg_fires, cg_cut_chars, cg_close_rows, cg_retries, cg_retry_kept_first;
 static int cg_retry = -1;
-static int cg_retry_on(void) { if (cg_retry < 0) { const char *e = getenv("LLMS_DS4_AGENT_COMPACT_RETRY"); cg_retry = e && *e && *e != '0'; if (cg_retry) { fprintf(stderr, "llms: compact retry (a summary that loops or holds under 200 characters is regenerated once on exact routing from a snapshot)\n"); atexit_b(^{ fprintf(stderr, "llms compact retry: %llu retries, %llu kept the first attempt's text\n", (unsigned long long)cg_retries, (unsigned long long)cg_retry_kept_first); }); } } return cg_retry; }
+static int cg_retry_on(void) { if (cg_retry < 0) { const char *e = getenv("LLMS_DS4_AGENT_COMPACT_RETRY"); cg_retry = e && *e && *e != '0'; if (cg_retry) { ((void)0); atexit_b(^{ ((void)0); }); } } return cg_retry; }
 static void cg_reset(void) { memset(cg_tab, 0, sizeof cg_tab); cg_n = cg_cnt = 0u; cg_stop = 0; }
-static int cg_feed(int tok, size_t off) {   /* off: the summary's length before this token; 1 when the window fires */
+static int cg_feed(int tok, size_t off) {
     if (cg_n >= CG_MAXT) return 0;
     const uint32_t i = cg_n++; cg_ids[i] = tok; cg_off[i] = off; cg_seen[i] = 0;
     if (i < 7u) return 0;
@@ -10169,16 +10143,16 @@ static int cg_feed(int tok, size_t off) {   /* off: the summary's length before 
     if (i >= 7u + (uint32_t)cg_win) cg_cnt -= cg_seen[i - (uint32_t)cg_win];
     return i >= 6u + (uint32_t)cg_win && cg_cnt >= (uint32_t)cg_need;
 }
-static size_t cg_cut(const char *t, size_t len) {   /* the kept length: back over the last run of repeated grams (a gap of 16 fresh grams ends the run), to its line start */
+static size_t cg_cut(const char *t, size_t len) {
     if (cg_n == 0u) return 0;
     uint32_t j0 = cg_n - 1u, gap = 0u;
     for (int32_t j = (int32_t)cg_n - 1; j >= 7; j--) { if (cg_seen[j]) { j0 = (uint32_t)j; gap = 0u; } else if (++gap >= 16u) break; }
     size_t at = cg_off[j0 >= 7u ? j0 - 7u : 0u]; if (at > len) at = len;
-    const size_t lo = at > 400u ? at - 400u : 0u; size_t k = at;   /* back to a line or sentence end within 400 bytes: a summary can be one long line */
+    const size_t lo = at > 400u ? at - 400u : 0u; size_t k = at;
     while (k > lo && t[k - 1] != '\n' && !(t[k - 1] == ' ' && k >= 2u && t[k - 2] == '.')) k--;
     return k > lo ? k : at;
 }
-static void cg_selftest(void) {   /* a canary the detector can fail: random text, a loop after random text, a 30 % periodic mixture; the cut must land at the loop */
+static void cg_selftest(void) {
     uint64_t x = 88172645463325252ull; int fr = 0, fl = -1, fm = 0; char t[1]; (void)t;
     const int w0 = cg_win, n0 = cg_need; cg_win = 128; cg_need = 96;
     cg_reset(); for (int i = 0; i < 4000; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; if (cg_feed((int)(x % 100000ull), (size_t)i)) fr++; }
@@ -10188,8 +10162,6 @@ static void cg_selftest(void) {   /* a canary the detector can fail: random text
     uint32_t j0 = cg_n - 1u, gap = 0u; for (int32_t j = (int32_t)cg_n - 1; j >= 7; j--) { if (cg_seen[j]) { j0 = (uint32_t)j; gap = 0u; } else if (++gap >= 16u) break; }
     const size_t at = cg_off[j0 - 7u];
     cg_reset(); for (int i = 0; i < 4000; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; if (cg_feed((i % 10 < 3) ? 5000 + (i % 41) : (int)(x % 100000ull), (size_t)i)) fm++; }
-    fprintf(stderr, "llms compact guard selftest: random 4000 -> %d fires; a period-37 loop after 300 random tokens -> fired %d tokens into it, the repeat found at token %zu (true: 337); a 30 %% periodic mixture -> %d fires: %s\n",
-            fr, fl, at, fm, (fr == 0 && fl >= 0 && fl < 37 + 128 && at == 337 && fm == 0) ? "PASS" : "FAIL");
     cg_win = w0; cg_need = n0; cg_reset();
 }
 static void cg_init(void) {
@@ -10199,10 +10171,10 @@ static void cg_init(void) {
     if (e && !strcmp(e, "selftest")) cg_selftest();
     else if (e && *e && *e != '0') { int wi = 0; float sh = 0.0f;
         if (sscanf(e, "%d,%f", &wi, &sh) == 2 && wi >= 16 && wi <= 1024 && sh > 0.05f && sh <= 1.0f) { cg_win = wi; cg_need = (int)(sh * (float)wi + 0.5f); }
-        else fprintf(stderr, "llms: COMPACT_LB '%s' is not win,share -- off\n", e); }
+        else ((void)0); }
     const char *x = getenv("LLMS_DS4_AGENT_COMPACT_EXACT"); if (x && *x) { cg_exact = atoi(x); if (cg_exact < 0 || cg_exact > 2) cg_exact = 0; }
-    if (cg_win > 0 || cg_exact) { fprintf(stderr, "llms: compact guard (the summary: stop at %d of the last %d 8-grams repeated, 0 = off; exact routing %d: 1 the close row, 2 and every summary row)\n", cg_need, cg_win, cg_exact);
-        atexit_b(^{ fprintf(stderr, "llms compact guard: %llu summaries, %llu loop stops, %llu characters cut, %llu close rows on exact routing\n", (unsigned long long)cg_calls, (unsigned long long)cg_fires, (unsigned long long)cg_cut_chars, (unsigned long long)cg_close_rows); }); }
+    if (cg_win > 0 || cg_exact) { ((void)0);
+        atexit_b(^{ ((void)0); }); }
 }
 static void cg_x_off(agent_worker *w, int x) { if (x > 0 && !g_agent_escalated && g_think_esc != 1) ds4_session_escalate(w->session, 0); }
 static void cg_test_report(agent_worker *w, const char *text, size_t len, double seconds, const ds4_token_score *top, int ntop) {
@@ -10210,8 +10182,7 @@ static void cg_test_report(agent_worker *w, const char *text, size_t len, double
     snprintf(path, sizeof path, "%s/%s.%c.txt", cg_test_out, cg_test_case, cg_test_arm); f = fopen(path, "w"); if (f) { fwrite(text, 1, len, f); fclose(f); }
     snprintf(path, sizeof path, "%s/%s.%c.ids", cg_test_out, cg_test_case, cg_test_arm); f = fopen(path, "w"); if (f) { for (uint32_t i = 0; i < cg_n; i++) fprintf(f, "%d %zu %u\n", cg_ids[i], cg_off[i], (unsigned)cg_seen[i]); fclose(f); }
     uint32_t rep = 0u; for (uint32_t i = 0; i < cg_n; i++) rep += cg_seen[i];
-    fprintf(stderr, "llms compact test: case %s arm %c tokens %u seconds %.1f stop %s chars %zu repeated_grams %u top:", cg_test_case, cg_test_arm, cg_n, seconds, cg_stop == 1 ? "eos" : cg_stop == 2 ? "dsml" : cg_stop == 3 ? "loop" : "cap", len, rep);
-    for (int k = 0; k < ntop; k++) { size_t tl = 0; char *tt = ds4_token_text(w->engine, top[k].id, &tl); fprintf(stderr, " %d:%.3f:'", top[k].id, (double)top[k].logprob); for (size_t q = 0; tt && q < tl; q++) fputc((unsigned char)tt[q] < 32u ? '~' : tt[q], stderr); fputc('\'', stderr); free(tt); }
+    for (int k = 0; k < ntop; k++) { size_t tl = 0; char *tt = ds4_token_text(w->engine, top[k].id, &tl); ((void)0); for (size_t q = 0; tt && q < tl; q++) fputc((unsigned char)tt[q] < 32u ? '~' : tt[q], stderr); fputc('\'', stderr); free(tt); }
     fputc('\n', stderr); fflush(stderr);
 }
 
@@ -10291,14 +10262,14 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
         return false;
     }
     int summary_max = summary_room < summary_budget ? summary_room : summary_budget;
-    cg_init(); cg_calls++;   /* llms COMPACT_GUARD */
+    cg_init(); cg_calls++;
     int cg_x = cg_test ? cg_test_exact : cg_exact; int cg_close = -1;
-    const int cg_live = !cg_test || cg_test_arm == 'R';   /* llms COMPACT_RETRY: the detector and the retry act; arm R of the replay runs them */
-    int cg_attempt = 0; char *cg_first = NULL; size_t cg_first_len = 0; static ds4_session_snapshot cg_snap; static int cg_have_snap; if (cg_have_snap) { ds4_session_snapshot_free(&cg_snap); cg_have_snap = 0; }   /* static: an error exit below leaves at most one copy behind, freed here */
-    if (cg_live && cg_retry_on()) { char se[160] = {0}; if (ds4_session_save_snapshot(w->session, &cg_snap, se, sizeof se) == 0) cg_have_snap = 1; else fprintf(stderr, "llms compact retry: no snapshot: %s\n", se); }
+    const int cg_live = !cg_test || cg_test_arm == 'R';
+    int cg_attempt = 0; char *cg_first = NULL; size_t cg_first_len = 0; static ds4_session_snapshot cg_snap; static int cg_have_snap; if (cg_have_snap) { ds4_session_snapshot_free(&cg_snap); cg_have_snap = 0; }
+    if (cg_live && cg_retry_on()) { char se[160] = {0}; if (ds4_session_save_snapshot(w->session, &cg_snap, se, sizeof se) == 0) cg_have_snap = 1; else ((void)0); }
 cg_again:;
     cg_close = -1;
-    if (cg_x > 0 && prompt.len > summary_bottom) { cg_close = prompt.v[prompt.len - 1]; prompt.len--; }   /* the close token's row is evaluated after the sync, on exact routing */
+    if (cg_x > 0 && prompt.len > summary_bottom) { cg_close = prompt.v[prompt.len - 1]; prompt.len--; }
 
     ds4_session_set_progress(w->session, worker_progress_cb, w);
     ds4_session_set_display_progress(w->session, worker_progress_cb, w);
@@ -10333,7 +10304,7 @@ cg_again:;
         return false;
     }
 
-    if (cg_close >= 0) {   /* llms COMPACT_GUARD: the close row on exact routing */
+    if (cg_close >= 0) {
         ds4_session_escalate(w->session, 1); cg_close_rows++;
         char cg_e[160] = {0}; const int cg_rc = ds4_session_eval(w->session, cg_close, cg_e, sizeof cg_e);
         prompt.len++;
@@ -10350,10 +10321,10 @@ cg_again:;
     char eval_err[160] = {0};
     int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = now_sec();
-    int llms_cq[16], llms_cnq = 0, llms_ciq = 0;   /* llms COMPACT_SPEC: tokens a speculative step committed beyond its first (already in the KV) */
+    int llms_cq[16], llms_cnq = 0, llms_ciq = 0;
     for (int i = 0; i < summary_max; i++) {
         if (worker_should_interrupt(w)) {
-            if (cg_x == 2) cg_x_off(w, cg_x);   /* llms COMPACT_GUARD */
+            if (cg_x == 2) cg_x_off(w, cg_x);
             snprintf(err, err_len, "interrupted");
             ds4_session_invalidate(w->session);
             ds4_tokens_free(&prompt);
@@ -10365,7 +10336,7 @@ cg_again:;
             worker_clear_interrupt(w);
             return false;
         }
-        const int llms_cfromq = llms_ciq < llms_cnq;   /* llms COMPACT_SPEC: a committed draft is the next token, no argmax, no eval */
+        const int llms_cfromq = llms_ciq < llms_cnq;
         int token = llms_cfromq ? llms_cq[llms_ciq++] : ds4_session_argmax(w->session);
         if (ds4_token_is_stop_for_think_mode(w->engine,
                                              token,
@@ -10375,11 +10346,11 @@ cg_again:;
                 summary.ptr[--summary.len] = '\0';
             }
             agent_trace(w, "compaction summary stopped before control token id=%d", token);
-            cg_stop = token == dsml_id ? 2 : 1;   /* llms COMPACT_GUARD */
+            cg_stop = token == dsml_id ? 2 : 1;
             break;
         }
-        if (!llms_cfromq && llms_compact_eval(w, token, summary_max - i, llms_cq, &llms_cnq, &llms_ciq, eval_err, sizeof(eval_err)) != 0) {   /* llms COMPACT_SPEC */
-            if (cg_x == 2) cg_x_off(w, cg_x);   /* llms COMPACT_GUARD */
+        if (!llms_cfromq && llms_compact_eval(w, token, summary_max - i, llms_cq, &llms_cnq, &llms_ciq, eval_err, sizeof(eval_err)) != 0) {
+            if (cg_x == 2) cg_x_off(w, cg_x);
             snprintf(err, err_len, "%s", eval_err);
             ds4_session_invalidate(w->session);
             ds4_tokens_free(&prompt);
@@ -10391,11 +10362,11 @@ cg_again:;
 
         size_t text_len = 0;
         char *text = ds4_token_text(w->engine, token, &text_len);
-        const size_t cg_before = summary.len;   /* llms COMPACT_GUARD */
+        const size_t cg_before = summary.len;
         agent_buf_append(&summary, text, text_len);
         agent_publish(w, text, text_len);
         free(text);
-        if (cg_feed(token, cg_before) && cg_live) {   /* llms COMPACT_GUARD: a loop; the text before the repeat stays */
+        if (cg_feed(token, cg_before) && cg_live) {
             const size_t cg_k = summary.ptr ? cg_cut(summary.ptr, summary.len) : 0; cg_cut_chars += summary.len - cg_k; cg_fires++;
             fprintf(stderr, "ds4-agent: compaction summary loop -- stopped at %u tokens, %zu of %zu characters kept\n", cg_n, cg_k, summary.len);
             agent_trace(w, "compaction summary loop stop tokens=%u kept=%zu of=%zu", cg_n, cg_k, summary.len);
@@ -10413,26 +10384,25 @@ cg_again:;
         pthread_mutex_unlock(&w->mu);
     }
     agent_publish(w, "\x1b[0m\n", 5);
-    if (cg_x == 2) cg_x_off(w, cg_x);   /* llms COMPACT_GUARD: the shipped dials rebuild the context */
-    if (cg_have_snap && cg_attempt == 0 && (cg_stop == 3 || summary.len < 200)) {   /* llms COMPACT_RETRY: once, on exact routing, from the snapshot */
+    if (cg_x == 2) cg_x_off(w, cg_x);
+    if (cg_have_snap && cg_attempt == 0 && (cg_stop == 3 || summary.len < 200)) {
         char le[160] = {0};
         if (ds4_session_load_snapshot(w->session, &cg_snap, le, sizeof le) == 0) {
             cg_attempt = 1; cg_retries++; cg_x = 2;
             cg_first_len = summary.len; cg_first = cg_first_len ? xstrndup(summary.ptr, cg_first_len) : NULL;
-            free(summary.ptr); summary.ptr = NULL; summary.len = 0;   /* the jump re-runs the declaration below the label */
+            free(summary.ptr); summary.ptr = NULL; summary.len = 0;
             fprintf(stderr, "ds4-agent: compaction summary failed (%zu characters, stop %d) -- once more on exact routing\n", cg_first_len, cg_stop);
             agent_trace(w, "compaction summary retry first=%zu stop=%d", cg_first_len, cg_stop);
             agent_publish_system_status(w, "Compaction summary failed; retrying on exact routing.");
             goto cg_again;
         }
-        fprintf(stderr, "llms compact retry: restore failed: %s\n", le);
     }
-    if (cg_first && cg_first_len > summary.len) { summary.len = 0; if (summary.ptr) summary.ptr[0] = '\0'; agent_buf_append(&summary, cg_first, cg_first_len); cg_retry_kept_first++; }   /* llms COMPACT_RETRY: the longer attempt */
+    if (cg_first && cg_first_len > summary.len) { summary.len = 0; if (summary.ptr) summary.ptr[0] = '\0'; agent_buf_append(&summary, cg_first, cg_first_len); cg_retry_kept_first++; }
     free(cg_first); cg_first = NULL;
     if (cg_have_snap) { ds4_session_snapshot_free(&cg_snap); cg_have_snap = 0; }
     ds4_tokens_free(&prompt);
 
-    if (cg_win > 0 && !cg_test && (!summary.ptr || !summary.ptr[0])) agent_buf_puts(&summary, "[The compaction summary failed: the model only repeated itself. The recent conversation below is intact; re-read files as needed.]\n");   /* llms COMPACT_GUARD */
+    if (cg_win > 0 && !cg_test && (!summary.ptr || !summary.ptr[0])) agent_buf_puts(&summary, "[The compaction summary failed: the model only repeated itself. The recent conversation below is intact; re-read files as needed.]\n");
     if (!summary.ptr || !summary.ptr[0]) {
         snprintf(err, err_len, "compaction summary was empty");
         ds4_session_invalidate(w->session);
@@ -10442,7 +10412,7 @@ cg_again:;
     }
 
     agent_trace_text(w, "compaction-summary", summary.ptr, summary.len);
-    if (cg_test) { cg_test_report(w, summary.ptr, summary.len, now_sec() - t0, cg_top, cg_ntop); ds4_tokens_free(&sys); free(summary.ptr); return true; }   /* llms COMPACT_GUARD: the replay stops before the rebuild */
+    if (cg_test) { cg_test_report(w, summary.ptr, summary.len, now_sec() - t0, cg_top, cg_ntop); ds4_tokens_free(&sys); free(summary.ptr); return true; }
     int tail_start = agent_compact_tail_start(w, bottom, sys.len);
     if (tail_start > summary_bottom) tail_start = summary_bottom;
     tail_start = agent_compact_image_boundary(w->images, w->image_count,
@@ -10707,10 +10677,9 @@ static int worker_force_generated_text(agent_worker *w,
  * This helper is intentionally derived only from the current streaming parser
  * state.  The state object is local to one assistant round, so malformed output,
  * EOS, Ctrl+C, or the next turn cannot accidentally leave sampling greedy. */
-/* llms DSML_HINT (apply_dsmlhint.py): the text the DSML41 grammar FIXES after `tail` (the parser's raw text since the last '>' / newline, plus the input token's own text), or NULL at a content hole (names, values, true / false) or outside DSML41 */
-static uint64_t g_gfstr_fixed;   /* llms GFORCE_STR (apply_gforce_str.py) */
+static uint64_t g_gfstr_fixed;
 static const char *agent_dsml41_fixed_next(const char *tail, bool in_invoke, bool param_close) {
-    if (param_close) {   /* the tail is a strict prefix of the parameter close */
+    if (param_close) {
         static const char close[] = "</｜DSML｜ parameter>\n";
         const size_t n = strlen(tail);
         return n < sizeof close - 1 && !strncmp(close, tail, n) ? close + n : NULL;
@@ -10721,7 +10690,7 @@ static const char *agent_dsml41_fixed_next(const char *tail, bool in_invoke, boo
     if (!strcmp(tail, "</｜DSML｜ invoke")) return ">\n";
     if (!strcmp(tail, "</｜DSML｜ calls")) return ">";
     if (!strcmp(tail, "<｜DSML｜ parameter") || !strcmp(tail, "<｜DSML｜ invoke")) return " name=\"";
-    {   /* '<｜DSML｜ parameter name="X"' -> ' string="' ; '... string="true' / '"false' -> '">' ; '<｜DSML｜ invoke name="X"' -> '>\n' */
+    {
         const char *q = strstr(tail, " name=\"");
         if (q && !strncmp(tail, "<｜DSML｜ parameter", strlen("<｜DSML｜ parameter"))) {
             const char *v = q + 7, *e = strchr(v, '"');
@@ -10729,14 +10698,13 @@ static const char *agent_dsml41_fixed_next(const char *tail, bool in_invoke, boo
             const char *s = e ? strstr(e, " string=\"") : NULL;
             if (s && s[9] == 0 && ({
                 static int m = -1; if (m < 0) { const char *e = getenv("LLMS_DS4_GFORCE_STR"); m = e && *e && *e != '0';
-                if (m) { fprintf(stderr, "llms: gforce str (a DSML41 parameter's string=\"true|false\" fixed from the tool schemas)\n");
-                         atexit_b(^{ fprintf(stderr, "llms gforce str: %llu string attributes fixed by the schema\n", (unsigned long long)g_gfstr_fixed); }); } }
+                if (m) { ((void)0);
+                         atexit_b(^{ ((void)0); }); } }
                 (int)(m);
-            })) {   /* llms GFORCE_STR: right after ' string="' -- the value from the schema */
+            })) {
                 const int k = ({
                     int inl_ret_agent_dsml41_param_kind;
                     const char *name = v; size_t n = (size_t)(e - v);
-                    /* llms GFORCE_STR: 1 string, 0 integer / boolean, -1 unknown (the agent's schemas, one type per name) */
                     static const char *str[] = {"command", "content", "glob", "mode", "new", "old", "path", "query", "url"};
                     static const char *non[] = {"case_sensitive", "context", "count", "job", "max_lines", "max_results", "pid", "raw", "refresh_sec", "start_line", "timeout_sec", "whole"};
                     for (size_t i = 0; i < sizeof str / sizeof str[0]; i++) if (strlen(str[i]) == n && !memcmp(str[i], name, n)) { inl_ret_agent_dsml41_param_kind = (int)(1); goto inl_end_agent_dsml41_param_kind; }
@@ -10752,15 +10720,14 @@ static const char *agent_dsml41_fixed_next(const char *tail, bool in_invoke, boo
     }
     return NULL;
 }
-/* llms GRAMMAR_CHAIN (apply_gchain.py): the DSML41 fixed text chained across tags; off unless LLMS_DS4_GRAMMAR_CHAIN is set */
 
 static int agent_gchain_mode(void) {
     static int m = -1;
     if (m < 0) { const char *e = getenv("LLMS_DS4_GRAMMAR_CHAIN"); m = !e || !*e || *e == '0' ? 0 : !strcmp(e, "log") ? 2 : 1;
-                 if (m) fprintf(stderr, "llms: grammar chain (the DSML41 fixed text chained across tags, up to 8 tokens)%s\n", m == 2 ? " -- LOG: every hint call" : ""); }
+                 if (m) ((void)0); }
     return m;
 }
-static const char *agent_dsml41_chain(const char *tail, bool in_invoke) {   /* STRUCTURAL tails; NULL: no chained text */
+static const char *agent_dsml41_chain(const char *tail, bool in_invoke) {
     static char full[320];
     static const char dsml_parameter_prefix[] = "<｜DSML｜ parameter name=\"", dsml_invoke_prefix[] = "<｜DSML｜ invoke name=\"", dsml_calls_prefix[] = "<｜DSML｜ calls>\n";
     const size_t n = strlen(tail); full[0] = 0;
@@ -10775,12 +10742,11 @@ static const char *agent_dsml41_chain(const char *tail, bool in_invoke) {   /* S
         if (n < ol) snprintf(full, sizeof full, "%s", op);
         else {
             const char *q = memchr(tail + ol, '"', n - ol);
-            if (!q) return NULL;   /* the name is still being written: free text */
+            if (!q) return NULL;
             const int nl = (int)(q - (tail + ol));
             if (is_p) snprintf(full, sizeof full, "%.*s\" string=\"%s\">", (int)ol + nl, tail, ({
                 bool inl_ret_agent_dsml41_param_is_string;
                 const char *name = tail + ol; size_t n = (size_t)nl;
-                /* the agent tools' string-typed parameters (the schemas above) */
                 static const char *s[] = {"query", "url", "command", "path", "content", "old", "new", "mode", "glob"};
                 for (size_t i = 0; i < sizeof s / sizeof s[0]; i++) if (strlen(s[i]) == n && !memcmp(s[i], name, n)) { inl_ret_agent_dsml41_param_is_string = (bool)(true); goto inl_end_agent_dsml41_param_is_string; }
                 inl_ret_agent_dsml41_param_is_string = (bool)(false);
@@ -10793,20 +10759,20 @@ static const char *agent_dsml41_chain(const char *tail, bool in_invoke) {   /* S
     const size_t fl = strlen(full);
     return fl > n && !strncmp(full, tail, n) ? full + n : NULL;
 }
-static int g_agent_hint_seq[8], g_agent_hint_seq_n;   /* llms GRAMMAR_DEPTH (8: llms GRAMMAR_CHAIN) */
+static int g_agent_hint_seq[8], g_agent_hint_seq_n;
 static uint64_t g_agent_hint_set, g_agent_hint_none; static int g_agent_hint_log, g_agent_hint_pend = -1; static char g_agent_hint_tail[192], g_agent_hint_fx[48];
 
-static int agent_dsml_hint_token(ds4_engine *engine, const agent_stream_renderer *sr, int token) {   /* -1: no hint */
+static int agent_dsml_hint_token(ds4_engine *engine, const agent_stream_renderer *sr, int token) {
     static int on = -1; if (on < 0) { const char *e = getenv("LLMS_DS4_DSML_HINT"); on = e && *e && *e != '0'; g_agent_hint_log = e && !strcmp(e, "log");
-                                       if (on) { fprintf(stderr, "llms: dsml hint (the DSML41 grammar's fixed next token as the block-1 draft on greedy markup steps)\n");
-                                                 atexit_b(^{ fprintf(stderr, "llms dsml hint (agent): %llu hints set, %llu greedy markup steps without one\n", (unsigned long long)g_agent_hint_set, (unsigned long long)g_agent_hint_none); }); } }
+                                       if (on) { ((void)0);
+                                                 atexit_b(^{ ((void)0); }); } }
     if (!on || !sr || !sr->parser || sr->parser->syntax != AGENT_TOOL_SYNTAX_DSML41 || !sr->dsml_active) return -1;
     const agent_dsml_parser *p = sr->parser;
     if (p->state != AGENT_DSML_STRUCTURAL && p->state != AGENT_DSML_PARAM_VALUE) return -1;
     size_t tl = 0; char *tt = ds4_token_text(engine, token, &tl);
     if (!tt) return -1;
     char tail[192]; size_t n = 0;
-    {   /* the raw text since the last '>' or newline (STRUCTURAL) or since the last '<' (a parameter close), then the token's text */
+    {
         const char *raw = p->raw ? p->raw : ""; size_t rl = p->raw_len, k = rl;
         if (p->state == AGENT_DSML_PARAM_VALUE) { while (k > p->param_value_start && raw[k - 1] != '<') k--; if (k > p->param_value_start) k--; else k = rl; }
         else while (k > 0 && raw[k - 1] != '>' && raw[k - 1] != '\n') k--;
@@ -10815,61 +10781,57 @@ static int agent_dsml_hint_token(ds4_engine *engine, const agent_stream_renderer
     }
     free(tt);
     const bool param_close = p->state == AGENT_DSML_PARAM_VALUE && tail[0] == '<';
-    if (agent_gchain_mode() == 2) { char tl2[200]; snprintf(tl2, sizeof tl2, "%s", tail); for (char *c = tl2; *c; c++) if (*c == '\n') *c = '~';   /* llms GRAMMAR_CHAIN log */
-                                    fprintf(stderr, "llms gchain LOG: state %d in_invoke %d param_close %d tail [%s]\n", (int)p->state, p->current.name != NULL, param_close, tl2); }
+    if (agent_gchain_mode() == 2) { char tl2[200]; snprintf(tl2, sizeof tl2, "%s", tail); for (char *c = tl2; *c; c++) if (*c == '\n') *c = '~';
+                                    ((void)0); }
     if (p->state == AGENT_DSML_PARAM_VALUE && !param_close) return -1;
     const bool in_invoke = p->current.name != NULL;
     const char *fx = agent_dsml41_fixed_next(tail, in_invoke, param_close);
-    if (agent_gchain_mode() && !param_close && p->state == AGENT_DSML_STRUCTURAL) {   /* llms GRAMMAR_CHAIN: the longer of the fragment rule and the chain */
+    if (agent_gchain_mode() && !param_close && p->state == AGENT_DSML_STRUCTURAL) {
         const char *cx = agent_dsml41_chain(tail, in_invoke);
         if (agent_gchain_mode() == 2) { char f2[120], c2[120]; snprintf(f2, sizeof f2, "%s", fx ? fx : "(null)"); snprintf(c2, sizeof c2, "%s", cx ? cx : "(null)");
                                         for (char *c = f2; *c; c++) if (*c == '\n') *c = '~'; for (char *c = c2; *c; c++) if (*c == '\n') *c = '~';
-                                        fprintf(stderr, "llms gchain LOG:   fragment [%s] chain [%s]\n", f2, c2); }
+                                        ((void)0); }
         if (cx && *cx && (!fx || strlen(cx) > strlen(fx))) fx = cx;
     }
     if (!fx || !*fx) { g_agent_hint_none++; return -1; }
     if (g_agent_hint_log) { snprintf(g_agent_hint_tail, sizeof g_agent_hint_tail, "%s", tail); snprintf(g_agent_hint_fx, sizeof g_agent_hint_fx, "%s", fx);
-                            for (char *c = g_agent_hint_tail; *c; c++) if (*c == '\n') *c = '~';   /* llms 10-30 15:1x: was '\\n' (a two-character constant, always false) */
-                            for (char *c = g_agent_hint_fx; *c; c++) if (*c == '\n') *c = '~'; }   /* one log line per hint: newlines shown as ~ */
+                            for (char *c = g_agent_hint_tail; *c; c++) if (*c == '\n') *c = '~';
+                            for (char *c = g_agent_hint_fx; *c; c++) if (*c == '\n') *c = '~'; }
     static struct { char text[32]; int tok; } cache[24]; static int ncache;
-    if (getenv("LLMS_DS4_GRAMMAR_DEPTH") && *getenv("LLMS_DS4_GRAMMAR_DEPTH") && *getenv("LLMS_DS4_GRAMMAR_DEPTH") != '0') ncache = 0;   /* llms GRAMMAR_DEPTH: the cache holds only the first token -- tokenize every time */
+    if (getenv("LLMS_DS4_GRAMMAR_DEPTH") && *getenv("LLMS_DS4_GRAMMAR_DEPTH") && *getenv("LLMS_DS4_GRAMMAR_DEPTH") != '0') ncache = 0;
     for (int i = 0; i < ncache; i++) if (!strcmp(cache[i].text, fx)) { g_agent_hint_set++; return cache[i].tok; }
-    ds4_tokens tk = {0}; ds4_tokenize_rendered_chat(engine, fx, &tk);   /* 12:4x: special tokens parsed -- plain-text tokenization made '｜DSML｜' the character 28217, not the special 128825 (dsmlhint_diag: 0 of 23) */
-    g_agent_hint_seq_n = 0; for (int i = 0; i < tk.len && i < (agent_gchain_mode() ? 8 : 3); i++) g_agent_hint_seq[g_agent_hint_seq_n++] = tk.v[i];   /* llms GRAMMAR_DEPTH: the whole fixed text, up to 3 tokens */
+    ds4_tokens tk = {0}; ds4_tokenize_rendered_chat(engine, fx, &tk);
+    g_agent_hint_seq_n = 0; for (int i = 0; i < tk.len && i < (agent_gchain_mode() ? 8 : 3); i++) g_agent_hint_seq[g_agent_hint_seq_n++] = tk.v[i];
     const int first = tk.len > 0 ? tk.v[0] : -1; ds4_tokens_free(&tk);
     if (ncache < 24 && strlen(fx) < sizeof cache[0].text) { strcpy(cache[ncache].text, fx); cache[ncache].tok = first; ncache++; }
     if (first >= 0) g_agent_hint_set++;
     return first;
 }
-/* llms GFORCE (apply_gforce.py): repair a token that leaves the DSML41 grammar's FIXED text (STRUCTURAL parser state only; values are never enforced) */
 static uint64_t g_gf_checks, g_gf_dev, g_gf_repair, g_gf_canary_count; static long g_gf_canary_at = -1;
-static int agent_gforce_mode(void) {   /* 0 off, 1 repair, 2 shadow (count only), 3 repair + log */
+static int agent_gforce_mode(void) {
     static int m = -1;
     if (m < 0) { const char *e = getenv("LLMS_DS4_GFORCE"); m = !e || !*e || *e == '0' ? 0 : !strcmp(e, "shadow") ? 2 : !strcmp(e, "log") ? 3 : 1;
                  const char *cn = getenv("LLMS_DS4_GFORCE_CANARY"); g_gf_canary_at = cn && *cn ? atol(cn) : -1;
-                 if (m || g_gf_canary_at >= 0) { fprintf(stderr, "llms: gforce %s (a token off the grammar's fixed DSML text is rewound and replaced by the fixed text)%s\n", m == 2 ? "SHADOW" : m ? "on" : "off", g_gf_canary_at >= 0 ? " -- CANARY armed" : "");
-                     atexit_b(^{ fprintf(stderr, "llms gforce: %llu fixed positions checked, %llu deviations, %llu repaired\n", (unsigned long long)g_gf_checks, (unsigned long long)g_gf_dev, (unsigned long long)g_gf_repair); }); } }
+                 if (m || g_gf_canary_at >= 0) { ((void)0);
+                     atexit_b(^{ ((void)0); }); } }
     return m;
 }
 
-/* llms GFORCE_OPEN (apply_gforce_open.py): the block's opening -- the start form's remainder when a token breaks it after the full marker */
 static uint64_t g_gfo_checks, g_gfo_repaired;
-static uint64_t g_gflt_holds, g_gflt_rep_sample, g_gflt_rep_block, g_gflt_passed, g_gflt_canary; static int g_gflt_cstate = -1;   /* llms GFORCE_LT v4 (apply_gforce_lt.py) */
-static int agent_gflt_on(void) {   /* LLMS_DS4_GFORCE_LT=1: a tool-ish token after a '<' held right after the thinking close is repaired to the DSML marker */
+static uint64_t g_gflt_holds, g_gflt_rep_sample, g_gflt_rep_block, g_gflt_passed, g_gflt_canary; static int g_gflt_cstate = -1;
+static int agent_gflt_on(void) {
     static int m = -1;
     if (m < 0) { const char *e = getenv("LLMS_DS4_GFORCE_LT"); m = e && *e && *e != '0';
-                 if (m) { fprintf(stderr, "llms: gforce lt (a tool-ish tag after a '<' right after the thinking close is repaired to the DSML marker; other text passes)\n");
-                          atexit_b(^{ fprintf(stderr, "llms gforce lt: %llu post-close '<' holds checked, %llu repaired (%llu sampled, %llu drafted), %llu passed untouched, %llu canary injected\n",
-                                              (unsigned long long)g_gflt_holds, (unsigned long long)(g_gflt_rep_sample + g_gflt_rep_block), (unsigned long long)g_gflt_rep_sample,
-                                              (unsigned long long)g_gflt_rep_block, (unsigned long long)g_gflt_passed, (unsigned long long)g_gflt_canary); }); } }
+                 if (m) { ((void)0);
+                          atexit_b(^{ ((void)0); }); } }
     return m;
 }
-static bool agent_gflt_hold(const agent_stream_renderer *sr) {   /* the renderer holds a lone '<' in the post-think gap (GREEDY_LT's predicate, narrowed to the gap) */
+static bool agent_gflt_hold(const agent_stream_renderer *sr) {
     return sr && sr->syntax == AGENT_TOOL_SYNTAX_DSML41 && sr->pending_len == 1 && sr->pending[0] == '<' && !sr->dsml_active && !sr->in_think && sr->post_think_gap;
 }
 static int agent_gflt_first_token(ds4_engine *e, const char *text) { ds4_tokens t = {0}; ds4_tokenize_rendered_chat(e, text, &t); const int v = t.len > 0 ? t.v[0] : -1; ds4_tokens_free(&t); return v; }
 static int agent_gflt_marker(ds4_engine *e) { static int id = -2; if (id == -2) id = agent_gflt_first_token(e, "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c"); return id; }
-static bool agent_gflt_is_slip(ds4_engine *e, int token) {   /* the token's text starts like a tool-call tag (SYNTAX_RETRY's set + the observed 'list' / 'ds'), case-insensitive */
+static bool agent_gflt_is_slip(ds4_engine *e, int token) {
     if (token < 0 || token == agent_gflt_marker(e)) return false;
     size_t tl = 0; char *tt = ds4_token_text(e, token, &tl); if (!tt) return false;
     char low[16]; size_t n = tl < sizeof low - 1 ? tl : sizeof low - 1; for (size_t i = 0; i < n; i++) low[i] = (char)((tt[i] >= 'A' && tt[i] <= 'Z') ? tt[i] - 'A' + 'a' : tt[i]); low[n] = 0; free(tt);
@@ -10877,16 +10839,15 @@ static bool agent_gflt_is_slip(ds4_engine *e, int token) {   /* the token's text
     for (size_t k = 0; k < sizeof pre / sizeof pre[0]; k++) if (!strncmp(low, pre[k], strlen(pre[k]))) return true;
     return false;
 }
-static int agent_gflt_canary(ds4_engine *e, const agent_stream_renderer *sr, int token) {   /* LLMS_DS4_GFORCE_LT_CANARY: 1 -> 'tool' (a slip), 2 -> 'html' (prose), at the first hold */
+static int agent_gflt_canary(ds4_engine *e, const agent_stream_renderer *sr, int token) {
     if (g_gflt_cstate < 0) { const char *c = getenv("LLMS_DS4_GFORCE_LT_CANARY"); g_gflt_cstate = c && *c ? atoi(c) : 0; if (g_gflt_cstate < 0 || g_gflt_cstate > 2) g_gflt_cstate = 0;
-                             if (g_gflt_cstate) fprintf(stderr, "llms: gforce lt CANARY %d armed (the first post-close '<' hold gets '%s')\n", g_gflt_cstate, g_gflt_cstate == 1 ? "tool" : "html"); }
+                             if (g_gflt_cstate) ((void)0); }
     if (g_gflt_cstate != 1 && g_gflt_cstate != 2) return token;
     if (!agent_gflt_hold(sr)) return token;
     const int v = agent_gflt_first_token(e, g_gflt_cstate == 1 ? "tool" : "html"); if (v < 0) return token;
-    fprintf(stderr, "llms gforce lt CANARY: token %d replaced by %d ('%s') after a post-close '<'\n", token, v, g_gflt_cstate == 1 ? "tool" : "html");
     g_gflt_cstate = 3; g_gflt_canary++; return v;
 }
-static const char *agent_dsml_fixed_now(const agent_stream_renderer *sr) {   /* the text the grammar fixes right now, before the next token; NULL: none / not enforceable */
+static const char *agent_dsml_fixed_now(const agent_stream_renderer *sr) {
     if (!sr || !sr->parser || sr->parser->syntax != AGENT_TOOL_SYNTAX_DSML41 || !sr->dsml_active) return NULL;
     const agent_dsml_parser *p = sr->parser;
     if (p->state != AGENT_DSML_STRUCTURAL) return NULL;
@@ -10897,22 +10858,20 @@ static const char *agent_dsml_fixed_now(const agent_stream_renderer *sr) {   /* 
     const char *fx = agent_dsml41_fixed_next(tail, p->current.name != NULL, false);
     return fx && *fx ? fx : NULL;
 }
-/* llms LOOPBREAK (apply_loopbreak.py): stop a round whose last 512 8-grams are >= 90 % repeats of earlier ones in the same round */
 #define LB_TAB (1u << 18)
 #define LB_WIN 512
-static uint64_t lb_tab[LB_TAB]; static uint8_t lb_ring[LB_WIN]; static int lb_hist[8]; static uint32_t lb_n, lb_pos, lb_cnt, lb_grams; static uint64_t lb_stops, lb_rounds, lb_maxshare_pm; static uint32_t lb_threshold = (LB_WIN * 9u) / 10u;   /* llms LOOPBREAK_SHARE: LLMS_DS4_AGENT_LOOPBREAK_SHARE overrides */
-static uint32_t lb_seen_run;   /* llms RAMP (apply_ramp.py): consecutive fed 8-grams already seen in this round */
+static uint64_t lb_tab[LB_TAB]; static uint8_t lb_ring[LB_WIN]; static int lb_hist[8]; static uint32_t lb_n, lb_pos, lb_cnt, lb_grams; static uint64_t lb_stops, lb_rounds, lb_maxshare_pm; static uint32_t lb_threshold = (LB_WIN * 9u) / 10u;
+static uint32_t lb_seen_run;
 static void lb_reset(void) { memset(lb_tab, 0, sizeof lb_tab); memset(lb_ring, 0, sizeof lb_ring); lb_n = lb_pos = lb_cnt = lb_grams = 0; lb_rounds++; lb_seen_run = 0; }
-/* llms AGENT_ANNOUNCE_CLOSE v2 (apply_announce_close2.py): an announced check ('let me run / test / check / verify ...') inside the thinking closes the span at the end of its line -- the text is read from EVERY committed token (v1 read only each cycle's sampled token and never matched) */
-static unsigned long long g_ac_inhead;   /* llms AGENT_ANNOUNCE_CLOSE v3: lines refused as in-head */
+static unsigned long long g_ac_inhead;
 static int g_ac_on = -1, g_ac_armed; static unsigned long long g_ac_seen, g_ac_n; static char g_ac_buf[128]; static size_t g_ac_len, g_ac_since;
 static int agent_ac_on(void) {
     if (g_ac_on < 0) { const char *e = getenv("LLMS_DS4_AGENT_ANNOUNCE_CLOSE"); g_ac_on = e && *e && *e != '0';
-        if (g_ac_on) { fprintf(stderr, "llms: agent announce close (inside the thinking, 'let me run / test / check / verify ...' closes the span at the end of its line)\n");
-                       atexit_b(^{ fprintf(stderr, "llms agent announce close: %llu announcements seen, %llu thinking spans closed, %llu refused as in-head (v3)\n", g_ac_seen, g_ac_n, g_ac_inhead); }); } }
+        if (g_ac_on) { ((void)0);
+                       atexit_b(^{ ((void)0); }); } }
     return g_ac_on;
 }
-static void agent_ac_feed(agent_worker *w, int token, bool in_think) {   /* llms AGENT_ANNOUNCE_CLOSE v3 (apply_announce_close3.py): decide at the END of each thinking line */
+static void agent_ac_feed(agent_worker *w, int token, bool in_think) {
     if (!agent_ac_on()) return;
     if (!in_think) { g_ac_len = 0; g_ac_armed = 0; return; }
     if (g_ac_armed == 2) return;
@@ -10934,60 +10893,57 @@ static void agent_ac_feed(agent_worker *w, int token, bool in_think) {   /* llms
     }
     free(tt);
 }
-/* llms AGENT_RESTART_TOK (apply_restart_tok.py): LLMS_DS4_AGENT_RESTART_TOK=N -- the restart at N committed tokens of the attempt, not at a wall-clock time */
 static long g_rs_tok_n = -1; static long g_rs_tok; static double g_rs_tok_t0 = -1.0; static unsigned long long g_rs_tok_fires;
-static int g_rs_tok_hit, g_rs_state_mirror;   /* llms AGENT_RESTART_TOK v3: the worker's latch and the main loop's restart state, read / written with __atomic builtins only */
+static int g_rs_tok_hit, g_rs_state_mirror;
 static void worker_interrupt(agent_worker *w);
 static long agent_rs_tok_n(void) {
     if (g_rs_tok_n < 0) { const char *e = getenv("LLMS_DS4_AGENT_RESTART_TOK"); g_rs_tok_n = e && *e ? atol(e) : 0; if (g_rs_tok_n < 0) g_rs_tok_n = 0;
-        if (g_rs_tok_n > 0) { fprintf(stderr, "llms: agent restart tok %ld (the restart fires at that many committed tokens of the attempt; the time condition is not read)\n", g_rs_tok_n);
-            atexit_b(^{ fprintf(stderr, "llms agent restart tok: %llu restarts by token count\n", g_rs_tok_fires); }); } }
+        if (g_rs_tok_n > 0) { ((void)0);
+            atexit_b(^{ ((void)0); }); } }
     return g_rs_tok_n;
 }
-/* llms AGENT_HYP_CLOSE (apply_hyp_close.py): LLMS_DS4_AGENT_HYP_CLOSE=1 -- a stated fix inside the thinking closes it at the end of its line (once a span) */
 static int g_hc_on = -1, g_hc_pend, g_hc_done; static char g_hc_win[97]; static size_t g_hc_wl; static unsigned long long g_hc_hits, g_hc_n;
 static int agent_hc_on(void) {
     if (g_hc_on < 0) { const char *e = getenv("LLMS_DS4_AGENT_HYP_CLOSE"); g_hc_on = e && *e && *e != '0';
-        if (g_hc_on) { fprintf(stderr, "llms: agent hyp close (a stated fix inside the thinking closes the span at the end of its line, once a span)\n");
-                       atexit_b(^{ fprintf(stderr, "llms agent hyp close: %llu stated fixes seen in thinking, %llu thinking spans closed\n", g_hc_hits, g_hc_n); }); } }
+        if (g_hc_on) { ((void)0);
+                       atexit_b(^{ ((void)0); }); } }
     return g_hc_on;
 }
-static void agent_hc_feed(agent_worker *w, int token, bool in_think) {   /* the commit loop: every committed token; O(1) a token */
+static void agent_hc_feed(agent_worker *w, int token, bool in_think) {
     if (!agent_hc_on()) return;
-    if (!in_think) { g_hc_pend = 0; g_hc_done = 0; g_hc_wl = 0; return; }   /* outside a span: the next span may close again */
+    if (!in_think) { g_hc_pend = 0; g_hc_done = 0; g_hc_wl = 0; return; }
     if (g_hc_done) return;
     size_t tl = 0; char *tt = ds4_token_text(w->engine, token, &tl); if (!tt) return;
     int eol = 0;
     for (size_t q = 0; q < tl; q++) { char ch = tt[q]; if (ch == '\n') eol = 1; if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
         if (g_hc_wl == 96) { memmove(g_hc_win, g_hc_win + 48, 48); g_hc_wl = 48; } g_hc_win[g_hc_wl++] = ch; }
     g_hc_win[g_hc_wl] = 0; free(tt);
-    if (g_hc_pend && eol) { g_ac_armed = 2; g_hc_pend = 0; g_hc_done = 1; g_hc_n++; fprintf(stderr, "llms agent hyp close: the thinking closes at the end of the stated fix's line\n"); return; }
+    if (g_hc_pend && eol) { g_ac_armed = 2; g_hc_pend = 0; g_hc_done = 1; g_hc_n++; ((void)0); return; }
     if (g_hc_pend) return;
     static const char *pat[] = { "should be `", "the bug is", "bug is that", "maybe bug", "maybe the bug", "that's the bug", "thats the bug", "seems bug", "seems a bug", "seems the bug", "this is the bug", "fix is to", "fix would be", NULL };
     for (int i = 0; pat[i]; i++) if (strstr(g_hc_win, pat[i])) { g_hc_pend = 1; g_hc_hits++;
-        if (eol) { g_ac_armed = 2; g_hc_pend = 0; g_hc_done = 1; g_hc_n++; fprintf(stderr, "llms agent hyp close: the thinking closes at the end of the stated fix's line\n"); } break; }   /* v3: both arming paths log the close */
+        if (eol) { g_ac_armed = 2; g_hc_pend = 0; g_hc_done = 1; g_hc_n++; ((void)0); } break; }
 }
-/* llms AGENT_VALUE_CLOSE (apply_value_close.py): the value-guided think close -- see that script */
 static unsigned g_vc_attempt, g_vc_seen_attempt = ~0u; static int g_vc_on = -1, g_vc_fired, g_vc_nterms; static double g_vc_t0_s, g_vc_attempt_t0, g_vc_thresh;
-static unsigned long long g_vc_scored, g_vc_fires, g_vc_tok; static long g_vc_count, g_vc_atok;   /* llms VALUE_CLOSE count mode (apply_value_count.py) */ static char g_vc_word[48], g_vc_prev[48]; static size_t g_vc_wlen;
+static unsigned long long g_vc_scored, g_vc_fires, g_vc_tok; static long g_vc_count, g_vc_atok;    static char g_vc_word[48], g_vc_prev[48]; static size_t g_vc_wlen;
 enum { VC_TAB = 2048 }; static char *g_vc_term[VC_TAB]; static float g_vc_w[VC_TAB]; static unsigned g_vc_cnt[VC_TAB];
 static unsigned vc_hash(const char *t) { unsigned h = 2166136261u; for (; *t; t++) { h ^= (unsigned char)*t; h *= 16777619u; } return h; }
 static int vc_find(const char *t, int add) { unsigned i = vc_hash(t) & (VC_TAB - 1); for (int k = 0; k < VC_TAB; k++, i = (i + 1) & (VC_TAB - 1)) { if (!g_vc_term[i]) { if (add) { g_vc_term[i] = xstrdup(t); return (int)i; } return -1; } if (!strcmp(g_vc_term[i], t)) return (int)i; } return -1; }
 static int agent_vc_on(void) {
     if (g_vc_on >= 0) return g_vc_on;
     g_vc_on = 0; const char *e = getenv("LLMS_DS4_AGENT_VALUE_CLOSE"); if (!e || !*e || *e == '0') return 0;
-    char path[1024]; const char *c = strrchr(e, ':'); if (!c || (size_t)(c - e) >= sizeof path) { fprintf(stderr, "llms: agent value close '%s' is not FILE:T0 -- off\n", e); return 0; }
+    char path[1024]; const char *c = strrchr(e, ':'); if (!c || (size_t)(c - e) >= sizeof path) { ((void)0); return 0; }
     memcpy(path, e, (size_t)(c - e)); path[c - e] = 0; g_vc_t0_s = atof(c + 1);
-    FILE *f = fopen(path, "r"); if (!f) { fprintf(stderr, "llms: agent value close: cannot read %s -- off\n", path); return 0; }
+    FILE *f = fopen(path, "r"); if (!f) { ((void)0); return 0; }
     char ln[256]; int ok = fgets(ln, sizeof ln, f) && (sscanf(ln, "thresh %lf", &g_vc_thresh) == 1 || sscanf(ln, "count %ld", &g_vc_count) == 1);
-    if (ok && g_vc_count > 0) { fclose(f); g_vc_on = 1; fprintf(stderr, "llms: agent value close COUNT mode (fires when an attempt has fewer than %ld committed tokens at its first check from %.0f s, once an attempt)\n", g_vc_count, g_vc_t0_s);
-        atexit_b(^{ fprintf(stderr, "llms agent value close: %llu scores computed, %llu thinking spans closed, %llu tokens read\n", g_vc_scored, g_vc_fires, g_vc_tok); }); return 1; }
+    if (ok && g_vc_count > 0) { fclose(f); g_vc_on = 1; ((void)0);
+        atexit_b(^{ ((void)0); }); return 1; }
     while (ok && fgets(ln, sizeof ln, f)) { char *sp = strchr(ln, ' '); if (!sp) continue; float wv = (float)atof(ln); char *t = sp + 1; size_t n = strlen(t); while (n && (t[n - 1] == '\n' || t[n - 1] == '\r')) t[--n] = 0;
         int i = vc_find(t, 1); if (i >= 0) { g_vc_w[i] = wv; g_vc_nterms++; } }
     fclose(f);
-    if (!ok || g_vc_nterms == 0) { fprintf(stderr, "llms: agent value close: %s holds no thresh / terms -- off\n", path); return 0; }
-    g_vc_on = 1; fprintf(stderr, "llms: agent value close (%d terms, thresh %.4f, from %.0f s into an attempt, once an attempt: a 'doomed' value inside the thinking closes the span)\n", g_vc_nterms, g_vc_thresh, g_vc_t0_s);
-    atexit_b(^{ fprintf(stderr, "llms agent value close: %llu scores computed, %llu thinking spans closed, %llu tokens read\n", g_vc_scored, g_vc_fires, g_vc_tok); });
+    if (!ok || g_vc_nterms == 0) { ((void)0); return 0; }
+    g_vc_on = 1; ((void)0);
+    atexit_b(^{ ((void)0); });
     return 1;
 }
 static void vc_count(const char *t) { int i = vc_find(t, 0); if (i >= 0) g_vc_cnt[i]++; }
@@ -10997,9 +10953,9 @@ static void vc_word_end(void) {
         memcpy(g_vc_prev, g_vc_word, g_vc_wlen + 1); }
     g_vc_wlen = 0;
 }
-static int g_vc_restart_req;   /* llms VALUE_ACTION=restart (apply_value_restart.py): set by a fire, consumed by llms_rs_tick */
+static int g_vc_restart_req;
 static int agent_vc_restart(void) { static int r = -1; if (r < 0) { const char *e = getenv("LLMS_DS4_AGENT_VALUE_ACTION"); r = e && !strcmp(e, "restart");
-    if (r) fprintf(stderr, "llms: agent value action RESTART (a 'doomed' value restarts the attempt at once, through the time restart's path)\n"); } return r; }
+    if (r) ((void)0); } return r; }
 static void agent_vc_feed(agent_worker *w, int token, bool in_think) {
     if (!agent_vc_on()) return;
     if (g_vc_seen_attempt != g_vc_attempt) { g_vc_seen_attempt = g_vc_attempt; memset(g_vc_cnt, 0, sizeof g_vc_cnt); g_vc_wlen = 0; g_vc_prev[0] = 0; g_vc_fired = 0; g_vc_attempt_t0 = now_sec(); g_vc_atok = 0; }
@@ -11009,14 +10965,14 @@ static void agent_vc_feed(agent_worker *w, int token, bool in_think) {
         if (wc) { if (g_vc_wlen + 1 < sizeof g_vc_word) g_vc_word[g_vc_wlen++] = ch; } else vc_word_end(); }
     free(tt); g_vc_tok++; g_vc_atok++;
     if (g_vc_fired || !in_think || (g_vc_tok & 31u) || now_sec() - g_vc_attempt_t0 < g_vc_t0_s) return;
-    if (g_vc_count > 0) { g_vc_scored++; g_vc_fired = 1;   /* count mode: one check an attempt */
-        if (g_vc_atok < g_vc_count) { g_vc_fires++; if (agent_vc_restart()) g_vc_restart_req = 1; else g_ac_armed = 2; fprintf(stderr, "llms agent value close: fired at %.1f s into the attempt (count %ld < %ld)\n", now_sec() - g_vc_attempt_t0, g_vc_atok, g_vc_count); }
+    if (g_vc_count > 0) { g_vc_scored++; g_vc_fired = 1;
+        if (g_vc_atok < g_vc_count) { g_vc_fires++; if (agent_vc_restart()) g_vc_restart_req = 1; else g_ac_armed = 2; ((void)(now_sec() - g_vc_attempt_t0), (void)(g_vc_atok), (void)(g_vc_count)); }
         return; }
     double num = 0.0, den = 0.0; for (int i = 0; i < VC_TAB; i++) if (g_vc_cnt[i]) { const double v = log1p((double)g_vc_cnt[i]); num += g_vc_w[i] * v; den += v * v; }
     g_vc_scored++; if (den <= 0.0) return;
-    if (num / sqrt(den) >= g_vc_thresh) { g_vc_fired = 1; g_vc_fires++; if (agent_vc_restart()) g_vc_restart_req = 1; else g_ac_armed = 2; fprintf(stderr, "llms agent value close: fired at %.1f s into the attempt (score %.4f >= %.4f)\n", now_sec() - g_vc_attempt_t0, num / sqrt(den), g_vc_thresh); }
+    if (num / sqrt(den) >= g_vc_thresh) { g_vc_fired = 1; g_vc_fires++; if (agent_vc_restart()) g_vc_restart_req = 1; else g_ac_armed = 2; ((void)(now_sec() - g_vc_attempt_t0), (void)(num / sqrt(den)), (void)(g_vc_thresh)); }
 }
-static int lb_feed(int tok) {   /* 1 when the window's repeat share reaches the threshold */
+static int lb_feed(int tok) {
     lb_hist[lb_n & 7u] = tok; lb_n++;
     if (lb_n < 8u) return 0;
     uint64_t h = 1469598103934665603ull;
@@ -11025,25 +10981,24 @@ static int lb_feed(int tok) {   /* 1 when the window's repeat share reaches the 
     uint32_t i = (uint32_t)(h >> 20) & (LB_TAB - 1u); int seen = 0;
     for (uint32_t pr = 0; pr < 64u; pr++, i = (i + 1u) & (LB_TAB - 1u)) { if (lb_tab[i] == h) { seen = 1; break; } if (lb_tab[i] == 0) { lb_tab[i] = h; break; } }
     lb_cnt -= lb_ring[lb_pos]; lb_ring[lb_pos] = (uint8_t)seen; lb_cnt += (uint32_t)seen; lb_pos = (lb_pos + 1u) % LB_WIN; lb_grams++;
-    lb_seen_run = seen ? lb_seen_run + 1u : 0u;   /* llms RAMP */
+    lb_seen_run = seen ? lb_seen_run + 1u : 0u;
     if (lb_grams < LB_WIN) return 0;
     { const uint64_t pm = (uint64_t)lb_cnt * 1000ull / LB_WIN; if (pm > lb_maxshare_pm) lb_maxshare_pm = pm; }
     return lb_cnt >= lb_threshold;
 }
 
-/* llms SYNTAX_RETRY (apply_syntax_retry.py): an invented tool syntax without DSML -> the round regenerated through the loopbreak retry */
 static uint64_t g_syntax_retries;
-static int agent_syntax_retry_mode(void) {   /* llms SYNTAX_RETRY2: the value of LLMS_DS4_AGENT_SYNTAX_RETRY (1 the shipped detector, 2 the widened one) */
+static int agent_syntax_retry_mode(void) {
     static int m = -1; if (m < 0) { const char *e = getenv("LLMS_DS4_AGENT_SYNTAX_RETRY"); m = e && *e ? atoi(e) : 0; if (m < 0) m = 0; }
     return m;
 }
-static int agent_invented_tool_syntax(const char *t, size_t n) {   /* the text after the last '</think>'; 1 = tool markup without a DSML marker */
+static int agent_invented_tool_syntax(const char *t, size_t n) {
     if (!t || !n) return 0;
     const char *s = t, *end = t + n;
     for (const char *p = t; p + 8 <= end; p++) if (!memcmp(p, "</think>", 8)) s = p + 8;
     static const char dsml[] = "\xef\xbd\x9c" "DSML";
     for (const char *p = s; p + 7 <= end; p++) if (!memcmp(p, dsml, 7)) return 0;
-    if (agent_syntax_retry_mode() >= 2) {   /* llms SYNTAX_RETRY2: the ASCII marker, and tags named after the agent's own tools */
+    if (agent_syntax_retry_mode() >= 2) {
         for (const char *p = s; p + 6 <= end; p++) if (!memcmp(p, "|DSML|", 6)) return 1;
         static const char *tool_names[] = { "search", "read", "write", "edit", "list", "more", "google_search", "visit_page" };
         for (const char *p = s; p < end; p++) {
@@ -11067,61 +11022,59 @@ static int agent_invented_tool_syntax(const char *t, size_t n) {   /* the text a
     }
     return 0;
 }
-static int agent_loopbreak_mode(void) {   /* 0 off, 1 stop, 3 shadow, 4 retry (stop the round, drop the message, regenerate: at most 2 times) */
+static int agent_loopbreak_mode(void) {
     static int m = -1;
     if (m < 0) {
         const char *e = getenv("LLMS_DS4_AGENT_LOOPBREAK"); m = !e || !*e || *e == '0' ? 0 : !strcmp(e, "shadow") ? 3 : !strcmp(e, "retry") ? 4 : 1;
-        { const char *sh = getenv("LLMS_DS4_AGENT_LOOPBREAK_SHARE");   /* llms LOOPBREAK_SHARE (apply_lbshare.py): the stop threshold as a fraction of the window */
+        { const char *sh = getenv("LLMS_DS4_AGENT_LOOPBREAK_SHARE");
           if (m && sh && *sh) { const double v = atof(sh); if (v > 0.05 && v < 1.0) { lb_threshold = (uint32_t)(v * (double)LB_WIN + 0.5);
-              fprintf(stderr, "llms: loopbreak share %.2f (LLMS_DS4_AGENT_LOOPBREAK_SHARE: a round stops when %u of the last %d 8-grams are repeats)\n", v, lb_threshold, LB_WIN); } } }
-        if (m && e && !strcmp(e, "selftest")) {   /* a canary the detector can fail: random / a loop / a mixture */
+              ((void)0); } } }
+        if (m && e && !strcmp(e, "selftest")) {
             uint64_t x = 88172645463325252ull; int trig_random = 0, trig_loop = -1, trig_mix = 0;
             lb_reset(); for (int i = 0; i < 4000; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; if (lb_feed((int)(x % 100000ull))) trig_random++; }
             lb_reset(); for (int i = 0; i < 200; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (void)lb_feed((int)(x % 100000ull)); }
             for (int i = 0; i < 2000 && trig_loop < 0; i++) if (lb_feed(1000 + (i % 37))) trig_loop = i;
             lb_reset(); for (int i = 0; i < 4000; i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; if (lb_feed((i % 10 < 3) ? 5000 + (i % 41) : (int)(x % 100000ull))) trig_mix++; }
-            fprintf(stderr, "llms loopbreak selftest: random 4000 tokens -> %d triggers; a period-37 loop after 200 random tokens -> triggered after %d tokens; a 30 %% periodic mixture -> %d triggers: %s\n",
-                    trig_random, trig_loop, trig_mix, (trig_random == 0 && trig_loop >= 0 && trig_loop < 700 && trig_mix == 0) ? "PASS" : "FAIL");
             lb_rounds = lb_stops = lb_maxshare_pm = 0;
         }
-        if (m) { fprintf(stderr, "llms: loopbreak %s (a round whose last 512 8-grams are >= 90 %% repeats of earlier ones is stopped%s)\n", m == 3 ? "SHADOW" : m == 4 ? "RETRY" : "on", m == 4 ? " and its message regenerated, at most twice" : "");
-                 atexit_b(^{ fprintf(stderr, "llms loopbreak: %llu rounds checked, %llu stops, the maximum window share %.3f\n", (unsigned long long)lb_rounds, (unsigned long long)lb_stops, (double)lb_maxshare_pm / 1000.0); }); }
+        if (m) { ((void)0);
+                 atexit_b(^{ ((void)0); }); }
     }
     return m;
 }
 
 static uint64_t g_glt_hits;
-static int agent_glt_on(void) {   /* llms GREEDY_LT (apply_greedylt.py): LLMS_DS4_AGENT_GREEDY_LT=1 -- the token after a '<' that opens a line is the argmax */
+static int agent_glt_on(void) {
     static int m = -1;
     if (m < 0) { const char *e = getenv("LLMS_DS4_AGENT_GREEDY_LT"); m = e && *e && *e != '0';
-                 if (m) { fprintf(stderr, "llms: greedy lt on (the token after a '<' that opens a line is the argmax: the call-start marker is not left to the sampled tail)\n");
-                          atexit_b(^{ fprintf(stderr, "llms greedy lt: %llu predicate hits\n", (unsigned long long)g_glt_hits); }); } }   /* v2: 'predicate hits' = loop-top hits */
+                 if (m) { ((void)0);
+                          atexit_b(^{ ((void)0); }); } }
     return m;
 }
-static bool agent_glt_pending(const agent_stream_renderer *sr) {   /* llms GREEDY_LT v2: a lone '<' token is held in sr->pending (a partial '<think>' / '</think>') until the next token arrives, so dsml_start_len is still 0 (v1 tested it == 1 and never fired); prev_nl is the last byte passed to the normal-byte handler */
+static bool agent_glt_pending(const agent_stream_renderer *sr) {
     return sr->pending_len == 1 && sr->pending[0] == '<' && !sr->dsml_active && !sr->in_think && (sr->prev_nl || sr->post_think_gap);
 }
 static uint64_t g_ramp_greedy_skips, g_ramp_minp_skips;
-static int g_cx_n = -1, g_cx_until = -1; static uint64_t g_cx_rounds, g_cx_tokens;   /* llms AGENT_CLOSE_EXACT (apply_agent_close_exact.py) */
-static int agent_ramp_on(void) {   /* llms RAMP: inside a repeat, the model's own distribution (no greedy, no min-p cut) */
+static int g_cx_n = -1, g_cx_until = -1; static uint64_t g_cx_rounds, g_cx_tokens;
+static int agent_ramp_on(void) {
     static int m = -1, run = 2;
     if (m < 0) { const char *e = getenv("LLMS_DS4_AGENT_RAMP"); m = e && *e && *e != '0'; const char *r = getenv("LLMS_DS4_AGENT_RAMP_RUN"); if (r && *r && atoi(r) > 0) run = atoi(r);
-                 if (m) { fprintf(stderr, "llms: agent ramp (inside a repeat -- the last %d fed 8-grams already seen this round -- a row is sampled from the model's own distribution: no greedy, no min-p cut)\n", run);
-                          atexit_b(^{ fprintf(stderr, "llms agent ramp: %llu greedy rows sampled, %llu min-p cuts lifted\n", (unsigned long long)g_ramp_greedy_skips, (unsigned long long)g_ramp_minp_skips); }); } }
+                 if (m) { ((void)0);
+                          atexit_b(^{ ((void)0); }); } }
     return m ? run : 0;
 }
 static uint64_t g_ramp_share_refused;
-static bool agent_ramp_active(void) {   /* llms RAMP_SHARE (apply_ramp_share.py): RAMP's trigger, optionally narrowed to a loop by the detector's own share */
+static bool agent_ramp_active(void) {
     const int rr = agent_ramp_on(); if (!rr || lb_seen_run < (uint32_t)rr) return false;
     static float sh = -2.0f; if (sh < -1.0f) { const char *e = getenv("LLMS_DS4_AGENT_RAMP_SHARE"); sh = (e && *e) ? (float)atof(e) : -1.0f;
-        if (sh > 0.0f) { fprintf(stderr, "llms: agent ramp share %.2f (RAMP acts only when %.0f of the loop detector's last %d fed 8-grams were repeats)\n", sh, sh * LB_WIN, LB_WIN);
-                         atexit_b(^{ fprintf(stderr, "llms agent ramp share: %llu repeat rows refused by the share gate\n", (unsigned long long)g_ramp_share_refused); }); } }
+        if (sh > 0.0f) { ((void)0);
+                         atexit_b(^{ ((void)0); }); } }
     if (sh > 0.0f && (float)lb_cnt < sh * (float)LB_WIN) { g_ramp_share_refused++; return false; }
     return true;
 }
 static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) {
     if (!sr || !sr->parser) return false;
-    if (agent_ramp_active()) { g_ramp_greedy_skips++; return false; }   /* llms RAMP (+ RAMP_SHARE) */
+    if (agent_ramp_active()) { g_ramp_greedy_skips++; return false; }
     if (sr->parser->state == AGENT_DSML_ERROR ||
         sr->parser->state == AGENT_DSML_DONE)
         return false;
@@ -11131,7 +11084,7 @@ static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) 
      * the second byte, the buffered prefix still matching here is specifically
      * DSML-shaped ("<｜..." or the tolerated "<D..." typo). */
     if (sr->dsml_start_len > 1) return true;
-    if (agent_glt_pending(sr) && agent_glt_on()) return true;   /* llms GREEDY_LT v2 */
+    if (agent_glt_pending(sr) && agent_glt_on()) return true;
     if (!sr->dsml_active) return false;
 
     if (sr->parser->state == AGENT_DSML_STRUCTURAL)
@@ -11147,35 +11100,31 @@ static bool agent_stream_compaction_needs_lookahead(const agent_stream_renderer 
            (sr->pending_len || sr->dsml_start_len);
 }
 
-/* llms FLIPKEEP (apply_flipkeep.py): LLMS_DS4_AGENT_FLIPKEEP=1 keeps the accepted draft across a sampling-mode flip when the new-mode draw from row 0's raw logits equals it; =shadow compares that draw with the shipped redraw. Off unless set. */
 static uint64_t g_fk_flips, g_fk_kept, g_fk_redraw, g_fk_invalid, g_fk_shadow_n, g_fk_shadow_same;
-static void llms_flipkeep_report(void) { fprintf(stderr, "llms flipkeep: %llu flips at the first token of a 2-token block, %llu kept, %llu redrawn, %llu invalid; shadow %llu of %llu redraws identical\n",
-    (unsigned long long)g_fk_flips, (unsigned long long)g_fk_kept, (unsigned long long)g_fk_redraw, (unsigned long long)g_fk_invalid, (unsigned long long)g_fk_shadow_same, (unsigned long long)g_fk_shadow_n); }
+static void llms_flipkeep_report(void) { ((void)0); }
 
-static float g_lb_retry_temp = -1.0f;   /* llms LB_RETRY_TEMP: the temperature of a LOOPBREAK retry of a greedy round (-1: none) */
-static float g_lb_retry_minp = -1.0f; static uint64_t g_lbm_rounds;   /* llms LB_RETRY_MINP (apply_lb_retry_minp.py): the min_p of a LOOPBREAK retry (-1: none) */
+static float g_lb_retry_temp = -1.0f;
+static float g_lb_retry_minp = -1.0f; static uint64_t g_lbm_rounds;
 static float agent_lbm_value(void) { static float v = -2.0f; if (v < -1.5f) { const char *e = getenv("LLMS_DS4_AGENT_LB_RETRY_MINP"); v = e && *e ? (float)atof(e) : -1.0f;
-    if (v >= 0.0f) { fprintf(stderr, "llms: lb retry min_p %.2f (a LOOPBREAK retry draws its round at this min_p)\n", (double)v); atexit_b(^{ fprintf(stderr, "llms lb retry min_p: %llu rounds drawn at the retry min_p\n", (unsigned long long)g_lbm_rounds); }); } } return v; }
-static float agent_eff_minp(const agent_config *cfg) { if (agent_ramp_active()) { g_ramp_minp_skips++; return 0.0f; }   /* llms RAMP (+ RAMP_SHARE) */
-    return g_lb_retry_minp >= 0.0f ? g_lb_retry_minp : cfg->gen.min_p; }   /* llms LB_RETRY_MINP */
+    if (v >= 0.0f) { ((void)0); atexit_b(^{ ((void)0); }); } } return v; }
+static float agent_eff_minp(const agent_config *cfg) { if (agent_ramp_active()) { g_ramp_minp_skips++; return 0.0f; }
+    return g_lb_retry_minp >= 0.0f ? g_lb_retry_minp : cfg->gen.min_p; }
 static float agent_eff_temp(const agent_config *cfg) { return g_lb_retry_temp >= 0.0f ? g_lb_retry_temp : cfg->gen.temperature; }
-static ds4_session_snapshot g_lbs_snap; static int g_lbs_pos = -1, g_lbs_top_id = -1; static float g_lbs_top_lp;   /* llms LB_SNAP (apply_lbsnap.py) */
+static ds4_session_snapshot g_lbs_snap; static int g_lbs_pos = -1, g_lbs_top_id = -1; static float g_lbs_top_lp;
 static uint64_t g_lbs_saves, g_lbs_loads, g_lbs_fails, g_lbs_mism; static double g_lbs_save_ms, g_lbs_load_ms;
-static uint64_t g_lbf_n;   /* llms LB_FORCE (apply_lbforce.py): forced retries, a test of the retry path */
+static uint64_t g_lbf_n;
 static int agent_lbforce_n(void) { static int n = -1; if (n < 0) { const char *e = getenv("LLMS_DS4_AGENT_LB_FORCE"); n = e && *e ? atoi(e) : 0; if (n < 0) n = 0;
-    if (n) { fprintf(stderr, "llms: lb force %d (TEST: the first %d rounds that end without a stop are retried once)\n", n, n); atexit_b(^{ fprintf(stderr, "llms lb force: %llu forced retries\n", (unsigned long long)g_lbf_n); }); } }
+    if (n) { ((void)0); atexit_b(^{ ((void)0); }); } }
     return n; }
 static int agent_lbsnap_on(void) {
     static int m = -1;
     if (m < 0) { const char *e = getenv("LLMS_DS4_AGENT_LB_SNAP"); m = e && *e && *e != '0';
-                 if (m) { fprintf(stderr, "llms: lb snap on (the session is snapshotted after each round's prefill; a loopbreak retry restores it instead of re-prefilling the transcript)\n");
-                          atexit_b(^{ fprintf(stderr, "llms lb snap: %llu saves (%.1f ms total, last %llu bytes), %llu restores (%.1f ms total), %llu failures, top-1 mismatches %llu\n",
-                                              (unsigned long long)g_lbs_saves, g_lbs_save_ms, (unsigned long long)g_lbs_snap.len, (unsigned long long)g_lbs_loads, g_lbs_load_ms,
-                                              (unsigned long long)g_lbs_fails, (unsigned long long)g_lbs_mism); }); } }
+                 if (m) { ((void)0);
+                          atexit_b(^{ ((void)0); }); } }
     return m;
 }
-static float agent_lbrt_value(void) {   /* LLMS_DS4_AGENT_LB_RETRY_TEMP=T; unset: -1 (off) */
-    static float v = -2.0f; if (v < -1.5f) { const char *e = getenv("LLMS_DS4_AGENT_LB_RETRY_TEMP"); v = e && *e ? (float)atof(e) : -1.0f; if (v >= 0.0f) fprintf(stderr, "llms: lb retry temp %.2f (a LOOPBREAK retry of a round configured below temperature 0.3 draws at %.2f)\n", (double)v, (double)v); }
+static float agent_lbrt_value(void) {
+    static float v = -2.0f; if (v < -1.5f) { const char *e = getenv("LLMS_DS4_AGENT_LB_RETRY_TEMP"); v = e && *e ? (float)atof(e) : -1.0f; if (v >= 0.0f) ((void)0); }
     return v;
 }
 static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
@@ -11184,7 +11133,7 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                               greedy ? 0.0f : agent_eff_temp(cfg),
                               0,
                               greedy ? 1.0f : cfg->gen.top_p,
-                              greedy ? 0.0f : agent_eff_minp(cfg),   /* llms LB_RETRY_MINP */
+                              greedy ? 0.0f : agent_eff_minp(cfg),
                               rng);
 }
 
@@ -11258,7 +11207,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * the tool result as a tool message, then ask the model to continue. */
     int carried_generation = 0;
     bool resume_assistant = false, resume_in_think = false;
-    int lb_retries = 0;   /* llms LOOPBREAK retry: regenerations of the current assistant message */
+    int lb_retries = 0;
     int resume_start = 0;
     for (int tool_round = 0; ; tool_round++) {
         if (!resume_assistant &&
@@ -11313,10 +11262,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         ds4_session_set_progress(w->session, worker_progress_cb, w);
         ds4_session_set_display_progress(w->session, worker_progress_cb, w);
         ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
-        const int llms_xa = llms_exact_append_rounds();   /* llms TOOLREAD: this round's append exact? */
+        const int llms_xa = llms_exact_append_rounds();
         const int llms_xa_now = (llms_xa == 1 && tool_round > 0) || (llms_xa == 2 && tool_round == 0);
-        if (llms_xa_now) { ds4_llms_set_append_exact(1); fprintf(stderr, "llms: exact append round %d (%d suffix tokens)\n", tool_round, suffix); }
-        const int llms_tx = llms_task_exact(); const int llms_tx_now = llms_tx > 0 && suffix > 0 && (tool_round == 0 || (llms_tx >= 2 && suffix <= llms_tx));   /* llms AGENT_TASK_EXACT */
+        if (llms_xa_now) { ds4_llms_set_append_exact(1); ((void)0); }
+        const int llms_tx = llms_task_exact(); const int llms_tx_now = llms_tx > 0 && suffix > 0 && (tool_round == 0 || (llms_tx >= 2 && suffix <= llms_tx));
         if (llms_tx_now) { ds4_llms_set_exact_sync(1); llms_tx_syncs++; llms_tx_rows += (unsigned long long)suffix; }
         double t_sync0 = now_sec();
         int sync_rc = w->image_count ?
@@ -11325,14 +11274,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                         err, sizeof(err)) :
             ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err));
         double t_sync1 = now_sec();
-        if (llms_tx_now) ds4_llms_set_exact_sync(0);   /* llms AGENT_TASK_EXACT */
-        if (llms_xa_now) ds4_llms_set_append_exact(0);   /* llms TOOLREAD */
+        if (llms_tx_now) ds4_llms_set_exact_sync(0);
+        if (llms_xa_now) ds4_llms_set_append_exact(0);
         ds4_session_set_cancel(w->session, NULL, NULL);
         ds4_session_set_progress(w->session, NULL, NULL);
         ds4_session_set_display_progress(w->session, NULL, NULL);
         agent_trace(w, "prefill sync done tool_round=%d prompt=%d cached=%d suffix=%d rc=%d %.3f ms pos=%d common=%d",
                     tool_round, prompt_for_sync->len, cached, suffix,
-                    sync_rc, (t_sync1 - t_sync0) * 1000.0, old_pos, common);   /* llms 04:1x: the cache rule's two inputs (apply_sync_trace.py) */
+                    sync_rc, (t_sync1 - t_sync0) * 1000.0, old_pos, common);
         if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
             agent_publish_system_status(
                 w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
@@ -11346,7 +11295,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 1;
         }
 
-        if (agent_lbsnap_on() && agent_loopbreak_mode() == 4) {   /* llms LB_SNAP: the round's start, kept for a loopbreak retry */
+        if (agent_lbsnap_on() && agent_loopbreak_mode() == 4) {
             char se[160] = {0}; const double t0 = now_sec(); ds4_token_score ts1[1];
             if (ds4_session_save_snapshot(w->session, &g_lbs_snap, se, sizeof se) == 0) { g_lbs_pos = ds4_session_pos(w->session); g_lbs_saves++;
                 g_lbs_top_id = ds4_session_top_logprobs(w->session, ts1, 1) == 1 ? ts1[0].id : -1; g_lbs_top_lp = g_lbs_top_id >= 0 ? ts1[0].logprob : 0.0f; }
@@ -11393,7 +11342,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool model_stopped = false;
         int generated = 0;
         int compaction_lookahead = 0;
-        bool lb_fired = false; if (agent_loopbreak_mode() > 0) lb_reset();   /* llms LOOPBREAK: a fresh window per round */
+        bool lb_fired = false; if (agent_loopbreak_mode() > 0) lb_reset();
         double t0 = now_sec();
         pthread_mutex_lock(&w->mu);
         w->status.state = AGENT_WORKER_GENERATING;
@@ -11403,32 +11352,32 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         bool status_greedy_sampling = false;
-        int fk_shadow_x = -2;   /* llms FLIPKEEP shadow: the x drawn at the last flip (-2: none pending) */
-        bool spec_mode_valid = false, spec_mode_greedy = false;   /* llms DSP41_RESRAW: the mode of the last speculative call */
+        int fk_shadow_x = -2;
+        bool spec_mode_valid = false, spec_mode_greedy = false;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
-            if (greedy_sampling && agent_glt_pending(&stream) && agent_glt_on()) g_glt_hits++;   /* llms GREEDY_LT v2: counted where it takes effect -- the '<' ended a speculative cycle, so this sample is the follower */
+            if (greedy_sampling && agent_glt_pending(&stream) && agent_glt_on()) g_glt_hits++;
             if (greedy_sampling != status_greedy_sampling) {
                 worker_set_greedy_sampling(w, greedy_sampling);
                 status_greedy_sampling = greedy_sampling;
             }
-            if (spec_mode_valid && spec_mode_greedy != greedy_sampling)   /* llms DSP41_RESRAW */
+            if (spec_mode_valid && spec_mode_greedy != greedy_sampling)
                 (void)ds4_session_dsp41_restore_raw(w->session);
             spec_mode_valid = false;
 
-            if (generated == 0 && stream.in_think) {   /* llms AGENT_CLOSE_BIAS (apply_closebias.py): LLMS_DS4_AGENT_CLOSE_BIAS=delta -- +delta on </think> at the first sample of a thinking round */
+            if (generated == 0 && stream.in_think) {
                 static float cbias = -1.0e9f; static uint64_t cbias_n;
                 if (cbias < -1.0e8f) { const char *e = getenv("LLMS_DS4_AGENT_CLOSE_BIAS"); cbias = (e && *e) ? (float)atof(e) : 0.0f;
-                                      if (cbias != 0.0f) { fprintf(stderr, "llms: agent close bias %+.2f (a one-shot logit bias on </think> at the first sample of every thinking round)\n", (double)cbias);
-                                                           atexit_b(^{ fprintf(stderr, "llms agent close bias: applied at %llu round starts\n", (unsigned long long)cbias_n); }); } }
+                                      if (cbias != 0.0f) { ((void)0);
+                                                           atexit_b(^{ ((void)0); }); } }
                 if (cbias != 0.0f) { const int te = ds4_token_think_end(w->engine); if (te >= 0) { ds4_session_set_next_bias(w->session, te, cbias); cbias_n++; } }
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
-            token = agent_gflt_canary(w->engine, &stream, token);   /* llms GFORCE_LT canary: the sampled token, before it is evaluated */
-            if (agent_gflt_on() && agent_gflt_hold(&stream)) { g_gflt_holds++; if (agent_gflt_is_slip(w->engine, token) && agent_gflt_marker(w->engine) >= 0) { token = agent_gflt_marker(w->engine); g_gflt_rep_sample++; } else g_gflt_passed++; }   /* llms GFORCE_LT */
-            if (agent_gforce_mode() >= 0 && g_gf_canary_at >= 0 && agent_dsml_fixed_now(&stream) && ++g_gf_canary_count == (uint64_t)g_gf_canary_at) { fprintf(stderr, "llms gforce CANARY: sampled token %d replaced by 13 at a fixed position\n", token); token = 13; }   /* llms GFORCE canary */
-            if (fk_shadow_x != -2) { g_fk_shadow_n++; if (token == fk_shadow_x) g_fk_shadow_same++; fk_shadow_x = -2; }   /* llms FLIPKEEP shadow: the shipped redraw vs x */
+            token = agent_gflt_canary(w->engine, &stream, token);
+            if (agent_gflt_on() && agent_gflt_hold(&stream)) { g_gflt_holds++; if (agent_gflt_is_slip(w->engine, token) && agent_gflt_marker(w->engine) >= 0) { token = agent_gflt_marker(w->engine); g_gflt_rep_sample++; } else g_gflt_passed++; }
+            if (agent_gforce_mode() >= 0 && g_gf_canary_at >= 0 && agent_dsml_fixed_now(&stream) && ++g_gf_canary_count == (uint64_t)g_gf_canary_at) { ((void)0); token = 13; }
+            if (fk_shadow_x != -2) { g_fk_shadow_n++; if (token == fk_shadow_x) g_fk_shadow_same++; fk_shadow_x = -2; }
             if (ds4_token_is_stop_for_think_mode(w->engine, token, think_mode)) {
                 model_stopped = true;
                 if (tool_syntax == AGENT_TOOL_SYNTAX_GLM &&
@@ -11438,21 +11387,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 break;
             }
 
-            if (agent_gforce_mode()) {   /* llms GFORCE v2: the sampled token, before it is evaluated (no rewind: the engine's LAZY0 hold wants the same first token back) */
+            if (agent_gforce_mode()) {
                 const char *gfx0 = agent_dsml_fixed_now(&stream);
                 if (!gfx0 && ({
                     static int on = -1;
                     if (on < 0) { const char *e = getenv("LLMS_DS4_GFORCE_OPEN"); on = e && *e && *e != '0';
-                                  if (on) { fprintf(stderr, "llms: gforce open (after the full DSML marker, a token that fits neither start form is replaced by the form's next text)\n");
-                                            atexit_b(^{ fprintf(stderr, "llms gforce open: %llu openings checked, %llu repaired\n", (unsigned long long)g_gfo_checks, (unsigned long long)g_gfo_repaired); }); } }
+                                  if (on) { ((void)0);
+                                            atexit_b(^{ ((void)0); }); } }
                     (int)(on);
-                }) && agent_gforce_mode() != 2) {   /* llms GFORCE_OPEN */
+                }) && agent_gforce_mode() != 2) {
                     size_t otl = 0; char *ott = ds4_token_text(w->engine, token, &otl); const char *ofx = ott ? ({
                         const char *inl_ret_agent_dsml_open_fixed;
                         const agent_stream_renderer *sr = &stream; const char *tok = ott; size_t tl = otl;
-                        /* the text to force, or NULL (no opening held, or the token fits) */
                         if (!sr || sr->syntax != AGENT_TOOL_SYNTAX_DSML41 || sr->dsml_active || sr->in_think || sr->dsml_in_think || !tok) { inl_ret_agent_dsml_open_fixed = (const char *)(NULL); goto inl_end_agent_dsml_open_fixed; }
-                        static const char marker[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c";   /* '<' + fullwidth bar + DSML + fullwidth bar */
+                        static const char marker[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c";
                         static const char calls_form[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c calls>", invoke_form[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c invoke";
                         const size_t ml = sizeof marker - 1, n = sr->dsml_start_len;
                         if (n < ml || n >= sizeof sr->dsml_start_tail || memcmp(sr->dsml_start_tail, marker, ml) != 0) { inl_ret_agent_dsml_open_fixed = (const char *)(NULL); goto inl_end_agent_dsml_open_fixed; }
@@ -11475,7 +11423,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 if (gfx0) {
                     size_t gtl0 = 0; char *gtt0 = ds4_token_text(w->engine, token, &gtl0); const size_t gfl0 = strlen(gfx0), gn0 = gtl0 < gfl0 ? gtl0 : gfl0;
                     const bool gdev0 = gtt0 && gn0 > 0 && memcmp(gtt0, gfx0, gn0) != 0; g_gf_checks++;
-                    if (gdev0) { g_gf_dev++; if (agent_gforce_mode() == 3) fprintf(stderr, "llms gforce LOG: fixed [%s] sampled token %d [%.*s] -> first token of the fixed text\n", gfx0, token, (int)(gtl0 > 40 ? 40 : gtl0), gtt0); }
+                    if (gdev0) { g_gf_dev++; if (agent_gforce_mode() == 3) ((void)0); }
                     free(gtt0);
                     if (gdev0 && agent_gforce_mode() != 2) {
                         ds4_tokens gft0 = {0}; ds4_tokenize_rendered_chat(w->engine, gfx0, &gft0);
@@ -11483,18 +11431,18 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                         ds4_tokens_free(&gft0);
                     }
                 }
-                if (agent_gfn_on() && agent_gforce_mode() != 2) {   /* llms GFORCE_NAME */
+                if (agent_gfn_on() && agent_gforce_mode() != 2) {
                     char gtail[256]; const size_t gtl = agent_gfn_tail(&stream, gtail, sizeof gtail);
                     if (gtl) {
-                        agent_pu_set_allow(stream.parser->raw, stream.parser->raw_len);   /* llms AGENT_PARAM_UNIQ v2 */
+                        agent_pu_set_allow(stream.parser->raw, stream.parser->raw_len);
                         size_t ntl = 0; char *ntt = ds4_token_text(w->engine, token, &ntl);
                         const char *v0; size_t vl0; int cl0;
                         const int in_name = ntt && (agent_gfn_judge(gtail, gtl, &v0, &vl0, &cl0) ? !cl0 : !!strstr(gtail, " name"));
                         if (in_name) {
                             g_gfn_checks++;
-                            { static long gcan = -2; if (gcan == -2) { const char *e = getenv("LLMS_DS4_GFORCE_NAME_CANARY"); gcan = e && *e ? atol(e) : -1; }   /* the canary: the placeholder injected at the Nth name check */
+                            { static long gcan = -2; if (gcan == -2) { const char *e = getenv("LLMS_DS4_GFORCE_NAME_CANARY"); gcan = e && *e ? atol(e) : -1; }
                               if (gcan > 0 && (long)g_gfn_checks == gcan) { const char *cx = (gtl >= 5 && !strcmp(gtail + gtl - 5, " name")) ? "=\"$" : "$"; ds4_tokens ct = {0}; ds4_tokenize_rendered_chat(w->engine, cx, &ct);
-                                  if (ct.len > 0) { fprintf(stderr, "llms gforce name CANARY: sampled token %d replaced by %d [%s] at name check %ld\n", token, ct.v[0], cx, gcan); token = ct.v[0]; free(ntt); ntl = 0; ntt = ds4_token_text(w->engine, token, &ntl); } ds4_tokens_free(&ct); } }
+                                  if (ct.len > 0) { ((void)0); token = ct.v[0]; free(ntt); ntl = 0; ntt = ds4_token_text(w->engine, token, &ntl); } ds4_tokens_free(&ct); } }
                             if (!ntt) { g_gfn_checks--; }
                             if (ntt && !agent_gfn_token_fits(gtail, gtl, ntt, ntl)) {
                                 int rep = -1;
@@ -11506,27 +11454,27 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                     if (ct && cl > 0 && agent_gfn_token_fits(gtail, gtl, ct, cl)) {
                                         char comb[320]; const char *v; size_t vl; int closed;
                                         if (gtl + cl < sizeof comb) { memcpy(comb, gtail, gtl); memcpy(comb + gtl, ct, cl);
-                                                                      if (agent_gfn_judge(comb, gtl + cl, &v, &vl, &closed)) rep = gsc[i].id; }   /* only a token that reaches the name form */
+                                                                      if (agent_gfn_judge(comb, gtl + cl, &v, &vl, &closed)) rep = gsc[i].id; }
                                     }
                                     free(ct);
                                 }
-                                if (rep < 0) {   /* fallback: the form's remainder, or the rest of the first name that matches the value so far */
+                                if (rep < 0) {
                                     char fx[64] = {0};
                                     if (agent_gfn_judge(gtail, gtl, &v0, &vl0, &cl0)) {
                                         const int kind = strstr(gtail, " invoke") ? 1 : 2;
-                                        const char *const *nm = (kind == 2 && g_pu_allow_n > 0) ? (const char *const *)g_pu_allow : kind == 1 ? g_gfn_tools : g_gfn_params; const size_t nn = (kind == 2 && g_pu_allow_n > 0) ? (size_t)g_pu_allow_n : kind == 1 ? sizeof g_gfn_tools / sizeof g_gfn_tools[0] : sizeof g_gfn_params / sizeof g_gfn_params[0];   /* llms AGENT_PARAM_UNIQ v3: the fallback completes from the unused names when the rule has a list */
+                                        const char *const *nm = (kind == 2 && g_pu_allow_n > 0) ? (const char *const *)g_pu_allow : kind == 1 ? g_gfn_tools : g_gfn_params; const size_t nn = (kind == 2 && g_pu_allow_n > 0) ? (size_t)g_pu_allow_n : kind == 1 ? sizeof g_gfn_tools / sizeof g_gfn_tools[0] : sizeof g_gfn_params / sizeof g_gfn_params[0];
                                         for (size_t i = 0; i < nn; i++) if (strlen(nm[i]) >= vl0 && !memcmp(nm[i], v0, vl0)) { snprintf(fx, sizeof fx, "%s", nm[i] + vl0); break; }
                                     } else if (gtl >= 5 && !strcmp(gtail + gtl - 5, " name")) snprintf(fx, sizeof fx, "=\"");
                                     if (fx[0]) { ds4_tokens gnt = {0}; ds4_tokenize_rendered_chat(w->engine, fx, &gnt); if (gnt.len > 0) { rep = gnt.v[0]; g_gfn_fallback++; } ds4_tokens_free(&gnt); }
                                 }
-                                if (rep >= 0) { if (getenv("LLMS_DS4_GFORCE_NAME_CANARY")) fprintf(stderr, "llms gforce name: token %d -> %d\n", token, rep); token = rep; g_gfn_fixed++; }
+                                if (rep >= 0) { if (getenv("LLMS_DS4_GFORCE_NAME_CANARY")) ((void)0); token = rep; g_gfn_fixed++; }
                             }
                         }
                         free(ntt);
                     }
                 }
             }
-            {   /* llms AGENT_PARAM_UNIQ (apply_param_uniq.py): LLMS_DS4_AGENT_PARAM_UNIQ=1 -- DSML41 legality by the tool's own schema: after a parameter closes inside an invoke whose schema parameters are ALL written, the token that opens another parameter is replaced by the one that opens the close. =canary: a schema counts as exhausted after one parameter. Off unless set. */
+            {
                 static int pu_on = -1, pu_lt = -1, pu_cl = -1; static uint64_t pu_rows, pu_full, pu_fixed, pu_dup;
                 static const char *const pu_schema[][9] = { {"bash", "command", "timeout_sec", "refresh_sec", NULL}, {"bash_status", "job", "pid", "refresh_sec", NULL}, {"bash_stop", "job", "pid", "refresh_sec", NULL},
                     {"read", "path", "start_line", "max_lines", "whole", "raw", NULL}, {"more", "count", NULL}, {"write", "path", "content", NULL}, {"edit", "path", "old", "new", NULL},
@@ -11534,15 +11482,13 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 if (pu_on < 0) { const char *e = getenv("LLMS_DS4_AGENT_PARAM_UNIQ"); pu_on = (e && *e && *e != '0') ? (!strcmp(e, "canary") ? 2 : 1) : 0;
                     if (pu_on) { ds4_tokens a_ = {0}, b_ = {0}; ds4_tokenize_rendered_chat(w->engine, "<", &a_); ds4_tokenize_rendered_chat(w->engine, "</", &b_);
                         pu_lt = a_.len == 1 ? a_.v[0] : -1; pu_cl = b_.len == 1 ? b_.v[0] : -1; ds4_tokens_free(&a_); ds4_tokens_free(&b_);
-                        fprintf(stderr, "llms: agent param uniq%s (a call whose tool's schema parameters are all written cannot open another parameter: '<' %d is replaced by '</' %d at that row)\n", pu_on == 2 ? " CANARY (exhausted after one parameter)" : "", pu_lt, pu_cl);
-                        atexit_b(^{ fprintf(stderr, "llms agent param uniq: %llu parameter boundaries, %llu with the schema exhausted, %llu opens replaced by the close, %llu duplicate names written\n",
-                                            (unsigned long long)pu_rows, (unsigned long long)pu_full, (unsigned long long)pu_fixed, (unsigned long long)pu_dup); }); } }
+                        atexit_b(^{ ((void)0); }); } }
                 if (pu_on && pu_lt >= 0 && pu_cl >= 0 && stream.parser && stream.parser->syntax == AGENT_TOOL_SYNTAX_DSML41 && stream.dsml_active && stream.parser->state == AGENT_DSML_STRUCTURAL && stream.parser->raw) {
                     static const char PC[] = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c parameter>\n", IV[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c invoke name=\"", PN[] = "<\xef\xbd\x9c" "DSML\xef\xbd\x9c parameter name=\"";
                     const char *raw = stream.parser->raw; const size_t rl = stream.parser->raw_len, pcl = sizeof PC - 1, ivl = sizeof IV - 1, pnl = sizeof PN - 1;
-                    if (rl >= pcl && !memcmp(raw + rl - pcl, PC, pcl)) {   /* a parameter has just closed: the next token opens another one or the invoke's close */
+                    if (rl >= pcl && !memcmp(raw + rl - pcl, PC, pcl)) {
                         size_t iv = (size_t)-1;
-                        for (size_t i = 0; i + ivl <= rl; i++) if (raw[i] == '<' && !memcmp(raw + i, IV, ivl)) iv = i;   /* the last invoke */
+                        for (size_t i = 0; i + ivl <= rl; i++) if (raw[i] == '<' && !memcmp(raw + i, IV, ivl)) iv = i;
                         if (iv != (size_t)-1) {
                             pu_rows++;
                             const char *tn = raw + iv + ivl; size_t tl = 0; while (iv + ivl + tl < rl && tn[tl] != '"' && tl < 40) tl++;
@@ -11564,13 +11510,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     }
                 }
             }
-            {   /* llms AGENT_EDIT_BIAS v2 (apply_edit_bias2.py; v1 apply_edit_bias.py never fired): LLMS_DS4_AGENT_EDIT_BIAS=D[:T] -- armed at the row where an invoke's ' name' takes '="', acting at the tool name's first token from tool round T (2): the edit tool's mass raised as by a logit bias of D nats */
+            {
                 static double eb_d = -1.0; static int eb_from = 2, eb_id = -1, eb_armed; static uint64_t eb_arm_n, eb_seen, eb_sw, eb_merged, eb_rng = 0x9E3779B97F4A7C15ull;
                 if (eb_d < 0.0) { const char *e = getenv("LLMS_DS4_AGENT_EDIT_BIAS"); eb_d = (e && *e) ? atof(e) : 0.0; if (!(eb_d > 0.0)) eb_d = 0.0;
                                   if (e && strchr(e, ':')) eb_from = atoi(strchr(e, ':') + 1);
                                   if (eb_d > 0.0) { ds4_tokens et_ = {0}; ds4_tokenize_rendered_chat(w->engine, "edit", &et_); eb_id = et_.len == 1 ? et_.v[0] : -1; ds4_tokens_free(&et_);
-                                                    fprintf(stderr, "llms: agent edit bias %.2f nats from tool round %d (the name token 'edit' is %d; v2: armed at the invoke name's '=\"')\n", eb_d, eb_from, eb_id);
-                                                    atexit_b(^{ fprintf(stderr, "llms agent edit bias: %llu armed, %llu name rows seen, %llu switched to edit, %llu merged '=\"x' tokens\n", (unsigned long long)eb_arm_n, (unsigned long long)eb_seen, (unsigned long long)eb_sw, (unsigned long long)eb_merged); }); } }
+                                                    atexit_b(^{ ((void)0); }); } }
                 if (eb_d > 0.0 && eb_id >= 0) {
                     if (eb_armed) {
                         eb_armed = 0;
@@ -11598,31 +11543,31 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
 
-            {   /* llms AGENT_THINK_BUDGET (apply_thinkbudget.py): LLMS_DS4_AGENT_THINK_BUDGET=N -- once a round's thinking has run N tokens, </think> replaces the sampled token */
+            {
                 static long agent_think_budget_value = -2; static uint64_t agent_think_budget_n;
                 if (agent_think_budget_value == -2) { const char *e = getenv("LLMS_DS4_AGENT_THINK_BUDGET"); agent_think_budget_value = (e && *e) ? atol(e) : -1;
-                                  if (agent_think_budget_value > 0) { fprintf(stderr, "llms: agent think budget %ld (</think> replaces the sampled token once a round's thinking has run that long)\n", agent_think_budget_value);
-                                                  atexit_b(^{ fprintf(stderr, "llms agent think budget: %llu rounds had </think> forced\n", (unsigned long long)agent_think_budget_n); }); } }
+                                  if (agent_think_budget_value > 0) { ((void)0);
+                                                  atexit_b(^{ ((void)0); }); } }
                 if (agent_think_budget_value > 0 && stream.in_think && generated >= agent_think_budget_value) { const int te = ds4_token_think_end(w->engine); if (te >= 0 && token != te) { token = te; agent_think_budget_n++; } }
-                {   /* llms AGENT_ANNOUNCE_CLOSE v2 (apply_announce_close2.py): the replacement only; the commit loop arms it */
-                    if ((agent_ac_on() || agent_vc_on() || agent_hc_on()) && stream.in_think && g_ac_armed == 2) { const int te = ds4_token_think_end(w->engine); if (te >= 0 && token != te) { token = te; g_ac_n++; fprintf(stderr, "llms agent forced close: session position %d\n", ds4_session_pos(w->session)); } g_ac_armed = 0; g_ac_len = 0; g_ac_since = 0; }
+                {
+                    if ((agent_ac_on() || agent_vc_on() || agent_hc_on()) && stream.in_think && g_ac_armed == 2) { const int te = ds4_token_think_end(w->engine); if (te >= 0 && token != te) { token = te; g_ac_n++; ((void)(ds4_session_pos(w->session))); } g_ac_armed = 0; g_ac_len = 0; g_ac_since = 0; }
                 }
-                {   /* llms THINK_ESCALATE: a round still thinking at N generated tokens decodes on exact routing for the rest of THAT round */
+                {
                     static int te_n = -1;
                     if (te_n < 0) { const char *e = getenv("LLMS_DS4_THINK_ESCALATE"); te_n = e && *e ? atoi(e) : 0;
-                                    { const char *c = e ? strchr(e, ':') : NULL; if (c && c[1] == 'b') { g_think_bonus = strtof(c + 2, NULL);   /* llms THINK_BONUS */
-                                          if (te_n > 0) fprintf(stderr, "llms: think escalate %d bonus %.2f (the decode residency bonus at %.2f, not exact routing, from the trigger to the round's end; 29 of 40 layers)\n", te_n, g_think_bonus, g_think_bonus); } }
-                                    if (te_n > 0) { fprintf(stderr, "llms: think escalate %d (a round still inside <think> at %d generated tokens decodes on exact routing until the round ends)\n", te_n, te_n);
-                                                    atexit_b(^{ fprintf(stderr, "llms think escalate: %llu rounds escalated (%llu decode cycles after the trigger)\n", (unsigned long long)g_think_esc_rounds, (unsigned long long)g_think_esc_tokens); }); } }
+                                    { const char *c = e ? strchr(e, ':') : NULL; if (c && c[1] == 'b') { g_think_bonus = strtof(c + 2, NULL);
+                                          if (te_n > 0) ((void)0); } }
+                                    if (te_n > 0) { ((void)0);
+                                                    atexit_b(^{ ((void)0); }); } }
                     if (te_n > 0 && !g_think_esc && !g_agent_escalated && stream.in_think && generated >= te_n) {
                         g_think_esc_rounds++; agent_trace(w, "think escalate generated=%d", generated);
-                        if (g_think_bonus >= 0.0f) { extern void ds4_gpu_llms_think_bonus(int, float); ds4_gpu_llms_think_bonus(1, g_think_bonus); g_think_esc = 2; }   /* llms THINK_BONUS */
+                        if (g_think_bonus >= 0.0f) { extern void ds4_gpu_llms_think_bonus(int, float); ds4_gpu_llms_think_bonus(1, g_think_bonus); g_think_esc = 2; }
                         else { ds4_session_escalate(w->session, 1); g_think_esc = 1; } }
                     if (g_think_esc) g_think_esc_tokens++; }
-                {   /* llms AGENT_CLOSE_EXACT: the N tokens after the thinking's close decode on exact routing (the CLI's CLOSE_EXACT, 11-07) */
+                {
                     if (g_cx_n < 0) { const char *e = getenv("LLMS_DS4_AGENT_CLOSE_EXACT"); g_cx_n = e && *e ? atoi(e) : 0; if (g_cx_n < 0) g_cx_n = 0;
-                                      if (g_cx_n > 0) { fprintf(stderr, "llms: agent close exact %d (after the thinking's close the next %d generated tokens decode on exact routing; the round's end returns the shipped dials)\n", g_cx_n, g_cx_n);
-                                                        atexit_b(^{ fprintf(stderr, "llms agent close exact: %llu closes escalated, %llu tokens on exact routing\n", (unsigned long long)g_cx_rounds, (unsigned long long)g_cx_tokens); }); } }
+                                      if (g_cx_n > 0) { ((void)0);
+                                                        atexit_b(^{ ((void)0); }); } }
                     if (g_cx_n > 0) {
                         if (g_cx_until >= 0 && generated >= g_cx_until) { if (!g_agent_escalated && g_think_esc != 1) ds4_session_escalate(w->session, 0); g_cx_until = -1; }
                         { const int te_ = ds4_token_think_end(w->engine);
@@ -11631,18 +11576,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     }
                 }
             }
-            int toks[65];   /* llms WIDE_LOOKUP: was 17 */
+            int toks[65];
             int ntok = 0;
             const int block_start = ds4_session_pos(w->session);
-            if (g_agent_hint_pend >= 0) {   /* llms DSML_HINT log: the previous hint was not accepted -- the token that followed is this input token */
+            if (g_agent_hint_pend >= 0) {
                 size_t l1 = 0, l2 = 0; char *t1 = ds4_token_text(w->engine, g_agent_hint_pend, &l1), *t2 = ds4_token_text(w->engine, token, &l2); for (size_t q = 0; t1 && q < l1; q++) if (t1[q] == '\n') t1[q] = '~'; for (size_t q = 0; t2 && q < l2; q++) if (t2[q] == '\n') t2[q] = '~';
-                fprintf(stderr, "llms dsml hint LOG: tail [%s] fixed [%s] hint %d [%.*s] actual %d [%.*s] %s\n", g_agent_hint_tail, g_agent_hint_fx, g_agent_hint_pend, (int)l1, t1 ? t1 : "", token, (int)l2, t2 ? t2 : "", g_agent_hint_pend == token ? "MATCH" : "MISS");
                 free(t1); free(t2); g_agent_hint_pend = -1;
             }
             int llms_hint_now = -1;
             if (greedy_sampling) { g_agent_hint_seq_n = 0; const int hint = agent_dsml_hint_token(w->engine, &stream, token); if (hint >= 0) { ds4_session_set_draft_hint(w->session, hint); llms_hint_now = hint;
-                                     if (g_agent_hint_seq_n >= 2) ds4_session_set_draft_hint_seq(w->session, g_agent_hint_seq, g_agent_hint_seq_n); } }   /* llms GRAMMAR_DEPTH */   /* llms DSML_HINT */
-            ds4_session_set_route_class(w->session, !stream.dsml_active);   /* llms UCAP_CLASS: inert unless LLMS_DS4_UCAP_CLASS is set */
+                                     if (g_agent_hint_seq_n >= 2) ds4_session_set_draft_hint_seq(w->session, g_agent_hint_seq, g_agent_hint_seq_n); } }   
+            ds4_session_set_route_class(w->session, !stream.dsml_active);
             if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
                 getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
                 ntok = ds4_session_eval_speculative(
@@ -11650,7 +11594,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     ds4_token_eos(w->engine),
                     greedy_sampling ? 0.0f : agent_eff_temp(cfg), 0,
                     greedy_sampling ? 1.0f : cfg->gen.top_p,
-                    greedy_sampling ? 0.0f : agent_eff_minp(cfg),   /* llms LB_RETRY_MINP */
+                    greedy_sampling ? 0.0f : agent_eff_minp(cfg),
                     &rng, toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
                 if (ntok < 0) {
@@ -11658,7 +11602,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     agent_set_error(w, err);
                     return 1;
                 }
-                spec_mode_valid = true; spec_mode_greedy = greedy_sampling;   /* llms DSP41_RESRAW */
+                spec_mode_valid = true; spec_mode_greedy = greedy_sampling;
             } else {
                 if (ds4_session_eval(w->session, token,
                                      err, sizeof(err)) != 0) {
@@ -11674,15 +11618,15 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 agent_set_error(w, "decode returned no tokens");
                 return 1;
             }
-            if (g_agent_hint_log && llms_hint_now >= 0) {   /* llms DSML_HINT log: accepted -> toks[1]; else the next input token tells */
+            if (g_agent_hint_log && llms_hint_now >= 0) {
                 if (ntok >= 2) { size_t l1 = 0; char *t1 = ds4_token_text(w->engine, llms_hint_now, &l1); for (size_t q = 0; t1 && q < l1; q++) if (t1[q] == '\n') t1[q] = '~';
-                                 fprintf(stderr, "llms dsml hint LOG: tail [%s] fixed [%s] hint %d [%.*s] actual %d %s\n", g_agent_hint_tail, g_agent_hint_fx, llms_hint_now, (int)l1, t1 ? t1 : "", toks[1], toks[1] == llms_hint_now ? "MATCH (accepted)" : "MISS (accepted another)"); free(t1); }
+                                 ((void)0); free(t1); }
                 else g_agent_hint_pend = llms_hint_now;
             }
 
             bool stop_block = false;
             bool restart_sampling = false;
-            bool lb_stop_now = false;   /* llms LOOPBREAK */
+            bool lb_stop_now = false;
             for (int ti = 0; ti < ntok && generated < max_tokens; ti++) {
                 token = toks[ti];
                 if (ds4_token_is_stop_for_think_mode(w->engine,
@@ -11721,19 +11665,19 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     break;
                 }
                 free(text);
-                if (ti > 0) {   /* llms GFORCE_LT on a drafted token: the draft was evaluated, so a changed token goes in by a rewind (as GFORCE repairs) */
+                if (ti > 0) {
                     const int gct = agent_gflt_canary(w->engine, &stream, token); int put = gct;
                     if (agent_gflt_on() && agent_gflt_hold(&stream)) { g_gflt_holds++; if (agent_gflt_is_slip(w->engine, gct) && agent_gflt_marker(w->engine) >= 0) { put = agent_gflt_marker(w->engine); g_gflt_rep_block++; } else g_gflt_passed++; }
                     if (put != token) {
                         if (agent_worker_rewind(w, block_start + ti, err, sizeof(err)) != 0) { agent_dsml_parser_free(&dsml); agent_set_error(w, err); return 1; }
                         if (worker_finish_generated_token(w, put, &generated, t0, &stream, true, err, sizeof(err)) != 0) { agent_dsml_parser_free(&dsml); agent_set_error(w, err); return 1; }
                         spec_mode_valid = false; restart_sampling = true; break; } }
-                if (ti > 0) {   /* llms AGENT_PARAM_UNIQ v3 (apply_param_uniq3.py): a DRAFTED token at a parameter boundary or a name row is held to the schema too, by a rewind (as GFORCE_LT does) */
+                if (ti > 0) {
                     static int pu3_on = -1, pu3_lt = -1, pu3_cl = -1; static uint64_t pu3_close, pu3_name;
                     if (pu3_on < 0) { const char *e = getenv("LLMS_DS4_AGENT_PARAM_UNIQ"); pu3_on = e && *e && *e != '0';
                         if (pu3_on) { ds4_tokens a_ = {0}, b_ = {0}; ds4_tokenize_rendered_chat(w->engine, "<", &a_); ds4_tokenize_rendered_chat(w->engine, "</", &b_);
                             pu3_lt = a_.len == 1 ? a_.v[0] : -1; pu3_cl = b_.len == 1 ? b_.v[0] : -1; ds4_tokens_free(&a_); ds4_tokens_free(&b_);
-                            atexit_b(^{ fprintf(stderr, "llms agent param uniq drafted: %llu drafted opens replaced by the close, %llu drafted name tokens replaced by an unused name\n", (unsigned long long)pu3_close, (unsigned long long)pu3_name); }); } }
+                            atexit_b(^{ ((void)0); }); } }
                     if (pu3_on && stream.parser && stream.parser->syntax == AGENT_TOOL_SYNTAX_DSML41 && stream.dsml_active && stream.parser->state == AGENT_DSML_STRUCTURAL && stream.parser->raw) {
                         static const char PC3[] = "</\xef\xbd\x9c" "DSML\xef\xbd\x9c parameter>\n";
                         const char *raw3 = stream.parser->raw; const size_t rl3 = stream.parser->raw_len; int put3 = -1;
@@ -11757,12 +11701,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                             spec_mode_valid = false; restart_sampling = true; break; }
                     }
                 }
-                if (agent_gforce_mode() && ti > 0) {   /* llms GFORCE: a token off the grammar's fixed text -> rewind to it and feed the fixed text (tokens 1.. of a block; the first token was checked before it was evaluated) */
+                if (agent_gforce_mode() && ti > 0) {
                     const char *gfx = agent_dsml_fixed_now(&stream);
                     if (gfx) {
                         size_t gtl = 0; char *gtt = ds4_token_text(w->engine, token, &gtl); const size_t gfl = strlen(gfx), gn = gtl < gfl ? gtl : gfl;
                         const bool gdev = gtt && gn > 0 && memcmp(gtt, gfx, gn) != 0; g_gf_checks++;
-                        if (gdev) { g_gf_dev++; if (agent_gforce_mode() == 3) fprintf(stderr, "llms gforce LOG: fixed [%s] token %d [%.*s] -> %s\n", gfx, token, (int)(gtl > 40 ? 40 : gtl), gtt, "repair"); }
+                        if (gdev) { g_gf_dev++; if (agent_gforce_mode() == 3) ((void)0); }
                         free(gtt);
                         if (gdev && agent_gforce_mode() != 2) {
                             ds4_tokens gft = {0}; ds4_tokenize_rendered_chat(w->engine, gfx, &gft);
@@ -11785,18 +11729,18 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
 
                 { extern void ds4_session_dry_feed(int, int); ds4_session_dry_feed(token, stream.in_think ? 1 : 0); }
-                agent_ac_feed(w, token, stream.in_think);   /* llms AGENT_ANNOUNCE_CLOSE v2: every committed token arms the close */
+                agent_ac_feed(w, token, stream.in_think);
                 agent_vc_feed(w, token, stream.in_think); agent_en_feed(w, token); agent_hc_feed(w, token, stream.in_think); g_rs_tok++;
-                if (agent_rs_tok_n() > 0 && __atomic_load_n(&g_rs_state_mirror, __ATOMIC_SEQ_CST) == 1 && !__atomic_load_n(&g_rs_tok_hit, __ATOMIC_SEQ_CST) && g_rs_tok >= agent_rs_tok_n()) {   /* llms AGENT_RESTART_TOK v3 */
-                    __atomic_store_n(&g_rs_tok_hit, 1, __ATOMIC_SEQ_CST); worker_interrupt(w); }   /* llms EDIT_NUDGE_HYP: the stated-fix matcher */   /* llms AGENT_VALUE_CLOSE: the value reads every committed token; a fire arms the same close */   /* llms AGENT_DRY (apply_agent_dry.py): the engine's DRY history, fed from the agent */
-                if (agent_loopbreak_mode() > 0 && !lb_fired && lb_feed(token)) {   /* llms LOOPBREAK */
-                    lb_fired = true; lb_stops++; if (agent_loopbreak_mode() == 1 || agent_loopbreak_mode() == 4) llms_lb_attempt++;   /* llms LB_RESTART: a real stop, not a shadow */
+                if (agent_rs_tok_n() > 0 && __atomic_load_n(&g_rs_state_mirror, __ATOMIC_SEQ_CST) == 1 && !__atomic_load_n(&g_rs_tok_hit, __ATOMIC_SEQ_CST) && g_rs_tok >= agent_rs_tok_n()) {
+                    __atomic_store_n(&g_rs_tok_hit, 1, __ATOMIC_SEQ_CST); worker_interrupt(w); }      
+                if (agent_loopbreak_mode() > 0 && !lb_fired && lb_feed(token)) {
+                    lb_fired = true; lb_stops++; if (agent_loopbreak_mode() == 1 || agent_loopbreak_mode() == 4) llms_lb_attempt++;
                     fprintf(stderr, "ds4-agent: loopbreak -- %s: >= %u%% of the last %d 8-grams were already generated in this round (%d tokens in)\n", agent_loopbreak_mode() == 1 ? "the round is stopped" : agent_loopbreak_mode() == 4 ? "the round is stopped and regenerated" : "shadow, nothing changed", (unsigned)(lb_threshold * 100u / LB_WIN), LB_WIN, generated);
                     agent_trace(w, "loopbreak %s generated=%d", agent_loopbreak_mode() == 1 ? "stop" : agent_loopbreak_mode() == 4 ? "retry" : "shadow", generated);
                     if (agent_loopbreak_mode() == 1 || agent_loopbreak_mode() == 4) lb_stop_now = true;
                 }
-                {   /* llms ESCALATE_ROUND (apply_escalate_round.py): a round past N tokens is a derail signature too */
-                    static int cap = -1; if (cap < 0) { const char *e = getenv("LLMS_DS4_ESCALATE_ROUND"); cap = e && *e ? atoi(e) : 0; if (cap > 0) fprintf(stderr, "llms: escalate round cap %d (a round past it escalates and is regenerated)\n", cap); }
+                {
+                    static int cap = -1; if (cap < 0) { const char *e = getenv("LLMS_DS4_ESCALATE_ROUND"); cap = e && *e ? atoi(e) : 0; if (cap > 0) ((void)0); }
                     if (cap > 0 && agent_escalate_on() && !g_agent_escalated && !lb_fired && generated > cap) {
                         lb_fired = true; lb_stop_now = true;
                         fprintf(stderr, "ds4-agent: escalate round cap -- %d tokens in one round\n", generated);
@@ -11818,7 +11762,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                            stream.dsml_in_think) {
                     malformed_tool = true;
                     stop_block = true;
-                } else if (lb_stop_now) {   /* llms LOOPBREAK */
+                } else if (lb_stop_now) {
                     model_stopped = true;
                     stop_block = true;
                 }
@@ -11838,17 +11782,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     const int fk = ({
                         static int m = -1;
                         if (m < 0) { const char *e = getenv("LLMS_DS4_AGENT_FLIPKEEP"); m = !e || !*e || *e == '0' ? 0 : !strcmp(e, "shadow") ? 2 : 1;
-                                     if (m) { fprintf(stderr, "llms: agent flipkeep %s (the accepted draft kept across a sampling-mode flip when the new mode draws it)\n", m == 2 ? "SHADOW" : "on"); atexit(llms_flipkeep_report); } }
+                                     if (m) { ((void)0); atexit(llms_flipkeep_report); } }
                         (int)(m);
-                    });   /* llms FLIPKEEP: 0 off, 1 keep, 2 shadow */
+                    });
                     if (fk && ti == 0 && ntok == 2) {
                         const uint64_t rs = rng; g_fk_flips++;
                         const int x = ds4_session_dsp41_sample_row(w->session, block_start, 0, next_greedy ? 0.0f : agent_eff_temp(cfg), 0,
-                                                                   next_greedy ? 1.0f : cfg->gen.top_p, next_greedy ? 0.0f : agent_eff_minp(cfg), &rng);   /* llms LB_RETRY_MINP */
+                                                                   next_greedy ? 1.0f : cfg->gen.top_p, next_greedy ? 0.0f : agent_eff_minp(cfg), &rng);
                         if (x < 0) { rng = rs; g_fk_invalid++; }
                         else if (fk == 2) { rng = rs; fk_shadow_x = x; }
-                        else if (x == toks[1]) { g_fk_kept++; greedy_sampling = next_greedy; continue; }   /* the draft IS the new-mode draw: keep the block */
-                        else { rng = rs; g_fk_redraw++; }   /* the shipped path redraws the same x from the same logits */
+                        else if (x == toks[1]) { g_fk_kept++; greedy_sampling = next_greedy; continue; }
+                        else { rng = rs; g_fk_redraw++; }
                     }
                     /* Later tokens were proposed under the old parser mode.
                      * Re-evaluate this boundary token to restore its logits,
@@ -11880,8 +11824,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             }
         }
 
-        if (g_cx_until >= 0) { if (!g_agent_escalated && g_think_esc != 1) ds4_session_escalate(w->session, 0); g_cx_until = -1; }   /* llms AGENT_CLOSE_EXACT: the round ends -- the shipped dials return */
-        if (g_think_esc) { think_esc_off(w->session); agent_trace(w, "think escalate end generated=%d", generated); }   /* llms THINK_ESCALATE: the CHAT round ends (worker_run_turn) -- the shipped dials return */
+        if (g_cx_until >= 0) { if (!g_agent_escalated && g_think_esc != 1) ds4_session_escalate(w->session, 0); g_cx_until = -1; }
+        if (g_think_esc) { think_esc_off(w->session); agent_trace(w, "think escalate end generated=%d", generated); }
         agent_trace(w, "generation finished tool_round=%d generated=%d carried=%d context_limited=%d",
                     tool_round, generated, carried_generation, context_limited);
         if (!lb_fired && ({
@@ -11891,20 +11835,19 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                           static const char selftest_invented_syntax_2[] = "<think>x</think>\n\n<\xef\xbd\x9c" "DSML\xef\xbd\x9c calls>\n<\xef\xbd\x9c" "DSML\xef\xbd\x9c invoke name=\"bash\">";
                           static const char selftest_plain_answer[] = "<think>done</think>\n\nThe fix: `if a < b:` in intervals.py; tests pass.\n";
                           const int ok = agent_invented_tool_syntax(selftest_invented_syntax_1, sizeof selftest_invented_syntax_1 - 1) == 1 && agent_invented_tool_syntax(selftest_invented_syntax_2, sizeof selftest_invented_syntax_2 - 1) == 0 && agent_invented_tool_syntax(selftest_plain_answer, sizeof selftest_plain_answer - 1) == 0;
-                          fprintf(stderr, "llms syntax retry: self-test %d / 3%s\n", ok ? 3 : 0, ok ? "" : " -- OFF"); if (!ok) on = 0;
-                          else atexit_b(^{ fprintf(stderr, "llms syntax retry: %llu rounds regenerated\n", (unsigned long long)g_syntax_retries); });   /* llms SYNTAX_RETRY2 ELSE FIX */
-                          if (on && agent_syntax_retry_mode() >= 2) {   /* llms SYNTAX_RETRY2: the widened detector's own canaries */
+                          ((void)0); if (!ok) on = 0;
+                          else atexit_b(^{ ((void)0); });
+                          if (on && agent_syntax_retry_mode() >= 2) {
                               static const char selftest_bare_tag_example[] = "<think>no tool result yet</think>\n\nI'll search the test file for function names.\n\n<search>\nquery=def test\npath=test_iniparse.py\ncontext=2\n</search>\n\nLet me see.";
                               static const char selftest_prose_mention_example[] = "<think>the syntax</think>\n\nThe proper syntax likely uses `<|DSML|";
                               static const char selftest_html_example[] = "<think>x</think>\n\nThe listing below shows it; read more in the README.\n<p>ok</p>\n";
                               const int k2 = (agent_invented_tool_syntax(selftest_bare_tag_example, sizeof selftest_bare_tag_example - 1) == 1) + (agent_invented_tool_syntax(selftest_prose_mention_example, sizeof selftest_prose_mention_example - 1) == 1) +
                                              (agent_invented_tool_syntax(selftest_invented_syntax_2, sizeof selftest_invented_syntax_2 - 1) == 0) + (agent_invented_tool_syntax(selftest_html_example, sizeof selftest_html_example - 1) == 0);
-                              fprintf(stderr, "llms syntax retry2: self-test %d / 4%s\n", k2, k2 == 4 ? "" : " -- THE WIDENED DETECTOR IS WRONG");
                           }
                       } }
             (int)(on);
         }) && agent_loopbreak_mode() == 4 && lb_retries < 2 && !worker_should_interrupt(w) && !got_tool &&
-            !(dsml.state == AGENT_DSML_DONE && dsml.calls.len > 0) && !stream.dsml_active && stream.dsml_start_len == 0 && w->transcript.len > assistant_start) {   /* llms SYNTAX_RETRY */
+            !(dsml.state == AGENT_DSML_DONE && dsml.calls.len > 0) && !stream.dsml_active && stream.dsml_start_len == 0 && w->transcript.len > assistant_start) {
             size_t cap = 16384, len = 0; char *txt = malloc(cap);
             const int t_from = w->transcript.len - assistant_start > 4096 ? w->transcript.len - 4096 : assistant_start;
             for (int ti = t_from; txt && ti < w->transcript.len; ti++) {
@@ -11916,18 +11859,18 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                                                 fprintf(stderr, "ds4-agent: syntax retry -- the message carried tool markup but no DSML call\n"); }
             free(txt);
         }
-        if (!lb_fired && agent_loopbreak_mode() == 4 && lb_retries == 0 && agent_lbforce_n() > 0 && g_lbf_n < (uint64_t)agent_lbforce_n() && !worker_should_interrupt(w)) {   /* llms LB_FORCE: a forced retry (TEST) */
+        if (!lb_fired && agent_loopbreak_mode() == 4 && lb_retries == 0 && agent_lbforce_n() > 0 && g_lbf_n < (uint64_t)agent_lbforce_n() && !worker_should_interrupt(w)) {
             lb_fired = true; g_lbf_n++; agent_trace(w, "lb force retry %llu", (unsigned long long)g_lbf_n); }
-        if (lb_fired && agent_escalate_on() && !g_agent_escalated) { g_agent_escalated = 1; g_agent_esc_lb++; ds4_session_escalate(w->session, 1); agent_trace(w, "escalate: exact decode routing for the rest of the task (loop-break / syntax retry)"); }   /* llms ESCALATE */
-        if (lb_fired && agent_loopbreak_mode() == 4 && lb_retries < 2 && !worker_should_interrupt(w)) {   /* llms LOOPBREAK retry: drop this message and regenerate it */
+        if (lb_fired && agent_escalate_on() && !g_agent_escalated) { g_agent_escalated = 1; g_agent_esc_lb++; ds4_session_escalate(w->session, 1); agent_trace(w, "escalate: exact decode routing for the rest of the task (loop-break / syntax retry)"); }
+        if (lb_fired && agent_loopbreak_mode() == 4 && lb_retries < 2 && !worker_should_interrupt(w)) {
             lb_retries++;
-            if (cfg->gen.temperature < 0.3f && agent_lbrt_value() >= 0.0f) g_lb_retry_temp = agent_lbrt_value();   /* llms LB_RETRY_TEMP: a deterministic round must be redrawn */
-            if (agent_lbm_value() >= 0.0f) { g_lb_retry_minp = agent_lbm_value(); g_lbm_rounds++; }   /* llms LB_RETRY_MINP */
+            if (cfg->gen.temperature < 0.3f && agent_lbrt_value() >= 0.0f) g_lb_retry_temp = agent_lbrt_value();
+            if (agent_lbm_value() >= 0.0f) { g_lb_retry_minp = agent_lbm_value(); g_lbm_rounds++; }
             fprintf(stderr, "ds4-agent: loopbreak -- regenerating the assistant message (retry %d of 2)\n", lb_retries);
             agent_trace(w, "loopbreak regenerate retry=%d", lb_retries);
             agent_stream_text(&stream, NULL, 0, true); renderer_finish(&renderer); worker_set_greedy_sampling(w, false); agent_dsml_parser_free(&dsml);
             w->transcript.len = assistant_start;
-            { int restored = 0;   /* llms LB_SNAP: restore the round's start instead of invalidating (a failed restore falls back) */
+            { int restored = 0;
               if (agent_lbsnap_on() && g_lbs_pos > 0) { char le[160] = {0}; const double t0 = now_sec();
                   if (ds4_session_load_snapshot(w->session, &g_lbs_snap, le, sizeof le) == 0 && ds4_session_pos(w->session) == g_lbs_pos) {
                       restored = 1; g_lbs_loads++; ds4_token_score ts1[1];
@@ -11939,7 +11882,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
               if (!restored) ds4_session_invalidate(w->session); }
             continue;
         }
-        if (!lb_fired) { lb_retries = 0; g_lb_retry_temp = -1.0f; g_lb_retry_minp = -1.0f; }   /* llms LB_RETRY_TEMP; llms LB_RETRY_MINP */
+        if (!lb_fired) { lb_retries = 0; g_lb_retry_temp = -1.0f; g_lb_retry_minp = -1.0f; }
         bool interrupted = worker_should_interrupt(w);
         const bool partial_tool = stream.dsml_active || stream.dsml_start_len > 0 ||
                                   dsml.state != AGENT_DSML_SEARCH;
@@ -12012,12 +11955,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                      "incomplete DSML tool call");
         }
 
-        if (got_tool && !malformed_tool && !early_tool_error && dsml.state == AGENT_DSML_DONE) llms_canon_calls(w, assistant_start, &dsml.calls);   /* llms AGENT_CANON_CALLS */
+        if (got_tool && !malformed_tool && !early_tool_error && dsml.state == AGENT_DSML_DONE) llms_canon_calls(w, assistant_start, &dsml.calls);
         agent_worker_append_assistant_turn_end(w);
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
-            /* llms AGENT_FINAL_TRACE: observation only; no generated token is changed. */
             { static int final_trace = -1;
               if (final_trace < 0) { const char *e = getenv("LLMS_DS4_AGENT_FINAL_TRACE");
                   final_trace = e && *e && *e != '0'; }
@@ -12109,7 +12051,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             goto observation_error;
         agent_tool_observation_free(&observation);
         agent_dsml_parser_free(&dsml);
-        if (g_h1_done) { fprintf(stderr, "llms: agent H1 -- the harness test run exited 0 after the edit: the session ends here\n"); agent_trace(w, "llms H1: the harness test run exited 0 after the edit; the session ends here"); g_h1_done = 0; g_h1_cmd[0] = 0; agent_set_status(w, AGENT_WORKER_IDLE); return 0; }   /* llms H1; llms H1 RESET (apply_h1_reset.py): both statics cleared, or the next prompt in this process ends at its round 0 */
+        if (g_h1_done) { ((void)0); agent_trace(w, "llms H1: the harness test run exited 0 after the edit; the session ends here"); g_h1_done = 0; g_h1_cmd[0] = 0; agent_set_status(w, AGENT_WORKER_IDLE); return 0; }
         carried_generation = 0;
 
         char *queued_user = worker_request_queued_user_drain(w);
@@ -12208,7 +12150,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
                                        &rng);
         if (ds4_token_is_stop(w->engine, token)) break;
 
-        int toks[65];   /* llms WIDE_LOOKUP: was 17 */
+        int toks[65];
         int ntok = 0;
         const int block_start = ds4_session_pos(w->session);
         if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
@@ -12447,17 +12389,16 @@ static void worker_run_deferred_compact(agent_worker *w) {
 
 /* Worker thread entry point.  The UI thread submits plain user text; this
  * thread owns all DS4 session mutation, tool execution, and compaction. */
-/* llms COMPACT_GUARD: LLMS_DS4_AGENT_COMPACT_TEST=<list of case files>: each case's transcript prefilled once, each arm of _TEST_ARMS from a snapshot; the process exits (never returns) when the switch is set */
 static void llms_compact_test(agent_worker *w) {
     const char *list = getenv("LLMS_DS4_AGENT_COMPACT_TEST"); if (!list || !*list) return;
     const char *arms = getenv("LLMS_DS4_AGENT_COMPACT_TEST_ARMS"); if (!arms || !*arms) arms = "S";
     { const char *o = getenv("LLMS_DS4_AGENT_COMPACT_TEST_OUT"); if (o && *o) cg_test_out = o; }
     cg_init(); cg_test = 1;
-    FILE *lf = fopen(list, "r"); if (!lf) { fprintf(stderr, "llms compact test: cannot open %s\n", list); exit(2); }
+    FILE *lf = fopen(list, "r"); if (!lf) { ((void)0); exit(2); }
     static char line[PATH_MAX], reason[256];
     while (fgets(line, sizeof line, lf)) {
         line[strcspn(line, "\r\n")] = 0; if (!line[0]) continue;
-        FILE *f = fopen(line, "r"); if (!f) { fprintf(stderr, "llms compact test: cannot open case %s\n", line); continue; }
+        FILE *f = fopen(line, "r"); if (!f) { ((void)0); continue; }
         if (!fgets(reason, sizeof reason, f)) { fclose(f); continue; }
         reason[strcspn(reason, "\r\n")] = 0;
         ds4_tokens T = {0}; int id; while (fscanf(f, "%d", &id) == 1) ds4_tokens_push(&T, id);
@@ -12466,27 +12407,27 @@ static void llms_compact_test(agent_worker *w) {
         ds4_tokens_free(&w->transcript); w->transcript = T;
         char err[256] = {0}; const double t0 = now_sec();
         const int rc = ds4_session_sync(w->session, &w->transcript, err, sizeof err);
-        fprintf(stderr, "llms compact test: case %s tokens %d prefill %.1f s rc %d %s\n", base, T.len, now_sec() - t0, rc, err); fflush(stderr);
+        ((void)(base), (void)(T.len), (void)(now_sec() - t0), (void)(rc), (void)(err)); fflush(stderr);
         if (rc != 0) { ds4_session_invalidate(w->session); continue; }
         ds4_session_snapshot snap = {0};
-        if (ds4_session_save_snapshot(w->session, &snap, err, sizeof err) != 0) { fprintf(stderr, "llms compact test: snapshot failed: %s\n", err); continue; }
+        if (ds4_session_save_snapshot(w->session, &snap, err, sizeof err) != 0) { ((void)0); continue; }
         for (const char *a = arms; *a; a++) {
-            if (ds4_session_load_snapshot(w->session, &snap, err, sizeof err) != 0) { fprintf(stderr, "llms compact test: restore failed: %s\n", err); break; }
+            if (ds4_session_load_snapshot(w->session, &snap, err, sizeof err) != 0) { ((void)0); break; }
             cg_test_arm = *a; cg_test_exact = *a == 'X' ? 2 : *a == 'C' ? 1 : 0;
             char e2[160] = {0};
-            if (!agent_worker_compact_transcript(w, reason, NULL, e2, sizeof e2)) { fprintf(stderr, "llms compact test: case %s arm %c tokens %u stop %s summary failed: %s\n", base, *a, cg_n, cg_stop == 1 ? "eos" : cg_stop == 2 ? "dsml" : "cap", e2); fflush(stderr); }
+            if (!agent_worker_compact_transcript(w, reason, NULL, e2, sizeof e2)) { ((void)0); fflush(stderr); }
         }
         ds4_session_snapshot_free(&snap);
     }
     fclose(lf);
-    fprintf(stderr, "llms compact test: done\n"); fflush(stderr);
+    ((void)0); fflush(stderr);
     exit(0);
 }
 
 static void *worker_main(void *arg) {
     agent_worker *w = arg;
 
-    {   /* llms WORKER_RT (10-29 03:1x): the session thread's scheduling. LATCRIT's time-constraint policy lands on the thread that opens the engine (the agent's MAIN thread), while every decode and prefill call runs here, on a default-QoS pthread -- the prefill route policy measured here at efficiency-core speed (~1.0-1.5 us a 384-score scan against 0.31 on a performance core, policy_bench.c). 1 = QOS_CLASS_USER_INTERACTIVE; 2 = + LATCRIT's time-constraint policy (5 ms of computation in 20 ms, preemptible). Off unless LLMS_DS4_WORKER_RT is set. */
+    {
         const char *e = getenv("LLMS_DS4_WORKER_RT"); const int m = e && *e && *e != '0' ? atoi(e) : 0;
 #ifdef __APPLE__
         if (m >= 1) {
@@ -12497,7 +12438,6 @@ static void *worker_main(void *arg) {
                 thread_time_constraint_policy_data_t pol = { .period = 0, .computation = (uint32_t)(5.0 * per_ms), .constraint = (uint32_t)(20.0 * per_ms), .preemptible = 1 };
                 kr = (int)thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
             }
-            fprintf(stderr, "llms: worker rt %d (the session thread: QoS user-interactive rc %d%s, time-constraint kr %d)\n", m, qr, m >= 2 ? "" : " (no time-constraint)", kr);
         }
 #else
         (void)m;
@@ -12520,7 +12460,7 @@ static void *worker_main(void *arg) {
         agent_trace(w, "raw one-shot prompt mode: skipping agent system prompt");
     else
         agent_trace_tokens(w, "initial_system_prompt", &w->transcript, 0);
-    llms_compact_test(w);   /* llms COMPACT_GUARD: exits when its switch is set */
+    llms_compact_test(w);
     pthread_mutex_lock(&w->mu);
     w->initialized = true;
     agent_wake_locked(w);
@@ -12651,7 +12591,7 @@ static int worker_status_power_locked(agent_worker *w) {
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
-    pthread_cond_broadcast(&w->bash_cv);   /* llms BASH_KQ: a bash wait ends on an interrupt */
+    pthread_cond_broadcast(&w->bash_cv);
     if (w->cfg &&
         w->cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
         (w->status.state == AGENT_WORKER_PREFILL ||
@@ -12671,7 +12611,7 @@ static void worker_stop(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->stop = true;
     pthread_cond_signal(&w->cond);
-    pthread_cond_broadcast(&w->bash_cv);   /* llms BASH_KQ */
+    pthread_cond_broadcast(&w->bash_cv);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -14045,7 +13985,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     w->wake_fd[1] = -1;
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cond, NULL);
-    pthread_cond_init(&w->bash_cv, NULL);   /* llms BASH_KQ */
+    pthread_cond_init(&w->bash_cv, NULL);
     w->status.state = AGENT_WORKER_IDLE;
     if (pipe(w->wake_fd) != 0) return -1;
     int old_flags;
@@ -14072,7 +14012,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
-    w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, llms_sysprompt_exact() ? "sysprompt.exact.kv" : "sysprompt.kv");   /* llms SYSPROMPT_EXACT */
+    w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, llms_sysprompt_exact() ? "sysprompt.exact.kv" : "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
@@ -14080,14 +14020,14 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
                     cfg->gen.trace_path, strerror(errno));
             return -1;
         }
-        { const char *gd = getenv("LLMS_DS4_GUARDS"); if (gd && *gd && *gd != '0') {   /* llms GUARDS */
+        { const char *gd = getenv("LLMS_DS4_GUARDS"); if (gd && *gd && *gd != '0') {
               agent_trace_time(w->trace);
               fputs(" llms trace format: every per-token line has one shape -- the lines right after a batch header (its label, start, len) are that batch's PROMPT tokens (len - start of them); the lines between a round's prefill-sync-done and its generation-finished are GENERATED tokens\n", w->trace); fflush(w->trace); } }
     }
-    {   /* llms WORKER_STACK_MB (apply_worker_stack.py; off unless set): the worker thread's stack in MiB -- unset keeps NULL attributes (the 512-KB default), which a prefill call through run_pipeline_layers overflows */
+    {
         const char *ws = getenv("LLMS_DS4_WORKER_STACK_MB"); const long mb = ws && *ws ? atol(ws) : 0;
         pthread_attr_t wat; const int use = mb > 0 && pthread_attr_init(&wat) == 0 && pthread_attr_setstacksize(&wat, (size_t)mb << 20) == 0;
-        if (use) fprintf(stderr, "llms: worker stack %ld MiB\n", mb);
+        if (use) ((void)0);
         const int prc = pthread_create(&w->thread, use ? &wat : NULL, worker_main, w);
         if (use) pthread_attr_destroy(&wat);
         if (prc != 0) return -1;
@@ -14266,57 +14206,56 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
  * stdin protocol: announce readiness on stderr, collect bytes until stdin has
  * been quiet for 200 ms, submit that buffer as one prompt, and keep reading so
  * later input can be queued while the model is still working. */
-/* llms AGENT_RESTART6 (apply_agent_restart6.py): the restart as ONE module -- every prompt of the non-interactive loop enters through llms_rs_submit */
-static struct { double tau, t0; char *prompt; int state; unsigned fired; int inited; int note, noedit; } llms_rs;   /* 11-02: note / noedit, apply_restart_fix.py */   /* state: 0 idle, 1 armed, 2 interrupting */
+static struct { double tau, t0; char *prompt; int state; unsigned fired; int inited; int note, noedit; } llms_rs;   
 static void llms_rs_init(void) {
     if (llms_rs.inited) return; llms_rs.inited = 1;
     const char *e = getenv("LLMS_DS4_AGENT_RESTART_S"); llms_rs.tau = e && *e ? atof(e) : 0.0;
-    const char *fi = getenv("LLMS_DS4_FORCE_IDS"), *tr = getenv("LLMS_DS4_TOOL_REPLAY");   /* a forced replay has nothing to rescue */
-    if (llms_rs.tau > 0.0 && ((fi && *fi) || (tr && *tr))) { fprintf(stderr, "llms: agent restart DISARMED (forced replay: FORCE_IDS / TOOL_REPLAY set)\n"); llms_rs.tau = 0.0; }
-    if (llms_rs.tau > 0.0) fprintf(stderr, "llms: agent restart %.0f s (a prompt still running then is interrupted, the conversation reset, the same prompt resubmitted once on a salted seed)\n", llms_rs.tau);
+    const char *fi = getenv("LLMS_DS4_FORCE_IDS"), *tr = getenv("LLMS_DS4_TOOL_REPLAY");
+    if (llms_rs.tau > 0.0 && ((fi && *fi) || (tr && *tr))) { ((void)0); llms_rs.tau = 0.0; }
+    if (llms_rs.tau > 0.0) ((void)0);
 
 
 
-    { const char *n = getenv("LLMS_DS4_AGENT_RESTART_NOTE"), *d = getenv("LLMS_DS4_AGENT_RESTART_NOEDIT"); llms_rs.note = n && *n && *n != '0'; llms_rs.noedit = d && *d && *d != '0';   /* llms RESTART_NOTE / NOEDIT */
-      if (llms_rs.tau > 0.0 && (llms_rs.note || llms_rs.noedit)) fprintf(stderr, "llms: agent restart fix --%s%s\n", llms_rs.note ? " NOTE (the resubmitted prompt says files may have changed)" : "", llms_rs.noedit ? " NOEDIT (disarmed once the attempt edits a file)" : ""); }
+    { const char *n = getenv("LLMS_DS4_AGENT_RESTART_NOTE"), *d = getenv("LLMS_DS4_AGENT_RESTART_NOEDIT"); llms_rs.note = n && *n && *n != '0'; llms_rs.noedit = d && *d && *d != '0';
+      if (llms_rs.tau > 0.0 && (llms_rs.note || llms_rs.noedit)) ((void)0); }
 }
-static bool llms_rs_submit(agent_worker *w, const char *prompt) {   /* THE entry of a prompt: submit, and on success arm the restart for it */
-    g_rs_tok = 0; __atomic_store_n(&g_rs_tok_hit, 0, __ATOMIC_SEQ_CST); __atomic_store_n(&g_rs_state_mirror, llms_rs.tau > 0.0 ? 1 : 0, __ATOMIC_SEQ_CST);   /* RESTART_TOK v3: reset and arm BEFORE the worker wakes */
+static bool llms_rs_submit(agent_worker *w, const char *prompt) {
+    g_rs_tok = 0; __atomic_store_n(&g_rs_tok_hit, 0, __ATOMIC_SEQ_CST); __atomic_store_n(&g_rs_state_mirror, llms_rs.tau > 0.0 ? 1 : 0, __ATOMIC_SEQ_CST);
     if (!worker_submit(w, prompt)) { __atomic_store_n(&g_rs_state_mirror, 0, __ATOMIC_SEQ_CST); return false; }
     if (llms_rs.tau > 0.0) { free(llms_rs.prompt); llms_rs.prompt = xstrdup(prompt); llms_rs.t0 = now_sec(); llms_rs.state = 1; llms_restart_salt = 0; llms_rs_edited = 0; }
-    llms_lb_attempt = 0; g_vc_attempt++; g_en_t0 = now_sec(); g_en_fired = 0; g_en_edited = 0; g_en_tok = 0; g_en_hyp_tok = -1; g_en_wl = 0; g_en_win[0] = 0; if (agent_en_on() || agent_en_hyp_on() || agent_rnc_on()) agent_en_snapshot();   /* llms AGENT_EDIT_NUDGE: a new attempt */   /* llms AGENT_VALUE_CLOSE: a new attempt */   /* llms LB_RESTART */
+    llms_lb_attempt = 0; g_vc_attempt++; g_en_t0 = now_sec(); g_en_fired = 0; g_en_edited = 0; g_en_tok = 0; g_en_hyp_tok = -1; g_en_wl = 0; g_en_win[0] = 0; if (agent_en_on() || agent_en_hyp_on() || agent_rnc_on()) agent_en_snapshot();      
     return true;
 }
-static bool llms_rs_tick(agent_worker *w, bool idle, size_t queued) {   /* returns true when it resubmitted (the worker is busy again) */
-    {   /* llms LB_RESTART: the N-th loopbreak of an attempt interrupts it for ONE fresh, salted attempt (the same reset / resubmit as the time restart below) */
-        static int lbn = -1, lbdone = 0; if (lbn < 0) { const char *e = getenv("LLMS_DS4_AGENT_LB_RESTART"); lbn = e && *e ? atoi(e) : 0; if (lbn > 0) fprintf(stderr, "llms: agent loopbreak restart at the %d-th loopbreak of an attempt (once a session; needs AGENT_RESTART_S's prompt copy)\n", lbn); }
+static bool llms_rs_tick(agent_worker *w, bool idle, size_t queued) {
+    {
+        static int lbn = -1, lbdone = 0; if (lbn < 0) { const char *e = getenv("LLMS_DS4_AGENT_LB_RESTART"); lbn = e && *e ? atoi(e) : 0; if (lbn > 0) ((void)0); }
         if (lbn > 0 && !lbdone && llms_rs.prompt && llms_rs.state != 2 && !idle && llms_lb_attempt >= lbn) {
-            lbdone = 1; fprintf(stderr, "llms agent loopbreak restart: %d loopbreaks in this attempt -- interrupting for a fresh attempt\n", llms_lb_attempt); worker_interrupt(w); llms_rs.state = 2; }
+            lbdone = 1; ((void)0); worker_interrupt(w); llms_rs.state = 2; }
     }
-    if (llms_rs.state == 1 && llms_rs.noedit && llms_rs_edited) { llms_rs.state = 0; fprintf(stderr, "llms agent restart: disarmed -- the attempt edited a file (NOEDIT)\n"); }   /* llms RESTART_NOEDIT */
-    if (llms_rs.state == 1 && !idle && g_vc_restart_req) {   /* llms VALUE_ACTION=restart: the value's fire interrupts for a fresh attempt now */
-        g_vc_restart_req = 0; fprintf(stderr, "llms agent restart: the value fired %.1f s into the prompt -- interrupting for a fresh attempt\n", now_sec() - llms_rs.t0); worker_interrupt(w); llms_rs.state = 2; }
-    if (llms_rs.state != 1) g_vc_restart_req = 0;   /* a request outside an armed attempt is dropped */
-    __atomic_store_n(&g_rs_state_mirror, llms_rs.state, __ATOMIC_SEQ_CST);   /* RESTART_TOK v3: the count and latch are reset in llms_rs_submit, before the worker starts */
-    if (agent_rs_tok_n() > 0) {   /* v2: token mode reads the worker's latch; the worker already interrupted itself at the exact token */
-        if (llms_rs.state == 1 && __atomic_load_n(&g_rs_tok_hit, __ATOMIC_SEQ_CST)) { g_rs_tok_fires++; fprintf(stderr, "llms agent restart tok: the worker cut the attempt at committed token %ld\n", g_rs_tok);
-            fprintf(stderr, "llms agent restart: %.1f s into the prompt -- interrupting for a fresh attempt\n", now_sec() - llms_rs.t0); llms_rs.state = 2; __atomic_store_n(&g_rs_state_mirror, 2, __ATOMIC_SEQ_CST); }
+    if (llms_rs.state == 1 && llms_rs.noedit && llms_rs_edited) { llms_rs.state = 0; ((void)0); }
+    if (llms_rs.state == 1 && !idle && g_vc_restart_req) {
+        g_vc_restart_req = 0; ((void)(now_sec() - llms_rs.t0)); worker_interrupt(w); llms_rs.state = 2; }
+    if (llms_rs.state != 1) g_vc_restart_req = 0;
+    __atomic_store_n(&g_rs_state_mirror, llms_rs.state, __ATOMIC_SEQ_CST);
+    if (agent_rs_tok_n() > 0) {
+        if (llms_rs.state == 1 && __atomic_load_n(&g_rs_tok_hit, __ATOMIC_SEQ_CST)) { g_rs_tok_fires++; ((void)0);
+            ((void)(now_sec() - llms_rs.t0)); llms_rs.state = 2; __atomic_store_n(&g_rs_state_mirror, 2, __ATOMIC_SEQ_CST); }
     } else if (llms_rs.state == 1 && !idle && now_sec() - llms_rs.t0 >= llms_rs.tau) {
-        fprintf(stderr, "llms agent restart: %.1f s into the prompt -- interrupting for a fresh attempt\n", now_sec() - llms_rs.t0); worker_interrupt(w); llms_rs.state = 2; }
+        ((void)(now_sec() - llms_rs.t0)); worker_interrupt(w); llms_rs.state = 2; }
     if (llms_rs.state != 2 || !idle || queued) return false;
     char rerr[160] = {0}; llms_rs.state = 0;
-    if (!agent_worker_reset_to_sysprompt(w, rerr, sizeof rerr)) { fprintf(stderr, "llms agent restart: reset failed (%s)\n", rerr); return false; }
-    llms_restart_salt = 1;   /* only B's turn is salted */
-    char *rp = llms_rs.prompt; char *noted = NULL;   /* llms RESTART_NOTE: the false premise named in the prompt itself */
-    int rnc_keep = 1; if (llms_rs.note && agent_rnc_on()) { rnc_keep = agent_en_changed(); if (rnc_keep) g_rnc_kept++; else g_rnc_dropped++; fprintf(stderr, "llms agent restart note if changed: %s\n", rnc_keep ? "a file changed -- the note is kept" : "no file changed -- the note is dropped"); }   /* llms RESTART_NOTE_IF_CHANGED */
+    if (!agent_worker_reset_to_sysprompt(w, rerr, sizeof rerr)) { ((void)0); return false; }
+    llms_restart_salt = 1;
+    char *rp = llms_rs.prompt; char *noted = NULL;
+    int rnc_keep = 1; if (llms_rs.note && agent_rnc_on()) { rnc_keep = agent_en_changed(); if (rnc_keep) g_rnc_kept++; else g_rnc_dropped++; ((void)0); }
     if (llms_rs.note && rnc_keep) { const char *nt = "\n\n(Note: an earlier attempt at this request was interrupted and restarted. It may already have changed files in this directory. Check the current state before you change anything.)";
                         noted = xmalloc(strlen(rp) + strlen(nt) + 1); strcpy(noted, rp); strcat(noted, nt); rp = noted; }
-    if (!worker_submit(w, rp)) { free(noted); fprintf(stderr, "llms agent restart: resubmit refused\n"); return false; }
-    free(noted);   /* the ONE raw submit: B is not re-armed */
-    llms_lb_attempt = 0; g_vc_attempt++; g_en_t0 = now_sec(); g_en_fired = 0; g_en_edited = 0; g_en_tok = 0; g_en_hyp_tok = -1; g_en_wl = 0; g_en_win[0] = 0; if (agent_en_on() || agent_en_hyp_on() || agent_rnc_on()) agent_en_snapshot();   /* llms AGENT_EDIT_NUDGE: a new attempt */   /* llms AGENT_VALUE_CLOSE: a new attempt */   /* llms LB_RESTART: the fresh attempt counts its own loopbreaks */
-    llms_rs.fired++; fprintf(stderr, "llms agent restart: resubmitted (restart %u, seed salt %llu)\n", llms_rs.fired, (unsigned long long)llms_restart_salt); return true;
+    if (!worker_submit(w, rp)) { free(noted); ((void)0); return false; }
+    free(noted);
+    llms_lb_attempt = 0; g_vc_attempt++; g_en_t0 = now_sec(); g_en_fired = 0; g_en_edited = 0; g_en_tok = 0; g_en_hyp_tok = -1; g_en_wl = 0; g_en_win[0] = 0; if (agent_en_on() || agent_en_hyp_on() || agent_rnc_on()) agent_en_snapshot();      
+    llms_rs.fired++; ((void)0); return true;
 }
-static bool llms_rs_pending(void) { return llms_rs.state == 2 || (llms_rs.state == 1 && __atomic_load_n(&g_rs_tok_hit, __ATOMIC_SEQ_CST)); }   /* llms RS_PENDING (apply_rs_pending.py): a restart is owed -- the exit tests ask this, never the state alone */
+static bool llms_rs_pending(void) { return llms_rs.state == 2 || (llms_rs.state == 1 && __atomic_load_n(&g_rs_tok_hit, __ATOMIC_SEQ_CST)); }
 static int llms_rs_timeout_ms(void) { if (llms_rs.state != 1) return -1; const double rem = llms_rs.t0 + llms_rs.tau - now_sec(); return rem <= 0.0 ? 0 : (int)(rem * 1000.0) + 1; }
 static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_worker worker;
@@ -14332,13 +14271,13 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
     int rc = 0;
-    double llms_deadline = 0.0;   /* llms AGENT_DEADLINE (apply_agent_deadline.py): a clean stop T s into the session -- the restart policy's abort */
+    double llms_deadline = 0.0;
     { const char *e = getenv("LLMS_DS4_AGENT_DEADLINE_S"); const double dt = e && *e ? atof(e) : 0.0;
-      if (dt > 0.0) { llms_deadline = now_sec() + dt; fprintf(stderr, "llms: agent deadline %.0f s (a clean stop at the deadline, rc 3)\n", dt); } }
-    int llms_term_on = 0;   /* llms AGENT_TERM_CLEAN: a SIGTERM takes the deadline's clean branch */
+      if (dt > 0.0) { llms_deadline = now_sec() + dt; ((void)0); } }
+    int llms_term_on = 0;
     { const char *e = getenv("LLMS_DS4_AGENT_TERM_CLEAN"); if (e && *e && *e != '0') { struct sigaction ta; memset(&ta, 0, sizeof ta); sigemptyset(&ta.sa_mask); ta.sa_handler = agent_term_handler;
-        if (sigaction(SIGTERM, &ta, NULL) == 0) { llms_term_on = 1; fprintf(stderr, "llms: agent term clean (a SIGTERM stops the session cleanly, rc 3)\n"); } } }
-    llms_rs_init();   /* llms AGENT_RESTART6 */
+        if (sigaction(SIGTERM, &ta, NULL) == 0) { llms_term_on = 1; ((void)0); } } }
+    llms_rs_init();
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -14354,13 +14293,13 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         bool idle = worker_is_idle(&worker);
 
         if (one_shot && !one_shot_submitted && initialized) {
-            if (llms_rs_submit(&worker, cfg->gen.prompt)) one_shot_submitted = true;   /* llms AGENT_RESTART6 */
+            if (llms_rs_submit(&worker, cfg->gen.prompt)) one_shot_submitted = true;
             idle = false;
         }
 
         if (!one_shot && queue.len && idle) {
             char *queued = agent_prompt_queue_take_all(&queue);
-            if (llms_rs_submit(&worker, queued)) {   /* llms AGENT_RESTART6 */
+            if (llms_rs_submit(&worker, queued)) {
                 idle = false;
             } else {
                 agent_prompt_queue_push_front(&queue, queued);
@@ -14369,7 +14308,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             free(queued);
         }
 
-        if (llms_rs_tick(&worker, idle, queue.len)) idle = false;   /* llms AGENT_RESTART6 */
+        if (llms_rs_tick(&worker, idle, queue.len)) idle = false;
         if (!one_shot && initialized && idle && !queue.len &&
             input.len == 0 && !stdin_eof && !waiting_announced)
         {
@@ -14383,14 +14322,14 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             timeout_ms = rem <= 0.0 ? 0 : (int)(rem * 1000.0) + 1;
         }
 
-        if (llms_term_on && agent_term) { fprintf(stderr, "llms agent term: SIGTERM -- the session stops cleanly (rc 3)\n"); worker_interrupt(&worker); worker_stop(&worker); rc = 3; break; }   /* llms AGENT_TERM_CLEAN */
-        if (llms_deadline > 0.0) {   /* llms AGENT_DEADLINE */
+        if (llms_term_on && agent_term) { ((void)0); worker_interrupt(&worker); worker_stop(&worker); rc = 3; break; }
+        if (llms_deadline > 0.0) {
             const double rem = llms_deadline - now_sec();
-            if (rem <= 0.0) { fprintf(stderr, "llms agent deadline: reached -- the session stops cleanly (rc 3)\n"); worker_interrupt(&worker); worker_stop(&worker); rc = 3; break; }
+            if (rem <= 0.0) { ((void)0); worker_interrupt(&worker); worker_stop(&worker); rc = 3; break; }
             const int dms = (int)(rem * 1000.0) + 1; if (timeout_ms < 0 || dms < timeout_ms) timeout_ms = dms;
         }
-        { const int dms = llms_rs_timeout_ms(); if (dms >= 0 && (timeout_ms < 0 || dms < timeout_ms)) timeout_ms = dms; }   /* llms AGENT_RESTART6 */
-        if (llms_term_on && (timeout_ms < 0 || timeout_ms > 200)) timeout_ms = 200;   /* llms AGENT_TERM_CLEAN: a signal on another thread is seen within 0.2 s */
+        { const int dms = llms_rs_timeout_ms(); if (dms >= 0 && (timeout_ms < 0 || dms < timeout_ms)) timeout_ms = dms; }
+        if (llms_term_on && (timeout_ms < 0 || timeout_ms > 200)) timeout_ms = 200;
         struct pollfd pfd[2];
         int nfds = 0;
         int wake_idx = nfds;
@@ -14447,28 +14386,28 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             (stdin_eof || now_sec() >= quiet_deadline))
         {
             char *prompt = agent_input_buf_take(&input);
-            {   /* llms STDIN_NEW (apply_stdinnew.py): LLMS_DS4_AGENT_STDIN_NEW=1 -- a stdin prompt that is exactly '/new' resets to the system prompt */
+            {
                 static int agent_stdin_new_state = -1; if (agent_stdin_new_state < 0) { const char *ev = getenv("LLMS_DS4_AGENT_STDIN_NEW"); agent_stdin_new_state = ev && *ev && *ev != '0'; }
                 if (agent_stdin_new_state && prompt) {
                     const char *p = prompt; while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
                     size_t n = strlen(p); while (n && (p[n - 1] == '\n' || p[n - 1] == ' ' || p[n - 1] == '\r' || p[n - 1] == '\t')) n--;
                     if (n == 4 && !strncmp(p, "/new", 4)) {
                         char rerr[160] = {0}; const bool ok = worker_is_idle(&worker) && queue.len == 0 && agent_worker_reset_to_sysprompt(&worker, rerr, sizeof rerr);
-                        if (ok && g_agent_escalated) { g_agent_escalated = 0; ds4_session_escalate(worker.session, 0); }   /* llms ESCALATE: a new task starts on the shipped dials */
-                        if (ok) { g_h1_done = 0; g_h1_cmd[0] = 0; }   /* llms H1 RESET: a new task does not inherit the last task's test command */
-                        if (ok && g_think_esc) think_esc_off(worker.session);   /* llms THINK_ESCALATE: the same at /new */
-                        {   /* llms FOOTPRINT (apply_arpool.py): LLMS_DS4_FOOTPRINT=1, off unless set -- the process's memory at each /new */
+                        if (ok && g_agent_escalated) { g_agent_escalated = 0; ds4_session_escalate(worker.session, 0); }
+                        if (ok) { g_h1_done = 0; g_h1_cmd[0] = 0; }
+                        if (ok && g_think_esc) think_esc_off(worker.session);
+                        {
                             static int fp_state = -1; static unsigned fp_n; if (fp_state < 0) { const char *fe = getenv("LLMS_DS4_FOOTPRINT"); fp_state = fe && *fe && *fe != '0'; }
                             if (fp_state) { task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT;
                                 if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS)
-                                    fprintf(stderr, "llms footprint: %u /new, phys_footprint %.3f GiB, resident %.3f GiB\n", ++fp_n, (double)vi.phys_footprint / 1073741824.0, (double)vi.resident_size / 1073741824.0); } }
+                                    ((void)(++fp_n), (void)((double)vi.phys_footprint / 1073741824.0), (void)((double)vi.resident_size / 1073741824.0)); } }
                         agent_noninteractive_marker(ok ? "+DWARFSTAR_NEW" : "+DWARFSTAR_NEW_FAILED"); if (!ok && rerr[0]) fprintf(stderr, "ds4-agent: stdin /new failed: %s\n", rerr);
                         free(prompt); waiting_announced = false; continue;
                     }
                 }
             }
             if (worker_is_idle(&worker) && queue.len == 0) {
-                if (!llms_rs_submit(&worker, prompt)) {   /* llms AGENT_RESTART6 */
+                if (!llms_rs_submit(&worker, prompt)) {
                     agent_prompt_queue_push(&queue, prompt);
                     agent_noninteractive_marker("+DWARFSTAR_QUEUED");
                 }
@@ -14480,9 +14419,9 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             waiting_announced = false;
         }
 
-        if (one_shot && one_shot_submitted && !llms_rs_pending() && worker_is_idle(&worker)) break;   /* llms AGENT_RESTART2: not while a restart is pending */   /* llms RS_PENDING */
+        if (one_shot && one_shot_submitted && !llms_rs_pending() && worker_is_idle(&worker)) break;   
         if (!one_shot && stdin_eof && input.len == 0 &&
-            queue.len == 0 && worker_is_idle(&worker) && !llms_rs_pending())   /* llms RS_PENDING */
+            queue.len == 0 && worker_is_idle(&worker) && !llms_rs_pending())
             break;
     }
 
@@ -14985,17 +14924,17 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
-    {   /* llms FOOTPRINT at start (apply_fpstart.py): every process reads the switch -- a single-task session has no '/new' */
+    {
         const char *fe = getenv("LLMS_DS4_FOOTPRINT");
         if (fe && *fe && *fe != '0') { task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT;
             if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS)
-                fprintf(stderr, "llms footprint: at start, phys_footprint %.3f GiB, resident %.3f GiB\n", (double)vi.phys_footprint / 1073741824.0, (double)vi.resident_size / 1073741824.0); }
+                ((void)0); }
     }
-    {   /* llms AGENT_THINK_LEVEL (apply_think_level.py): the default think level when no think option was given */
+    {
         const char *e = getenv("LLMS_DS4_AGENT_THINK_LEVEL");
         if (!llms_think_arg_seen && e && *e) {
-            if (ds4_think_mode_parse_level(e, &cfg.gen.think_mode)) fprintf(stderr, "llms: agent think level %s (the default; a think option overrides)\n", e);
-            else fprintf(stderr, "llms: LLMS_DS4_AGENT_THINK_LEVEL=%s ignored (an integer from 0 to 100)\n", e);
+            if (ds4_think_mode_parse_level(e, &cfg.gen.think_mode)) ((void)0);
+            else ((void)0);
         }
     }
     if (cfg.chdir_path) {
@@ -15084,9 +15023,9 @@ int main(int argc, char **argv) {
     }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);
 
-    {   /* llms AGENT_MIN_P (apply_agent_minp.py): the default min_p when --min-p was not given */
+    {
         const char *e = getenv("LLMS_DS4_AGENT_MIN_P");
-        if (!cfg.gen.min_p_set && e && *e) { cfg.gen.min_p = strtof(e, NULL); fprintf(stderr, "llms: agent min_p %.2f (the default; --min-p overrides)\n", (double)cfg.gen.min_p); }
+        if (!cfg.gen.min_p_set && e && *e) { cfg.gen.min_p = strtof(e, NULL); ((void)0); }
     }
 
     /* Model paths and Metal kernel sources are resolved from the launch

@@ -740,7 +740,6 @@ int main(int argc, char **argv) {
             ds4_tokens at = {0};
             ds4_tokenize_text(engine, ans, &at);
             for (int k = 0; k < at.len; k++) ds4_tokens_push(&prompt, at.v[k]);
-            fprintf(stderr, "llms answer: prompt_tokens %d answer_tokens %d total %d\n", p_len, at.len, prompt.len);
             ds4_tokens_free(&at); free(ans);
         }
     } else {

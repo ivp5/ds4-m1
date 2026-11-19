@@ -1,7 +1,7 @@
 #include "ds4.h"
-int ds4_session_llms_rerun_rows(ds4_session *s, const int *tokens, int k, float *row_logits);   /* llms PPL_REPEAT */
-void ds4_llms_elide_sweep_set(int layer);   /* llms ELIDE_SWEEP */
-int ds4_gpu_llms_alt_off(const char *name);   /* llms PPL_REPEAT */
+int ds4_session_llms_rerun_rows(ds4_session *s, const int *tokens, int k, float *row_logits);
+void ds4_llms_elide_sweep_set(int layer);
+int ds4_gpu_llms_alt_off(const char *name);
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
@@ -146,10 +146,10 @@ static void cli_dist_busy_set(const cli_config *cfg, bool busy) {
     if (!busy) cli_dist_notice_printed = 0;
 }
 
-static int llms_force_through_stop(void) {   /* llms FORCE_THROUGH_STOP (apply_force_through_stop.py): forced reads continue past stop tokens */
+static int llms_force_through_stop(void) {
     static int st = -1;
     if (st < 0) { const char *e = getenv("LLMS_DS4_FORCE_THROUGH_STOP"), *f = getenv("LLMS_DS4_FORCE_IDS"); st = e && *e && strcmp(e, "0") && f && *f;
-        if (st) fprintf(stderr, "llms: force through stop (the forced record continues past EOS and stop tokens; an instrument switch for forced reads)\n"); }
+        if (st) ((void)0); }
     return st;
 }
 static int cli_wait_distributed_route(const cli_config *cfg, ds4_session *session) {
@@ -492,11 +492,10 @@ static void generation_done(void *ud) {
     fflush(p->fp);
 }
 
-/* LLMS_DS4_CLI_RAW_TRACE: measurement only, off unless a new file path is set. */
 static FILE *llms_cli_raw_fp; static uint64_t llms_cli_raw_tokens;
 static void llms_cli_raw_close(void) {
     if (llms_cli_raw_fp) { if (fclose(llms_cli_raw_fp)) { perror("llms cli raw close"); _exit(2); }
-        fprintf(stderr, "llms cli raw: %llu token-byte records\n", (unsigned long long)llms_cli_raw_tokens); }
+        ((void)0); }
 }
 static void llms_cli_raw_write(const char *text, size_t len) {
     static int initialized;
@@ -506,7 +505,7 @@ static void llms_cli_raw_write(const char *text, size_t len) {
             if (fwrite("D4RAW1\n", 7, 1, llms_cli_raw_fp) != 1) { perror("llms cli raw header"); exit(2); }
             atexit(llms_cli_raw_close); } }
     if (!llms_cli_raw_fp) return;
-    if (len > UINT32_MAX) { fprintf(stderr, "llms cli raw: oversized token piece\n"); exit(2); }
+    if (len > UINT32_MAX) { ((void)0); exit(2); }
     const uint32_t n = (uint32_t)len;
     if (fwrite(&n, sizeof n, 1, llms_cli_raw_fp) != 1 || (len && fwrite(text, len, 1, llms_cli_raw_fp) != 1) || fflush(llms_cli_raw_fp)) {
         perror("llms cli raw record"); exit(2); }
@@ -544,15 +543,15 @@ static void build_chat_prompt(ds4_engine *engine,
     ds4_chat_append_assistant_prefix(engine, out, think_mode);
 }
 
-static void llms_cov_init(const char *prompt);   /* llms THINK_COVER: defined below */
+static void llms_cov_init(const char *prompt);
 static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
-    llms_cov_init(gen->prompt);   /* llms THINK_COVER: parses the finding tags of the prompt once, when the switch is set */
-    {   /* llms PROMPT_IDS (apply_prompt_ids.py): the generation prompt as token ids from a file -- a stored state continued by free sampling; off unless set */
+    llms_cov_init(gen->prompt);
+    {
         const char *pf = getenv("LLMS_DS4_PROMPT_IDS");
         if (pf && *pf) {
             char *text = read_prompt_file(pf, true), *p = text, *end = NULL;
             for (long v = strtol(p, &end, 10); end != p; p = end, v = strtol(p, &end, 10)) ds4_tokens_push(out, (int)v);
-            free(text); fprintf(stderr, "llms: prompt ids (%d token ids from %s, no tokenization, no template)\n", out->len, pf);
+            free(text); ((void)0);
             return;
         }
     }
@@ -578,23 +577,20 @@ static void cli_apply_model_sampling_defaults(
     if (!gen->min_p_set) gen->min_p = 0.0f;
 }
 
-/* llms THINK_SCRUB (apply_think_scrub.py): the decode's rows are provisional; every W tokens of open thinking the state since the last scrub is rebuilt by the prefill path (restore the snapshot, re-prefill, snapshot again) */
-static int llms_scrub_w = -1, llms_scrub_n, llms_scrub_next, llms_scrub_have; static int llms_scrub_native = -1;   /* llms THINK_SCRUB_NATIVE */ static int llms_scrub_close = 0, llms_scrub_last = -1; static long llms_scrub_budget = -1;   /* llms TWOSPEED */ static ds4_session_snapshot llms_scrub_snap; static double llms_scrub_s, llms_scrub_aux_s; static long llms_scrub_rows;
+static int llms_scrub_w = -1, llms_scrub_n, llms_scrub_next, llms_scrub_have; static int llms_scrub_native = -1;    static int llms_scrub_close = 0, llms_scrub_last = -1; static long llms_scrub_budget = -1;    static ds4_session_snapshot llms_scrub_snap; static double llms_scrub_s, llms_scrub_aux_s; static long llms_scrub_rows;
 static void llms_scrub_init(void) {
     if (llms_scrub_w >= 0) return;
     const char *e = getenv("LLMS_DS4_THINK_SCRUB"); llms_scrub_w = e && *e ? atoi(e) : 0; if (llms_scrub_w < 0) llms_scrub_w = 0;
-    { const char *nv = getenv("LLMS_DS4_THINK_SCRUB_NATIVE"); llms_scrub_native = nv && *nv && *nv != '0'; if (llms_scrub_w && llms_scrub_native) fprintf(stderr, "llms: think scrub native (a graph-position rollback keeps the rows below the mark; no session snapshot) [LLMS_DS4_THINK_SCRUB_NATIVE]\n"); }
-    { const char *cv = getenv("LLMS_DS4_THINK_SCRUB_CLOSE"); llms_scrub_close = cv && *cv && *cv != '0' && llms_scrub_w; if (llms_scrub_close) { const char *bv = getenv("LLMS_DS4_THINK_BUDGET"); llms_scrub_budget = bv && *bv ? atol(bv) : -1; fprintf(stderr, "llms: think scrub close (a sampled </think> and the budget's forced close commit first; the close is re-sampled from the committed state) [LLMS_DS4_THINK_SCRUB_CLOSE]\n"); } }
-    if (llms_scrub_w) { fprintf(stderr, "llms: think scrub %d (while the thinking is open, every %d generated tokens the state since the last scrub is rebuilt by the prefill path: restore the snapshot, re-prefill, snapshot again; the decode's rows are provisional) -- FIDELITY DIAL [LLMS_DS4_THINK_SCRUB]\n", llms_scrub_w, llms_scrub_w);
-        atexit_b(^{ fprintf(stderr, "llms think scrub: %d scrubs, %ld rows re-prefilled in %.1f s, restore + snapshot %.1f s\n", llms_scrub_n, llms_scrub_rows, llms_scrub_s, llms_scrub_aux_s); }); }
+    { const char *nv = getenv("LLMS_DS4_THINK_SCRUB_NATIVE"); llms_scrub_native = nv && *nv && *nv != '0'; if (llms_scrub_w && llms_scrub_native) ((void)0); }
+    { const char *cv = getenv("LLMS_DS4_THINK_SCRUB_CLOSE"); llms_scrub_close = cv && *cv && *cv != '0' && llms_scrub_w; if (llms_scrub_close) { const char *bv = getenv("LLMS_DS4_THINK_BUDGET"); llms_scrub_budget = bv && *bv ? atol(bv) : -1; ((void)0); } }
+    if (llms_scrub_w) { ((void)0);
+        atexit_b(^{ ((void)0); }); }
 }
-/* llms IND_PEN (apply_ind_pen.py): a table from the last 4 generated tokens to the token that followed them last time */
 #define IND_TAB (1u << 16)
 static uint64_t ind_key[IND_TAB]; static int ind_val[IND_TAB]; static int ind_last[4]; static uint32_t ind_n; static float ind_pen = -1.0f; static unsigned long long ind_hits;
 static uint64_t ind_gram(void) { uint64_t h = 1469598103934665603ull; for (uint32_t i = 0; i < 4; i++) { h ^= (uint64_t)(uint32_t)ind_last[(ind_n + i) & 3] + 1u; h *= 1099511628211ull; } return h | 1ull; }
 static void ind_feed(int tok) { if (ind_n >= 4) { const uint64_t k = ind_gram(); uint32_t s = (uint32_t)(k >> 40) & (IND_TAB - 1); for (int p = 0; p < 16; p++, s = (s + 1) & (IND_TAB - 1)) if (!ind_key[s] || ind_key[s] == k) { ind_key[s] = k; ind_val[s] = tok; break; } } ind_last[ind_n & 3] = tok; ind_n++; }
 static int ind_lookup(void) { if (ind_n < 4) return -1; const uint64_t k = ind_gram(); uint32_t s = (uint32_t)(k >> 40) & (IND_TAB - 1); for (int p = 0; p < 16; p++, s = (s + 1) & (IND_TAB - 1)) { if (!ind_key[s]) return -1; if (ind_key[s] == k) return ind_val[s]; } return -1; }
-/* llms THINK_LOOP / THINK_REREAD (apply_think_loop_reread.py) */
 #define TLB_TAB (1u << 18)
 #define TLB_WIN 512
 static uint64_t tlb_tab[TLB_TAB]; static uint8_t tlb_ring[TLB_WIN]; static int tlb_hist[8]; static uint32_t tlb_n, tlb_pos, tlb_cnt, tlb_grams; static uint32_t tlb_threshold = (TLB_WIN * 9u) / 10u;
@@ -612,8 +608,8 @@ static int tlb_feed(int tok) {
     return tlb_cnt >= tlb_threshold;
 }
 #include <strings.h>
-static char llms_stop_prefix[64]; static int llms_stop_on = -1; static char llms_sl[256]; static int llms_sl_len;   /* llms STOP_LINE */
-static int llms_stop_feed(const char *p, size_t n) {   /* 1 when a completed line begins with the prefix */
+static char llms_stop_prefix[64]; static int llms_stop_on = -1; static char llms_sl[256]; static int llms_sl_len;
+static int llms_stop_feed(const char *p, size_t n) {
     for (size_t i = 0; i < n; i++) {
         const char c = p[i];
         if (c == '\n') { int k = 0; while (k < llms_sl_len && (llms_sl[k] == ' ' || llms_sl[k] == '*' || llms_sl[k] == '_')) k++;
@@ -622,19 +618,18 @@ static int llms_stop_feed(const char *p, size_t n) {   /* 1 when a completed lin
     }
     return 0;
 }
-static int llms_cli_inside = -1;   /* the thinking span is open (was a block static of the CLI_THINK_BUDGET block) */
+static int llms_cli_inside = -1;
 static int llms_loop_on = -1, llms_loop_fired, llms_reread_on = -1, llms_think_reread_pending;
 static int llms_wrap_tok[256], llms_wrap_n, llms_wrap_cur = -1;
-static int llms_wrap_uncap; static unsigned long long llms_wrap_extra, llms_wrap_forced_total;   /* llms THINK_WRAP singleton cap: the control knob, the extra-token counter, the forced-token count */   /* llms THINK_WRAP: the wrap-up text forced inside the thinking before a forced close; cur -1 = not started, -2 = no text */
+static int llms_wrap_uncap; static unsigned long long llms_wrap_extra, llms_wrap_forced_total;   
 
-/* llms THINK_CALC (apply_think_calc.py): a calculator inside the thinking -- off unless LLMS_DS4_THINK_CALC is set */
 static int llms_calc_on = -1, llms_calc_mark, llms_calc_div, llms_calc_sf, llms_calc_chm, llms_calc_par, llms_calc_psf, llms_calc_x, llms_calc_tok[32], llms_calc_n, llms_calc_cur = -1; static char llms_calc_tail[192]; static int llms_calc_tl;
 static unsigned long long llms_calc_fired, llms_calc_held, llms_calc_skipped; static char llms_calc_raw[48];
 static void llms_calc_init(void) {
     if (llms_calc_on != -1) return;
-    const char *e = getenv("LLMS_DS4_THINK_CALC"); llms_calc_on = e && *e && *e != '0'; llms_calc_mark = e && (*e == '2' || *e == '3' || *e == '4' || *e == '5' || *e == '6' || *e == '7'); llms_calc_div = e && (*e == '3' || *e == '4' || *e == '5' || *e == '6' || *e == '7'); llms_calc_sf = e && (*e == '4' || *e == '5' || *e == '6' || *e == '7'); llms_calc_chm = e && (*e == '5' || *e == '6' || *e == '7'); llms_calc_par = e && (*e == '6' || *e == '7'); llms_calc_x = e && *e == '7';   /* value 5 = 4 + a sum chained straight after a marked result ('182 (exact) +101=') + the quotient shown unrounded beside its s.f. form */   /* 2 = append ' (exact)' to every forced result; 3 = 2 plus division and '=?' */
-    if (llms_calc_on) { fprintf(stderr, "llms: think calc (results of 'A op B =' and running-sum steps are computed and forced inside the thinking; + - * only) -- FIDELITY DIAL\n");
-        atexit_b(^{ fprintf(stderr, "llms think calc: %llu results forced, %llu held cycles, %llu skipped\n", llms_calc_fired, llms_calc_held, llms_calc_skipped); }); }
+    const char *e = getenv("LLMS_DS4_THINK_CALC"); llms_calc_on = e && *e && *e != '0'; llms_calc_mark = e && (*e == '2' || *e == '3' || *e == '4' || *e == '5' || *e == '6' || *e == '7'); llms_calc_div = e && (*e == '3' || *e == '4' || *e == '5' || *e == '6' || *e == '7'); llms_calc_sf = e && (*e == '4' || *e == '5' || *e == '6' || *e == '7'); llms_calc_chm = e && (*e == '5' || *e == '6' || *e == '7'); llms_calc_par = e && (*e == '6' || *e == '7'); llms_calc_x = e && *e == '7';   
+    if (llms_calc_on) { ((void)0);
+        atexit_b(^{ ((void)0); }); }
 }
 static void llms_calc_feed(const char *p, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -643,15 +638,15 @@ static void llms_calc_feed(const char *p, size_t n) {
     }
     llms_calc_tail[llms_calc_tl] = 0;
 }
-static int llms_calc_isop(const char *s, int i, int *w) {   /* the operator ending at s[i]; *w = its width in bytes; 0 = none */
+static int llms_calc_isop(const char *s, int i, int *w) {
     const unsigned char c = (unsigned char)s[i];
     if (c == '+' || c == '-' || c == '*') { *w = 1; return c; }
-    if (c == '/' && llms_calc_div) { *w = 1; return '/'; }   /* 03:5x value 3: division, forced to four significant figures */
-    if (c == 'x' && i >= 1 && ((s[i - 1] >= '0' && s[i - 1] <= '9') || s[i - 1] == ' ') && (s[i + 1] == ' ' || (s[i + 1] >= '0' && s[i + 1] <= '9') || s[i + 1] == 0)) { *w = 1; return '*'; }   /* 'x' only between numbers, not inside a word */
-    if (c == 0x97 && i >= 1 && (unsigned char)s[i - 1] == 0xC3) { *w = 2; return '*'; }   /* the multiplication sign, UTF-8 C3 97 */
+    if (c == '/' && llms_calc_div) { *w = 1; return '/'; }
+    if (c == 'x' && i >= 1 && ((s[i - 1] >= '0' && s[i - 1] <= '9') || s[i - 1] == ' ') && (s[i + 1] == ' ' || (s[i + 1] >= '0' && s[i + 1] <= '9') || s[i + 1] == 0)) { *w = 1; return '*'; }
+    if (c == 0x97 && i >= 1 && (unsigned char)s[i - 1] == 0xC3) { *w = 2; return '*'; }
     return 0;
 }
-static int llms_calc_num_back(const char *s, int end, int *start, long double *v, int *dec, int *comma) {   /* the number ending at s[end - 1]; returns 1 if found */
+static int llms_calc_num_back(const char *s, int end, int *start, long double *v, int *dec, int *comma) {
     int i = end - 1; int nd = 0; *comma = 0; *dec = -1;
     while (i >= 0 && ((s[i] >= '0' && s[i] <= '9') || s[i] == ',' || s[i] == '.')) { if (s[i] >= '0' && s[i] <= '9') nd++; i--; }
     if (nd == 0) return 0;
@@ -664,7 +659,7 @@ static int llms_calc_num_back(const char *s, int end, int *start, long double *v
     if (k > 16) return 0;
     *v = strtold(buf, NULL); *start = a; return 1;
 }
-static int llms_calc_sigfigs(const char *p, int lim) {   /* significant digits of the number starting at p (commas skipped; an integer's trailing zeros not counted) */
+static int llms_calc_sigfigs(const char *p, int lim) {
     int n = 0, z = 0, dot = 0, lead = 1; (void)lim;
     for (; *p && ((*p >= '0' && *p <= '9') || *p == ',' || *p == '.'); p++) {
         if (*p == ',') continue; if (*p == '.') { dot = 1; continue; }
@@ -674,7 +669,7 @@ static int llms_calc_sigfigs(const char *p, int lim) {   /* significant digits o
     if (dot) n += z;
     return n > 0 ? n : 1;
 }
-static int llms_calc_hold(void) {   /* 1 while a number follows an operator: cap the speculative cycle to one token */
+static int llms_calc_hold(void) {
     if (llms_calc_on <= 0 || llms_calc_tl < 2) return 0;
     const char *s = llms_calc_tail; int i = llms_calc_tl - 1;
     if (!(s[i] >= '0' && s[i] <= '9') && s[i] != ' ' && !llms_calc_isop(s, i, &(int){0})) return 0;
@@ -682,11 +677,11 @@ static int llms_calc_hold(void) {   /* 1 while a number follows an operator: cap
     int w; if (i >= 0 && llms_calc_isop(s, i, &w)) { llms_calc_held++; return 1; }
     return 0;
 }
-static int llms_calc_start6(ds4_engine *engine) {   /* values 1-6: the tail ends with '=': compute, format and tokenize the result; 1 = forcing starts now */
+static int llms_calc_start6(ds4_engine *engine) {
     if (llms_calc_on <= 0 || llms_calc_tl < 3) return 0;
     const char *s = llms_calc_tail; int e = llms_calc_tl;
     int sp_after = 0; if (s[e - 1] == ' ') { e--; sp_after = 1; }
-    int qmark = 0; if (llms_calc_div && e >= 2 && s[e - 1] == '?' && s[e - 2] == '=') { e--; qmark = 1; }   /* 03:5x value 3: '490190/3070 =?' is the model's own 'now compute this' */
+    int qmark = 0; if (llms_calc_div && e >= 2 && s[e - 1] == '?' && s[e - 2] == '=') { e--; qmark = 1; }
     if (e < 3 || s[e - 1] != '=') return 0;
     int j = e - 1; int sp_before = 0; while (j > 0 && s[j - 1] == ' ') { j--; sp_before = 1; }
     long double B, A; int bs, bd, bc, as_, ad, ac;
@@ -697,7 +692,7 @@ static int llms_calc_start6(ds4_engine *engine) {   /* values 1-6: the tail ends
     int oa = o - w; while (oa >= 0 && s[oa] == ' ') oa--;
     int chain = 0; int nterms = 2;
     int paren = 0;
-    if (llms_calc_par && op == '/' && oa >= 1 && s[oa] == ')') {   /* value 6: '(88+94+101+112+184)/5 =' -- a pure sum in parentheses divided by a number */
+    if (llms_calc_par && op == '/' && oa >= 1 && s[oa] == ')') {
         int q = oa - 1; long double sum = 0; int n = 0, mxd = 0, cm = 0;
         for (;;) {
             while (q >= 0 && s[q] == ' ') q--;
@@ -715,28 +710,27 @@ static int llms_calc_start6(ds4_engine *engine) {   /* values 1-6: the tail ends
     else
     if (oa >= 0 && ((s[oa] >= '0' && s[oa] <= '9') || s[oa] == '.')) {
         if (!llms_calc_num_back(s, oa + 1, &as_, &A, &ad, &ac)) return 0;
-        if (op == '-' && A >= 1900 && A <= 2100 && B < 100 && bd == 0 && ad == 0) { llms_calc_skipped++; return 0; }   /* '2023-24' is a year range, not a subtraction */
-        /* a longer sum: walk back over '+' / '-' terms (products in a longer expression are skipped: precedence) */
+        if (op == '-' && A >= 1900 && A <= 2100 && B < 100 && bd == 0 && ad == 0) { llms_calc_skipped++; return 0; }
         for (;;) {
             int q = as_ - 1; while (q >= 0 && s[q] == ' ') q--;
             int w2 = 0; const int op2 = q >= 0 ? llms_calc_isop(s, q, &w2) : 0;
             if (q >= 0 && (s[q] == '/' || s[q] == '(' || s[q] == '^' || s[q] == ')')) { llms_calc_skipped++; return 0; }
             if (!op2) break;
             int qa = q - w2; while (qa >= 0 && s[qa] == ' ') qa--;
-            if (qa < 0 || !((s[qa] >= '0' && s[qa] <= '9') || s[qa] == '.')) { llms_calc_skipped++; return 0; }   /* a leading sign or a word before the operator */
+            if (qa < 0 || !((s[qa] >= '0' && s[qa] <= '9') || s[qa] == '.')) { llms_calc_skipped++; return 0; }
             if (op == '*' || op2 == '*') { llms_calc_skipped++; return 0; }
             long double A2; int as2, ad2, ac2;
             if (!llms_calc_num_back(s, qa + 1, &as2, &A2, &ad2, &ac2)) return 0;
-            A = op2 == '+' ? A2 + A : A2 - A;   /* left to right: A2 op2 (A ...) is wrong for '-' -- rebuild below */
+            A = op2 == '+' ? A2 + A : A2 - A;
             (void)as2; nterms++;
-            if (op2 == '-') { llms_calc_skipped++; return 0; }   /* keep v1 to pure sums ahead of a final + / -: a '-' inside a longer chain is skipped */
+            if (op2 == '-') { llms_calc_skipped++; return 0; }
             if (ad2 > ad) ad = ad2; ac |= ac2; as_ = as2;
             if (nterms > 12) { llms_calc_skipped++; return 0; }
         }
     } else if (oa >= 0 && (s[oa] == ';' || s[oa] == ',' || (llms_calc_chm && s[oa] == ')' && oa >= 6 && !strncmp(s + oa - 6, "(exact)", 7))) && (op == '+' || op == '-')) {
-        if (s[oa] == ')') oa++;   /* value 5: no separator; the mark itself ends at oa */   /* a running-sum step: A = the number after the previous '=' */
+        if (s[oa] == ')') oa++;   
         int q = oa - 1; while (q >= 0 && s[q] == ' ') q--;
-        if (q >= 6 && !strncmp(s + q - 6, "(exact)", 7)) { q -= 7; while (q >= 0 && s[q] == ' ') q--; }   /* 03:5x: a running-sum step after a marked result ('25660 (exact) ; +25250=') */
+        if (q >= 6 && !strncmp(s + q - 6, "(exact)", 7)) { q -= 7; while (q >= 0 && s[q] == ' ') q--; }
         if (!llms_calc_num_back(s, q + 1, &as_, &A, &ad, &ac)) return 0;
         int r = as_ - 1; while (r >= 0 && s[r] == ' ') r--;
         if (r < 0 || s[r] != '=') return 0;
@@ -747,7 +741,7 @@ static int llms_calc_start6(ds4_engine *engine) {   /* values 1-6: the tail ends
     long double R = op == '+' ? A + B : op == '-' ? A - B : op == '*' ? A * B : A / B;
     int dec = op == '*' ? ad + bd : (ad > bd ? ad : bd); if (dec > 4) dec = 4;
     if (op == '/') { const long double ar = R < 0 ? -R : R; dec = ar >= 1000 ? 1 : ar >= 100 ? 2 : ar >= 1 ? 4 : ar >= 0.01L ? 4 : 6; }
-    int sfn = 0;   /* value 4: a quotient carries the significant figures of its operands (an integer's trailing zeros are not counted), at least 2 */
+    int sfn = 0;
     if (op == '/' && llms_calc_sf) {
         const int sa = paren ? llms_calc_psf : llms_calc_sigfigs(s + as_, j), sb = llms_calc_sigfigs(s + bs, j); sfn = sa < sb ? sa : sb; if (sfn < 2) sfn = 2;
         const long double ar = R < 0 ? -R : R; const int mag = ar > 0 ? (int)floorl(log10l(ar)) : 0; dec = sfn - 1 - mag;
@@ -763,16 +757,15 @@ static int llms_calc_start6(ds4_engine *engine) {   /* values 1-6: the tail ends
     for (int t = 0; t < il; t++) { out[k++] = ip[t]; if ((ac || bc) && (il - t - 1) > 0 && (il - t - 1) % 3 == 0) out[k++] = ','; }
     if (dot) { for (const char *t = dot; *t && k < 78; t++) out[k++] = *t; }
     out[k] = 0;
-    if (llms_calc_mark) { char mk[48]; if (sfn > 0 && llms_calc_raw[0]) snprintf(mk, sizeof mk, " (%s unrounded)", llms_calc_raw); else if (sfn > 0) snprintf(mk, sizeof mk, " (to %d s.f.)", sfn); else snprintf(mk, sizeof mk, " (exact)"); for (const char *t = mk; *t && k < 78; t++) out[k++] = *t; out[k] = 0; }   /* 03:5x: value 2 marks the forced result as a tool's, so the model stops re-deriving it */
+    if (llms_calc_mark) { char mk[48]; if (sfn > 0 && llms_calc_raw[0]) snprintf(mk, sizeof mk, " (%s unrounded)", llms_calc_raw); else if (sfn > 0) snprintf(mk, sizeof mk, " (to %d s.f.)", sfn); else snprintf(mk, sizeof mk, " (exact)"); for (const char *t = mk; *t && k < 78; t++) out[k++] = *t; out[k] = 0; }
     ds4_tokens tv = {0}; ds4_tokenize_text(engine, out, &tv);
     llms_calc_n = 0; for (int t = 0; t < tv.len && t < 32; t++) llms_calc_tok[llms_calc_n++] = tv.v[t];
     ds4_tokens_free(&tv);
     if (llms_calc_n <= 0) return 0;
     llms_calc_fired++; llms_calc_cur = 0;
-    { int from = e - 40; if (from < 0) from = 0; fprintf(stderr, "llms: think calc: '%.*s' -> '%s'%s\n", e - from, s + from, out, chain ? " (running sum)" : ""); }
+    { int from = e - 40; if (from < 0) from = 0; ((void)0); }
     return 1;
 }
-/* value 7 (apply_calc7.py, calc_sym.py): where values 1-6 do not fire, a precedence-aware evaluator over the whole arithmetic stretch that ends at the '=' -- '(22-16)/16 =', '(96+640)/(120+900) =', '3.88*38*3070 =', '0.46*72/80 =', '17.8 - 1.6*7 =', and a '/'-step after a result ('= 18.2; /5 ='). No unary sign, no '%', no letters; a stretch that starts right after an operator, a digit or a comma is the suffix of a longer expression and is not evaluated. Output as value 6: ' R (exact)' without a division, ' R (U unrounded)' with one, R at the operands' fewest significant figures (>= 2). */
 static const char *llms_cxe_p, *llms_cxe_end; static int llms_cxe_div, llms_cxe_ops, llms_cxe_sf, llms_cxe_dec, llms_cxe_comma, llms_cxe_bad;
 static void llms_cxe_ws(void) { while (llms_cxe_p < llms_cxe_end && *llms_cxe_p == ' ') llms_cxe_p++; }
 static void llms_cxe_reset(const char *a, const char *b) { llms_cxe_p = a; llms_cxe_end = b; llms_cxe_div = llms_cxe_ops = llms_cxe_comma = llms_cxe_bad = 0; llms_cxe_sf = 99; llms_cxe_dec = 0; }
@@ -784,7 +777,7 @@ static long double llms_cxe_atom(int depth) {
     while (q < llms_cxe_end && *q >= '0' && *q <= '9' && k < 40) buf[k++] = *q++;
     if (k == 0 || k > 16) { llms_cxe_bad = 1; return 0; }
     while (q + 3 < llms_cxe_end && *q == ',' && q[1] >= '0' && q[1] <= '9' && q[2] >= '0' && q[2] <= '9' && q[3] >= '0' && q[3] <= '9' && (q + 4 >= llms_cxe_end || !(q[4] >= '0' && q[4] <= '9')) && k < 40) { buf[k++] = q[1]; buf[k++] = q[2]; buf[k++] = q[3]; q += 4; groups++; }
-    if (q + 3 == llms_cxe_end && *q == ',' && q[1] >= '0' && q[1] <= '9' && q[2] >= '0' && q[2] <= '9') { }   /* ',dd' at the end is not a thousands group */
+    if (q + 3 == llms_cxe_end && *q == ',' && q[1] >= '0' && q[1] <= '9' && q[2] >= '0' && q[2] <= '9') { }
     if (q + 1 < llms_cxe_end && *q == '.' && q[1] >= '0' && q[1] <= '9') { buf[k++] = *q++; d = 0; while (q < llms_cxe_end && *q >= '0' && *q <= '9' && k < 46) { buf[k++] = *q++; d++; } }
     buf[k] = 0; if (groups) llms_cxe_comma = 1; if (d > llms_cxe_dec) llms_cxe_dec = d;
     { const int sf = llms_calc_sigfigs(buf, 0); if (sf < llms_cxe_sf) llms_cxe_sf = sf; }
@@ -810,7 +803,7 @@ static long double llms_cxe_expr(int depth) {
         llms_cxe_p++; long double r = llms_cxe_term(depth); llms_cxe_ops++; v = c == '+' ? v + r : v - r;
     }
 }
-static int llms_cxe_eval(const char *a, const char *b, long double *out, int need_op) {   /* 1 = [a, b) is one whole expression (with an operator if need_op) */
+static int llms_cxe_eval(const char *a, const char *b, long double *out, int need_op) {
     llms_cxe_reset(a, b); long double v = llms_cxe_expr(0); llms_cxe_ws();
     if (llms_cxe_bad || llms_cxe_p != b || llms_cxe_ops < need_op) return 0;
     *out = v; return 1;
@@ -823,7 +816,7 @@ static int llms_calc_start(ds4_engine *engine) {
     int qmark = 0; if (e >= 2 && s[e - 1] == '?' && s[e - 2] == '=') { e--; qmark = 1; }
     if (e < 3 || s[e - 1] != '=') return 0;
     int j = e - 1; int sp_before = 0; while (j > 0 && s[j - 1] == ' ') { j--; sp_before = 1; }
-    int st = j;   /* walk back over the arithmetic stretch */
+    int st = j;
     while (st > 0) {
         const unsigned char c = (unsigned char)s[st - 1];
         if ((c >= '0' && c <= '9') || c == '.' || c == ',' || c == '+' || c == '-' || c == '*' || c == '/' || c == '(' || c == ')' || c == ' ') { st--; continue; }
@@ -833,7 +826,7 @@ static int llms_calc_start(ds4_engine *engine) {
     }
     long double R = 0; int found = 0, chain = 0;
     for (int k = st; k < j && !found; k++) {
-        if (s[k] == '/') {   /* a '/'-step after a result: '= 18.2; /5 =' -- A is the number after the previous '=' */
+        if (s[k] == '/') {
             int q = k - 1; while (q >= 0 && s[q] == ' ') q--;
             if (!(q >= 0 && (s[q] == ';' || s[q] == '.' || s[q] == ','))) continue;
             q--; while (q >= 0 && s[q] == ' ') q--;
@@ -847,9 +840,9 @@ static int llms_calc_start(ds4_engine *engine) {
         }
         if (!((s[k] >= '0' && s[k] <= '9') || s[k] == '(')) continue;
         { int q = k - 1; while (q >= 0 && s[q] == ' ') q--;
-          if (q >= 0 && ((s[q] >= '0' && s[q] <= '9') || s[q] == '.' || s[q] == ',' || s[q] == '+' || s[q] == '-' || s[q] == '*' || s[q] == '/' || (s[q] == 'x' && !(q > 0 && ((s[q - 1] >= 'a' && s[q - 1] <= 'z') || (s[q - 1] >= 'A' && s[q - 1] <= 'Z')))) || (unsigned char)s[q] == 0x97 || s[q] == ')')) continue; }   /* a word ending in 'x' ('max', 'tax') is not the glyph */
+          if (q >= 0 && ((s[q] >= '0' && s[q] <= '9') || s[q] == '.' || s[q] == ',' || s[q] == '+' || s[q] == '-' || s[q] == '*' || s[q] == '/' || (s[q] == 'x' && !(q > 0 && ((s[q - 1] >= 'a' && s[q - 1] <= 'z') || (s[q - 1] >= 'A' && s[q - 1] <= 'Z')))) || (unsigned char)s[q] == 0x97 || s[q] == ')')) continue; }
         if (llms_cxe_eval(s + k, s + j, &R, 1)) {
-            if (llms_cxe_ops == 1 && !llms_cxe_div && memchr(s + k, '-', (size_t)(j - k))) { const long double A0 = strtold(s + k, NULL); if (A0 >= 1900 && A0 <= 2100) { llms_calc_skipped++; return 0; } }   /* '2023-24' is a year range */
+            if (llms_cxe_ops == 1 && !llms_cxe_div && memchr(s + k, '-', (size_t)(j - k))) { const long double A0 = strtold(s + k, NULL); if (A0 >= 1900 && A0 <= 2100) { llms_calc_skipped++; return 0; } }
             found = 1;
         }
     }
@@ -877,10 +870,10 @@ static int llms_calc_start(ds4_engine *engine) {
     ds4_tokens_free(&tv);
     if (llms_calc_n <= 0) return 0;
     llms_calc_fired++; llms_calc_cur = 0;
-    { int from = e - 40; if (from < 0) from = 0; fprintf(stderr, "llms: think calc: '%.*s' -> '%s'%s\n", e - from, s + from, out, chain ? " (expression, after a result)" : " (expression)"); }
+    { int from = e - 40; if (from < 0) from = 0; ((void)0); }
     return 1;
 }
-static int llms_wrap_start(ds4_engine *engine) {   /* llms THINK_WRAP: tokenize the text once; 1 = a wrap starts now */
+static int llms_wrap_start(ds4_engine *engine) {
     const char *fp = getenv("LLMS_DS4_THINK_WRAP"); char buf[1024]; size_t n = 0;
     if (!(fp && *fp)) { llms_wrap_cur = -2; return 0; }
     for (const char *q = fp; *q && n + 1 < sizeof buf; q++) { if (q[0] == '\\' && q[1] == 'n') { buf[n++] = '\n'; q++; } else buf[n++] = *q; }
@@ -889,18 +882,16 @@ static int llms_wrap_start(ds4_engine *engine) {   /* llms THINK_WRAP: tokenize 
     llms_wrap_n = 0; for (int k = 0; k < tv.len && k < 256; k++) llms_wrap_tok[llms_wrap_n++] = tv.v[k];
     ds4_tokens_free(&tv);
     if (llms_wrap_n <= 0) { llms_wrap_cur = -2; return 0; }
-    llms_wrap_cur = 0; fprintf(stderr, "llms: think wrap (%d tokens forced inside the thinking before the forced close) -- FIDELITY DIAL\n", llms_wrap_n);
-    { const char *u = getenv("LLMS_DS4_WRAP_UNCAP"); llms_wrap_uncap = u && *u && *u != '0'; atexit_b(^{ fprintf(stderr, "llms wrap: %llu tokens forced, %llu extra tokens emitted by forced iterations (singleton cap %s)\n", llms_wrap_forced_total, llms_wrap_extra, llms_wrap_uncap ? "OFF" : "on"); }); }   /* llms THINK_WRAP singleton cap */
+    llms_wrap_cur = 0; ((void)0);
+    { const char *u = getenv("LLMS_DS4_WRAP_UNCAP"); llms_wrap_uncap = u && *u && *u != '0'; atexit_b(^{ ((void)0); }); }
     return 1;
 }
-/* llms FINAL_LOOP (apply_final_loop.py): the thinking's LOOPBREAK rule on the FINAL channel; mode 1 = stop the answer, 2 = force '\n\nFLAWS:' */
 static int llms_fl_mode, llms_fl_fired, llms_fl_done, llms_fl_started, llms_fl_tok[16], llms_fl_n, llms_fl_cur = -1; static unsigned long long llms_fl_forced;
 static int llms_fl_feed(int tok) { if (!llms_fl_started) { tlb_reset(); llms_fl_started = 1; } return tlb_feed(tok); }
-/* llms FINAL_PROGRESS (apply_final_progress.py): force the FLAWS: opening when N answer tokens pass without a NEW 'N<digits>' line-start tag; needs FINAL_LOOP */
 static long llms_fp_n = -2, llms_fp_idle; static int llms_fp_state, llms_fp_num, llms_fp_fired; static unsigned char llms_fp_seen[1024];
-static void llms_fp_init(void) { if (llms_fp_n != -2) return; const char *e = getenv("LLMS_DS4_FINAL_PROGRESS"); llms_fp_n = (e && *e) ? atol(e) : 0; if (llms_fp_n > 0) fprintf(stderr, "llms: final progress %ld (an answer with no new N<digits> line-start tag for %ld tokens forces the FLAWS: opening; needs FINAL_LOOP) -- FIDELITY DIAL\n", llms_fp_n, llms_fp_n); }
+static void llms_fp_init(void) { if (llms_fp_n != -2) return; const char *e = getenv("LLMS_DS4_FINAL_PROGRESS"); llms_fp_n = (e && *e) ? atol(e) : 0; if (llms_fp_n > 0) ((void)0); }
 static void llms_fp_tag(int num) { if (num >= 0 && num < 1024 && !llms_fp_seen[num]) { llms_fp_seen[num] = 1; llms_fp_idle = 0; } }
-static void llms_fp_feed(const char *p, size_t n) {   /* one piece = one token */
+static void llms_fp_feed(const char *p, size_t n) {
     llms_fp_init(); if (llms_fp_n <= 0) return; llms_fp_idle++;
     for (size_t i = 0; i < n; i++) {
         const unsigned char c = (unsigned char)p[i]; const int digit = c >= '0' && c <= '9', word = digit || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c >= 128;
@@ -914,20 +905,18 @@ static void llms_fp_feed(const char *p, size_t n) {   /* one piece = one token *
         if (llms_fp_state == 2) { if (digit) { llms_fp_state = 3; llms_fp_num = c - '0'; } else llms_fp_state = 1; continue; }
     }
 }
-static int llms_fp_hit(void) {   /* 1 once, when N answer tokens have passed since the last new tag */
+static int llms_fp_hit(void) {
     if (llms_fp_n <= 0 || llms_fp_fired || llms_fp_idle < llms_fp_n) return 0;
-    llms_fp_fired = 1; fprintf(stderr, "llms: final progress: %ld answer tokens since the last new tag line, the FLAWS: opening is forced\n", llms_fp_idle); return 1;
+    llms_fp_fired = 1; ((void)0); return 1;
 }
 
 static int llms_fl_start(ds4_engine *engine) {
     ds4_tokens tv = {0}; ds4_tokenize_text(engine, "\n\nFLAWS:", &tv);
     llms_fl_n = 0; for (int k = 0; k < tv.len && k < 16; k++) llms_fl_tok[llms_fl_n++] = tv.v[k];
     ds4_tokens_free(&tv); llms_fl_cur = llms_fl_n > 0 ? 0 : -2;
-    fprintf(stderr, "llms: final loop: %d tokens of the FLAWS: opening forced\n", llms_fl_n);
     return llms_fl_n > 0;
 }
 
-/* llms THINK_COVER (apply_think_cover.py): coverage-driven thinking: close g tokens after every finding tag of the prompt opened a line, at the next line end; nudge the loop rule onto the lowest unanalysed finding up to m times; off unless LLMS_DS4_THINK_COVER is set */
 static long llms_cov_g = -2, llms_cov_at = -1, llms_cov_min = 0, llms_cov_nl_at_g = -1, llms_cov_nudge_max, llms_cov_nudges, llms_cov_pace, llms_cov_idle; static int llms_cov_n, llms_cov_state, llms_cov_num, llms_cov_seen_n, llms_cov_fired, llms_cov_nudge_tok[48], llms_cov_nudge_n, llms_cov_nudge_cur = -1; static unsigned char llms_cov_seen[1024], llms_cov_inprompt[1024];
 static int llms_cov_isw(int c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c >= 128; }
 static void llms_cov_init(const char *prompt) {
@@ -942,17 +931,16 @@ static void llms_cov_init(const char *prompt) {
     }
     int n = 0; while (n + 1 < 1024 && llms_cov_inprompt[n + 1]) n++;
     llms_cov_n = n;
-    { const char *ct = getenv("LLMS_DS4_THINK_COVER_TAGS");   /* llms THINK_COVER_TAGS (apply_cover_tags.py): only the listed tags count; the rest are marked seen */
+    { const char *ct = getenv("LLMS_DS4_THINK_COVER_TAGS");
       if (ct && *ct && n >= 3) { static unsigned char want[1024]; int nw = 0; for (const char *q = ct; *q; ) { while (*q && (*q < '0' || *q > '9')) q++; if (!*q) break; int v = 0; while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; } if (v >= 1 && v <= n && !want[v]) { want[v] = 1; nw++; } }
         if (nw > 0) { for (int k = 1; k <= n; k++) if (!want[k]) { llms_cov_seen[k] = 1; llms_cov_seen_n++; }
-          fprintf(stderr, "llms: think cover tags: %d of the prompt's %d finding tags count for the cover, nudge and pace rules; the other %d are marked seen [LLMS_DS4_THINK_COVER_TAGS]\n", nw, n, n - nw); } } }
-    if (n < 3) { fprintf(stderr, "llms: think cover: %d finding tags in the prompt, the rule stays off\n", n); llms_cov_g = -1; return; }
-    fprintf(stderr, "llms: think cover (the thinking closes %ld tokens after all %d finding tags of the prompt have opened a line, at the next line end; %ld loop nudges allowed; the loop rule and the budget stay as fallbacks) -- FIDELITY DIAL\n", llms_cov_g, n, llms_cov_nudge_max);
-    if (llms_cov_pace > 0) fprintf(stderr, "llms: think pace (%ld thinking tokens without a new finding tag force the next unanalysed finding's tag line, within the nudge budget) -- FIDELITY DIAL\n", llms_cov_pace);
+          ((void)0); } } }
+    if (n < 3) { ((void)0); llms_cov_g = -1; return; }
+    if (llms_cov_pace > 0) ((void)0);
 }
-static void llms_cov_feed(const char *p, size_t n) {   /* the thinking's pieces, one piece = one token; forced pieces included */
+static void llms_cov_feed(const char *p, size_t n) {
     if (llms_cov_g < 0 || llms_cov_n <= 0) return;
-    llms_cov_idle++;   /* THINK_PACE: one piece = one token since the last new finding tag */
+    llms_cov_idle++;
     for (size_t i = 0; i < n; i++) {
         const unsigned char c = (unsigned char)p[i]; const int digit = c >= '0' && c <= '9', word = llms_cov_isw(c);
         if (llms_cov_state == 3) {
@@ -965,23 +953,21 @@ static void llms_cov_feed(const char *p, size_t n) {   /* the thinking's pieces,
         if (llms_cov_state == 2) { if (digit) { llms_cov_state = 3; llms_cov_num = c - '0'; } else llms_cov_state = 1; continue; }
     }
 }
-static int llms_cov_hit(int generated, unsigned long nl_count) {   /* 1 once, when the close is due: coverage complete, g tokens later, at a line end */
+static int llms_cov_hit(int generated, unsigned long nl_count) {
     if (llms_cov_g < 0 || llms_cov_fired || llms_cov_n <= 0 || llms_cov_seen_n < llms_cov_n) return 0;
     if (llms_cov_at < 0) llms_cov_at = generated;
     if (generated < llms_cov_min || generated - llms_cov_at < llms_cov_g) return 0;
     if (llms_cov_nl_at_g < 0) llms_cov_nl_at_g = (long)nl_count;
     if ((long)nl_count <= llms_cov_nl_at_g && generated - llms_cov_at < llms_cov_g + 300) return 0;
-    llms_cov_fired = 1; fprintf(stderr, "llms: think cover fired at completion %d: all %d finding tags opened by completion %ld, grace %ld\n", generated, llms_cov_n, llms_cov_at, llms_cov_g); return 1;
+    llms_cov_fired = 1; ((void)0); return 1;
 }
-/* llms THINK_HOLD (apply_think_hold.py): LLMS_DS4_THINK_HOLD=N -- while the thinking is open and fewer than N tokens are generated, the close token is excluded from every draw (the engine's sampler and the speculative acceptance); the budget, loop and cover rules still close; off unless set */
 void ds4_llms_ban_token(int tok); unsigned long long ds4_llms_ban_rows(void); unsigned long long ds4_llms_ban_live(void);
-/* llms THINK_CHECK (apply_think_check.py): LLMS_DS4_THINK_CHECK=k -- with the hold on, the first k times the close is the row's most likely token a check sentence is forced instead; the (k+1)-th releases the hold; off unless set */
 int ds4_llms_ban_take_wanted(void); unsigned long long ds4_llms_ban_wants(void);
 static long llms_ck_max = -2, llms_ck_used; static int llms_ck_tok[128], llms_ck_n, llms_ck_cur = -1, llms_ck_released;
 static int llms_ck_on(void) {
     if (llms_ck_max == -2) { const char *e = getenv("LLMS_DS4_THINK_CHECK"); llms_ck_max = (e && *e) ? atol(e) : 0; if (llms_ck_max < 0) llms_ck_max = 0;
-        if (llms_ck_max > 0) { fprintf(stderr, "llms: think check %ld (with the hold on: the first %ld times the close is the most likely token a check sentence is forced; then the hold releases) -- FIDELITY DIAL\n", llms_ck_max, llms_ck_max);
-            atexit_b(^{ fprintf(stderr, "llms think check: %ld checks forced, %llu rows with the close most likely, released %d\n", llms_ck_used, ds4_llms_ban_wants(), llms_ck_released); }); } }
+        if (llms_ck_max > 0) { ((void)0);
+            atexit_b(^{ ((void)(llms_ck_used), (void)(ds4_llms_ban_wants()), (void)(llms_ck_released)); }); } }
     return llms_ck_max > 0;
 }
 static int llms_ck_start(ds4_engine *engine, int generated) {
@@ -994,7 +980,7 @@ static int llms_ck_start(ds4_engine *engine, int generated) {
     llms_ck_n = 0; for (int k = 0; k < tv.len && k < 128; k++) llms_ck_tok[llms_ck_n++] = tv.v[k];
     ds4_tokens_free(&tv);
     if (llms_ck_n <= 0) return 0;
-    llms_ck_cur = 0; fprintf(stderr, "llms: think check %ld of %ld at completion %d: %d tokens forced at the model's stopping point\n", llms_ck_used + 1, llms_ck_max, generated, llms_ck_n);
+    llms_ck_cur = 0; ((void)0);
     return 1;
 }
 
@@ -1002,13 +988,12 @@ static long llms_hold_n = -2; static int llms_hold_set = -1;
 static void llms_hold_init(void) {
     if (llms_hold_n != -2) return;
     const char *e = getenv("LLMS_DS4_THINK_HOLD"); llms_hold_n = (e && *e) ? atol(e) : 0; if (llms_hold_n < 0) llms_hold_n = 0;
-    if (llms_hold_n > 0) { fprintf(stderr, "llms: think hold %ld (the close token is excluded from every draw until %ld thinking tokens; the budget, the loop rule and the cover rule still close) -- FIDELITY DIAL\n", llms_hold_n, llms_hold_n);
-        atexit_b(^{ fprintf(stderr, "llms think hold: %llu draws held, %llu of them with the close a candidate\n", ds4_llms_ban_rows(), ds4_llms_ban_live()); }); }
+    if (llms_hold_n > 0) { ((void)0);
+        atexit_b(^{ ((void)(ds4_llms_ban_rows()), (void)(ds4_llms_ban_live())); }); }
 }
-/* llms THINK_LOOP_REDIRECT (apply_loopredirect.py): the repetition rule redirects instead of closing, k times; off unless set */
 static long llms_rd_max = -2, llms_rd_used; static int llms_rd_tok[96], llms_rd_n, llms_rd_cur = -1, llms_tlb_fired_now;
 static int llms_rd_ok(void) {
-    if (llms_rd_max == -2) { const char *e = getenv("LLMS_DS4_THINK_LOOP_REDIRECT"); llms_rd_max = (e && *e) ? atol(e) : 0; if (llms_rd_max > 0) fprintf(stderr, "llms: think loop redirect (%ld: the repetition rule forces a redirect sentence and resets instead of closing the thinking, up to %ld times) -- FIDELITY DIAL\n", llms_rd_max, llms_rd_max); }
+    if (llms_rd_max == -2) { const char *e = getenv("LLMS_DS4_THINK_LOOP_REDIRECT"); llms_rd_max = (e && *e) ? atol(e) : 0; if (llms_rd_max > 0) ((void)0); }
     return llms_rd_max > 0 && llms_rd_used < llms_rd_max && llms_rd_cur == -1 && llms_tlb_fired_now;
 }
 static int llms_rd_start(ds4_engine *engine) {
@@ -1021,60 +1006,58 @@ static int llms_rd_start(ds4_engine *engine) {
     llms_rd_n = 0; for (int k = 0; k < tv.len && k < 96; k++) llms_rd_tok[llms_rd_n++] = tv.v[k];
     ds4_tokens_free(&tv);
     if (llms_rd_n <= 0) return 0;
-    llms_rd_cur = 0; fprintf(stderr, "llms: think loop redirect %ld of %ld: %d tokens forced instead of the close\n", llms_rd_used + 1, llms_rd_max, llms_rd_n);
+    llms_rd_cur = 0; ((void)0);
     return 1;
 }
 static int llms_cov_nudge_ok(void) { return llms_cov_g >= 0 && llms_cov_n > 0 && llms_cov_nudges < llms_cov_nudge_max && llms_cov_seen_n < llms_cov_n && llms_cov_nudge_cur == -1; }
-static int llms_cov_pace_due(void) { return llms_cov_pace > 0 && llms_cov_idle >= llms_cov_pace && llms_cov_seen_n < llms_cov_n; }   /* THINK_PACE */
+static int llms_cov_pace_due(void) { return llms_cov_pace > 0 && llms_cov_idle >= llms_cov_pace && llms_cov_seen_n < llms_cov_n; }
 static int llms_cov_lowest_unseen(void) { for (int k = 1; k <= llms_cov_n; k++) if (!llms_cov_seen[k]) return k; return 0; }
 
-static int llms_cov_nudge_start(ds4_engine *engine) {   /* copies llms_fl_start: the nudge text is tokenized once per nudge */
+static int llms_cov_nudge_start(ds4_engine *engine) {
     const int k = llms_cov_lowest_unseen(); if (k <= 0) return 0;
     char buf[96]; snprintf(buf, sizeof buf, "\n\nStill open; I move on to the next finding.\nN%d:", k);
     ds4_tokens tv = {0}; ds4_tokenize_text(engine, buf, &tv);
     llms_cov_nudge_n = 0; for (int j = 0; j < tv.len && j < 48; j++) llms_cov_nudge_tok[llms_cov_nudge_n++] = tv.v[j];
     ds4_tokens_free(&tv); llms_cov_nudge_cur = llms_cov_nudge_n > 0 ? 0 : -1;
-    fprintf(stderr, "llms: think cover nudge %ld of %ld (%s, %ld tokens since the last new finding tag): %d tokens force finding N%d (%d of %d finding tags opened)\n", llms_cov_nudges + 1, llms_cov_nudge_max, llms_loop_fired ? "loop rule" : "pace rule", llms_cov_idle, llms_cov_nudge_n, k, llms_cov_seen_n, llms_cov_n);
     return llms_cov_nudge_n > 0;
 }
 static int llms_cg_n, llms_cg_left, llms_cx_n, llms_cx_end = -1;
-static long llms_eol_n = -2; static unsigned long llms_nl_count, llms_nl_at_budget; static int llms_nl_marked;   /* llms THINK_BUDGET_EOL */
-static int llms_budget_hit(long budget, int generated) {   /* llms THINK_BUDGET_EOL: the raw condition (generated >= budget), unless LLMS_DS4_THINK_BUDGET_EOL=N defers the forced close up to N tokens to the end of the current line */
+static long llms_eol_n = -2; static unsigned long llms_nl_count, llms_nl_at_budget; static int llms_nl_marked;
+static int llms_budget_hit(long budget, int generated) {
     if (budget <= 0 || generated < budget) return 0;
-    if (llms_eol_n == -2) { const char *e = getenv("LLMS_DS4_THINK_BUDGET_EOL"); llms_eol_n = (e && *e) ? atol(e) : 0; if (llms_eol_n > 0) fprintf(stderr, "llms: think budget eol (the budget's forced close waits up to %ld tokens for the end of the line) -- FIDELITY DIAL\n", llms_eol_n); }
+    if (llms_eol_n == -2) { const char *e = getenv("LLMS_DS4_THINK_BUDGET_EOL"); llms_eol_n = (e && *e) ? atol(e) : 0; if (llms_eol_n > 0) ((void)0); }
     if (llms_eol_n <= 0) return 1;
     if (!llms_nl_marked) { llms_nl_marked = 1; llms_nl_at_budget = llms_nl_count; }
     return llms_nl_count > llms_nl_at_budget || generated >= budget + llms_eol_n;
 }
-static int llms_ew_from = -1, llms_ew_on, llms_ew_done;   /* llms ESC_WINDOW: exact routing from completion G until the close */   /* llms CLOSE_GREEDY / CLOSE_EXACT */
-static int llms_probe_k, llms_isolate_now;   /* llms CLOSE_PROBE; the close token is evaluated alone */
+static int llms_ew_from = -1, llms_ew_on, llms_ew_done;   
+static int llms_probe_k, llms_isolate_now;
 static void llms_probe_print(ds4_engine *engine, ds4_session *session, const char *tag) {
     ds4_token_score sc[32]; const int k = llms_probe_k > 32 ? 32 : llms_probe_k; const int n = ds4_session_top_logprobs(session, sc, k);
-    fprintf(stderr, "llms close probe [%s]:", tag);
-    for (int i = 0; i < n; i++) { size_t len = 0; char *txt = ds4_token_text(engine, sc[i].id, &len); fprintf(stderr, " %d:%.4f:'", sc[i].id, sc[i].logprob);
+    for (int i = 0; i < n; i++) { size_t len = 0; char *txt = ds4_token_text(engine, sc[i].id, &len); ((void)0);
         for (size_t q = 0; txt && q < len && q < 14; q++) { const unsigned char c = (unsigned char)txt[q]; fputc(c == '\n' ? '~' : (c == '\'' ? '`' : (c < 32 ? '?' : c)), stderr); } fputc('\'', stderr); free(txt); }
     fputc('\n', stderr);
 }
-static void llms_snap_dump(ds4_session *session, const char *tag) {   /* llms CLOSE_SNAPSHOT: the session payload (window rows, compressed latents, index keys) to <dir>/<tag>.kv */
+static void llms_snap_dump(ds4_session *session, const char *tag) {
     const char *dir = getenv("LLMS_DS4_CLOSE_SNAPSHOT"); if (!dir || !*dir) return;
     ds4_session_snapshot sn = {0}; char serr[160]; serr[0] = 0;
-    if (ds4_session_save_snapshot(session, &sn, serr, sizeof serr) != 0) { fprintf(stderr, "llms close snapshot [%s]: failed (%s)\n", tag, serr); return; }
+    if (ds4_session_save_snapshot(session, &sn, serr, sizeof serr) != 0) { ((void)0); return; }
     char path[1024]; snprintf(path, sizeof path, "%s/%s.kv", dir, tag); FILE *sf = fopen(path, "wb");
-    if (sf) { fwrite(sn.ptr, 1, (size_t)sn.len, sf); fclose(sf); fprintf(stderr, "llms close snapshot [%s]: %llu bytes -> %s\n", tag, (unsigned long long)sn.len, path); }
-    else fprintf(stderr, "llms close snapshot [%s]: cannot open %s\n", tag, path);
+    if (sf) { fwrite(sn.ptr, 1, (size_t)sn.len, sf); fclose(sf); ((void)0); }
+    else ((void)0);
     ds4_session_snapshot_free(&sn);
 }
 static void llms_think_switches_init(void) {
     if (llms_loop_on >= 0) return;
-    { const char *e = getenv("LLMS_DS4_THINK_LOOP"); llms_loop_on = e && *e && *e != '0'; if (llms_loop_on) { tlb_reset(); fprintf(stderr, "llms: think loop (LOOPBREAK: the last 512 token 8-grams >= 90 %% repeats close the thinking) -- FIDELITY DIAL\n"); } }
-    { const char *e = getenv("LLMS_DS4_STOP_LINE"); llms_stop_on = e && *e && *e != '0'; if (llms_stop_on) { snprintf(llms_stop_prefix, sizeof llms_stop_prefix, "%s", e); fprintf(stderr, "llms: stop line (generation stops at the first completed line that begins with '%s' after the thinking has closed) -- FIDELITY DIAL\n", llms_stop_prefix); } }
-    { const char *e = getenv("LLMS_DS4_CLOSE_GREEDY"); llms_cg_n = e && *e ? atoi(e) : 0; if (llms_cg_n < 0) llms_cg_n = 0; if (llms_cg_n) fprintf(stderr, "llms: close greedy %d (after the thinking has closed the first token of each of the next %d decode cycles is the argmax) -- FIDELITY DIAL\n", llms_cg_n, llms_cg_n); }
-    { const char *e = getenv("LLMS_DS4_ESC_WINDOW"); if (e && *e) { llms_ew_from = atoi(e); if (llms_ew_from < 0) llms_ew_from = 0; fprintf(stderr, "llms: esc window (exact routing from completion %d until the thinking closes; the shipped dials return at the close) -- FIDELITY DIAL\n", llms_ew_from); } }   /* llms ESC_WINDOW */
-        { const char *e = getenv("LLMS_DS4_CLOSE_EXACT"); llms_cx_n = e && *e ? atoi(e) : 0; if (llms_cx_n < 0) llms_cx_n = 0; if (llms_cx_n) fprintf(stderr, "llms: close exact %d (after the thinking has closed the decode runs on exact routing for %d generated tokens) -- FIDELITY DIAL\n", llms_cx_n, llms_cx_n); }
-    { const char *e = getenv("LLMS_DS4_CLOSE_PROBE"); llms_probe_k = e && *e ? atoi(e) : 0; if (llms_probe_k < 0) llms_probe_k = 0; if (llms_probe_k) fprintf(stderr, "llms: close probe %d (the top-%d next-token logprobs at the first position after the thinking's close are printed, before and after a rebuild) -- FIDELITY DIAL\n", llms_probe_k, llms_probe_k); }
-    { const char *e = getenv("LLMS_DS4_CLOSE_SNAPSHOT"); if (e && *e) fprintf(stderr, "llms: close snapshot (the session payload at the close is written to %s/dec.kv before a rebuild, reb.kv after it, pre.kv for a prompt that ends on the close) -- INSTRUMENT\n", e); }
-    { const char *e = getenv("LLMS_DS4_THINK_REREAD"); llms_reread_on = e && *e && *e != '0'; if (llms_reread_on) fprintf(stderr, "llms: think reread (at the thinking's close the session state is rebuilt by a full prefill of its own tokens) -- FIDELITY DIAL\n"); }
-    { const char *e = getenv("LLMS_DS4_FINAL_LOOP"); llms_fl_mode = (e && !strcmp(e, "stop")) ? 1 : (e && !strcmp(e, "flaws")) ? 2 : 0; if (llms_fl_mode) { fprintf(stderr, "llms: final loop (%s: the last 512 token 8-grams >= 90 %% repeats after the thinking has closed %s) -- FIDELITY DIAL\n", e, llms_fl_mode == 1 ? "stop the answer" : "force a FLAWS: line"); atexit_b(^{ fprintf(stderr, "llms final loop: fired %d, FLAWS tokens forced %llu\n", llms_fl_fired, llms_fl_forced); }); } }   /* llms FINAL_LOOP */
+    { const char *e = getenv("LLMS_DS4_THINK_LOOP"); llms_loop_on = e && *e && *e != '0'; if (llms_loop_on) { tlb_reset(); ((void)0); } }
+    { const char *e = getenv("LLMS_DS4_STOP_LINE"); llms_stop_on = e && *e && *e != '0'; if (llms_stop_on) { snprintf(llms_stop_prefix, sizeof llms_stop_prefix, "%s", e); ((void)0); } }
+    { const char *e = getenv("LLMS_DS4_CLOSE_GREEDY"); llms_cg_n = e && *e ? atoi(e) : 0; if (llms_cg_n < 0) llms_cg_n = 0; if (llms_cg_n) ((void)0); }
+    { const char *e = getenv("LLMS_DS4_ESC_WINDOW"); if (e && *e) { llms_ew_from = atoi(e); if (llms_ew_from < 0) llms_ew_from = 0; ((void)0); } }
+        { const char *e = getenv("LLMS_DS4_CLOSE_EXACT"); llms_cx_n = e && *e ? atoi(e) : 0; if (llms_cx_n < 0) llms_cx_n = 0; if (llms_cx_n) ((void)0); }
+    { const char *e = getenv("LLMS_DS4_CLOSE_PROBE"); llms_probe_k = e && *e ? atoi(e) : 0; if (llms_probe_k < 0) llms_probe_k = 0; if (llms_probe_k) ((void)0); }
+    { const char *e = getenv("LLMS_DS4_CLOSE_SNAPSHOT"); if (e && *e) ((void)0); }
+    { const char *e = getenv("LLMS_DS4_THINK_REREAD"); llms_reread_on = e && *e && *e != '0'; if (llms_reread_on) ((void)0); }
+    { const char *e = getenv("LLMS_DS4_FINAL_LOOP"); llms_fl_mode = (e && !strcmp(e, "stop")) ? 1 : (e && !strcmp(e, "flaws")) ? 2 : 0; if (llms_fl_mode) { ((void)0); atexit_b(^{ ((void)0); }); } }
 }
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
@@ -1124,9 +1107,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     ds4_session_set_progress(session, NULL, NULL);
     ds4_session_set_display_progress(session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
-    llms_scrub_init();   /* llms THINK_SCRUB: the first snapshot is the prompt's own prefill-built state */
+    llms_scrub_init();
     if (llms_scrub_w > 0) { char serr[160]; serr[0] = 0; llms_scrub_have = llms_scrub_native ? ds4_session_llms_scrub_mark(session) == 0 : ds4_session_save_snapshot(session, &llms_scrub_snap, serr, sizeof serr) == 0; llms_scrub_next = llms_scrub_w;
-        if (!llms_scrub_have) fprintf(stderr, "llms think scrub: the first snapshot failed (%s); the first scrub will rebuild from the prompt\n", serr); }
+        if (!llms_scrub_have) ((void)0); }
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(session) - ds4_session_pos(session);
@@ -1145,13 +1128,13 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     bool have_greedy_next = false;
     int greedy_next = -1;
     const double t_decode0 = cli_now_sec();
-    llms_think_switches_init();   /* llms CLOSE_PROBE: a prompt that ends on the close token is already a state at the first-token position */
+    llms_think_switches_init();
     if (llms_probe_k > 0 && prompt->len > 0 && prompt->v[prompt->len - 1] == ds4_token_think_end(engine)) llms_probe_print(engine, session, "prefilled");
     if (prompt->len > 0 && prompt->v[prompt->len - 1] == ds4_token_think_end(engine)) llms_snap_dump(session, "pre");
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        if (llms_cx_end >= 0 && generated >= llms_cx_end) { ds4_session_escalate(session, 0); llms_cx_end = -1; }   /* llms CLOSE_EXACT: the shipped dials return */
-        if (llms_ew_from >= 0 && !llms_ew_on && !llms_ew_done && generated >= llms_ew_from) { ds4_session_escalate(session, 1); llms_ew_on = 1; fprintf(stderr, "llms: esc window opens at completion %d\n", generated); }   /* llms ESC_WINDOW */
-        if (llms_think_reread_pending) {   /* llms THINK_REREAD: the thinking has closed; rebuild the state by a full prefill of the session's own tokens */
+        if (llms_cx_end >= 0 && generated >= llms_cx_end) { ds4_session_escalate(session, 0); llms_cx_end = -1; }
+        if (llms_ew_from >= 0 && !llms_ew_on && !llms_ew_done && generated >= llms_ew_from) { ds4_session_escalate(session, 1); llms_ew_on = 1; ((void)0); }
+        if (llms_think_reread_pending) {
             llms_think_reread_pending = 0;
             const ds4_tokens *ck = ds4_session_tokens(session);
             if (ck && ck->len > 0) {
@@ -1162,75 +1145,75 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 const int rrc = ds4_session_sync(session, &full, rerr, sizeof(rerr));
                 cli_dist_busy_set(cfg, false);
                 if (rrc != 0) { fprintf(stderr, "ds4: think reread failed: %s\n", rerr); ds4_tokens_free(&full); ds4_session_free(session); return 1; }
-                fprintf(stderr, "llms: think reread: %d tokens re-prefilled after the close in %.1f s\n", full.len, cli_now_sec() - tr0);
+                ((void)(full.len), (void)(cli_now_sec() - tr0));
                 ds4_tokens_free(&full);
                 if (llms_probe_k > 0) llms_probe_print(engine, session, "rebuilt");
                 llms_snap_dump(session, "reb");
             }
         }
-        bool llms_wrap_forced_now = false;   /* llms THINK_WRAP singleton cap: only the forced token may be emitted this iteration */
-        llms_hold_init(); if (llms_hold_n > 0) { const int want = (llms_cli_inside > 0 && generated < llms_hold_n && !llms_ck_released) ? ds4_token_think_end(engine) : -1; if (want != llms_hold_set) { ds4_llms_ban_token(want); if (llms_hold_set >= 0 && want < 0) fprintf(stderr, "llms: think hold released at completion %d%s\n", generated, llms_cli_inside > 0 ? "" : " (the thinking had closed)"); llms_hold_set = want; } }   /* llms THINK_HOLD */
+        bool llms_wrap_forced_now = false;
+        llms_hold_init(); if (llms_hold_n > 0) { const int want = (llms_cli_inside > 0 && generated < llms_hold_n && !llms_ck_released) ? ds4_token_think_end(engine) : -1; if (want != llms_hold_set) { ds4_llms_ban_token(want); if (llms_hold_set >= 0 && want < 0) ((void)0); llms_hold_set = want; } }
         int token;
         if (greedy_argmax && have_greedy_next) {
             token = greedy_next;
             have_greedy_next = false;
         } else {
-            if (ind_pen < 0.0f) { const char *e = getenv("LLMS_DS4_IND_PEN"); ind_pen = e && *e ? (float)atof(e) : 0.0f; if (ind_pen > 0.0f) fprintf(stderr, "llms: IND_PEN %.3f on the single-token path\n", ind_pen); }
-            if (ind_pen > 0.0f) { const int it = ind_lookup(); if (it >= 0) { ds4_session_set_next_bias(session, it, -ind_pen); ind_hits++; } }   /* llms IND_PEN */
-            token = ds4_session_sample(session, llms_cg_left > 0 ? 0.0f : cfg->gen.temperature, 0,   /* llms CLOSE_GREEDY */
+            if (ind_pen < 0.0f) { const char *e = getenv("LLMS_DS4_IND_PEN"); ind_pen = e && *e ? (float)atof(e) : 0.0f; if (ind_pen > 0.0f) ((void)0); }
+            if (ind_pen > 0.0f) { const int it = ind_lookup(); if (it >= 0) { ds4_session_set_next_bias(session, it, -ind_pen); ind_hits++; } }
+            token = ds4_session_sample(session, llms_cg_left > 0 ? 0.0f : cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
         if (llms_cg_left > 0) llms_cg_left--;
-        if (llms_scrub_w > 0 && (generated >= llms_scrub_next || (llms_scrub_close && generated > llms_scrub_last && (token == ds4_token_think_end(engine) || (llms_scrub_budget > 0 && generated == llms_scrub_budget))))) {   /* llms THINK_SCRUB: placed after the sample; a scrub re-samples from the rebuilt state; TWOSPEED: also at the close */
+        if (llms_scrub_w > 0 && (generated >= llms_scrub_next || (llms_scrub_close && generated > llms_scrub_last && (token == ds4_token_think_end(engine) || (llms_scrub_budget > 0 && generated == llms_scrub_budget))))) {
             llms_scrub_last = generated;
             const int llms_scrub_n_before = llms_scrub_n;
             const ds4_tokens *ck = ds4_session_tokens(session); const int te = ds4_token_think_end(engine); int open = 1;
             for (int q = prompt->len; ck && q < ck->len; q++) if (ck->v[q] == te) { open = 0; break; }
-            if (!open) { fprintf(stderr, "llms: think scrub retired at completion %d: the thinking has closed\n", generated); llms_scrub_w = 0; }
+            if (!open) { ((void)0); llms_scrub_w = 0; }
             else if (ck && ck->len > prompt->len) {
                 ds4_tokens full = {0}; for (int q = 0; q < ck->len; q++) ds4_tokens_push(&full, ck->v[q]);
                 char serr[160]; const double s0 = cli_now_sec(); int rows = full.len;
                 serr[0] = 0;
                 if (llms_scrub_have && (llms_scrub_native ? ds4_session_llms_scrub_restore(session) == 0 : ds4_session_load_snapshot(session, &llms_scrub_snap, serr, sizeof serr) == 0)) rows = full.len - ds4_session_pos(session);
-                else { if (llms_scrub_have) fprintf(stderr, "llms think scrub: restore failed (%s): a full rebuild\n", serr); ds4_session_invalidate(session); }
+                else { if (llms_scrub_have) ((void)0); ds4_session_invalidate(session); }
                 const double s1 = cli_now_sec();
                 cli_dist_busy_set(cfg, true); const int src = ds4_session_sync(session, &full, serr, sizeof serr); cli_dist_busy_set(cfg, false);
                 if (src != 0) { fprintf(stderr, "ds4: think scrub failed: %s\n", serr); ds4_tokens_free(&full); ds4_session_free(session); return 1; }
                 const double s2 = cli_now_sec();
                 llms_scrub_have = llms_scrub_native ? ds4_session_llms_scrub_mark(session) == 0 : ds4_session_save_snapshot(session, &llms_scrub_snap, serr, sizeof serr) == 0;
-                if (!llms_scrub_have) fprintf(stderr, "llms think scrub: snapshot failed (%s); the next scrub rebuilds from the prompt\n", serr);
+                if (!llms_scrub_have) ((void)0);
                 const double s3 = cli_now_sec(); llms_scrub_n++; llms_scrub_rows += rows; llms_scrub_s += s2 - s1; llms_scrub_aux_s += (s1 - s0) + (s3 - s2);
-                fprintf(stderr, "llms: think scrub %d at completion %d: %d rows re-prefilled in %.2f s (restore + snapshot %.2f s); state at %d\n", llms_scrub_n, generated, rows, s2 - s1, (s1 - s0) + (s3 - s2), ds4_session_pos(session));
+                ((void)(llms_scrub_n), (void)(generated), (void)(rows), (void)(s2 - s1), (void)((s1 - s0) + (s3 - s2)), (void)(ds4_session_pos(session)));
                 ds4_tokens_free(&full);
             }
             if (llms_scrub_w > 0) llms_scrub_next = generated + llms_scrub_w;
-            if (llms_scrub_n_before != llms_scrub_n && !(greedy_argmax && have_greedy_next)) token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, cfg->gen.min_p, &rng);   /* the token comes from the rebuilt state */
+            if (llms_scrub_n_before != llms_scrub_n && !(greedy_argmax && have_greedy_next)) token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
-        {   /* llms CLI_THINK_BUDGET (apply_cli_think_budget.py): the server's THINK_BUDGET / THINK_FORCE_PREFIX in the CLI */
+        {
             static long think_budget_value = -2; static int forced_opening_tokens[64]; static int forced_opening_count = 0, forced_opening_cursor = -1;
             if (think_budget_value == -2) { const char *e = getenv("LLMS_DS4_THINK_BUDGET"); think_budget_value = (e && *e) ? atol(e) : -1; }
             llms_think_switches_init();
             if (llms_cli_inside < 0) llms_cli_inside = ds4_think_mode_enabled(think_mode) ? 1 : 0;
             const int te = ds4_token_think_end(engine);
             if (forced_opening_cursor >= 0 && forced_opening_cursor < forced_opening_count) token = forced_opening_tokens[forced_opening_cursor++];
-            else if (llms_calc_cur >= 0 && llms_calc_cur < llms_calc_n && llms_cli_inside > 0) { token = llms_calc_tok[llms_calc_cur++]; llms_wrap_forced_now = true; if (llms_calc_cur >= llms_calc_n) llms_calc_cur = -1; }   /* llms THINK_CALC: the rest of a forced result */
-            else if ((llms_calc_init(), llms_calc_on > 0) && llms_cli_inside > 0 && token != te && llms_calc_start(engine)) { token = llms_calc_tok[llms_calc_cur++]; llms_wrap_forced_now = true; if (llms_calc_cur >= llms_calc_n) llms_calc_cur = -1; }   /* llms THINK_CALC: the first token of a forced result */
-            else if (llms_fl_fired && !llms_fl_done && llms_fl_mode == 2 && llms_cli_inside <= 0) { if (llms_fl_cur == -1) llms_fl_start(engine); if (llms_fl_cur >= 0 && llms_fl_cur < llms_fl_n) { token = llms_fl_tok[llms_fl_cur++]; llms_wrap_forced_now = true; llms_fl_forced++; if (llms_fl_cur >= llms_fl_n) llms_fl_done = 1; } else llms_fl_done = 1; }   /* llms FINAL_LOOP: the FLAWS: opening, one forced token an iteration */
-            else if (llms_cov_nudge_cur >= 0 && llms_cov_nudge_cur < llms_cov_nudge_n && llms_cli_inside) { token = llms_cov_nudge_tok[llms_cov_nudge_cur++]; llms_wrap_forced_now = true; if (llms_cov_nudge_cur >= llms_cov_nudge_n) { llms_cov_nudge_cur = -1; llms_cov_nudges++; llms_loop_fired = 0; tlb_reset(); } }   /* llms THINK_COVER: the rest of a nudge */
-            else if (llms_cov_nudge_ok() && (llms_loop_fired || llms_cov_pace_due()) && !llms_budget_hit(think_budget_value, generated) && llms_cli_inside && te >= 0 && token != te && llms_cov_nudge_start(engine)) { token = llms_cov_nudge_tok[llms_cov_nudge_cur++]; llms_wrap_forced_now = true; if (llms_cov_nudge_cur >= llms_cov_nudge_n) { llms_cov_nudge_cur = -1; llms_cov_nudges++; llms_loop_fired = 0; tlb_reset(); } }   /* llms THINK_COVER: the loop rule fired with findings unanalysed: force the next finding's tag line */
-            else if (llms_ck_cur >= 0 && llms_ck_cur < llms_ck_n && llms_cli_inside) { token = llms_ck_tok[llms_ck_cur++]; llms_wrap_forced_now = true; if (llms_ck_cur >= llms_ck_n) { llms_ck_cur = -1; llms_ck_used++; tlb_reset(); } }   /* llms THINK_CHECK: the rest of a check */
-            else if (llms_hold_set >= 0 && llms_ck_on() && llms_ck_cur == -1 && llms_cli_inside > 0 && te >= 0 && token != te && ds4_llms_ban_take_wanted()) {   /* llms THINK_CHECK: the close was the most likely token under the hold */
+            else if (llms_calc_cur >= 0 && llms_calc_cur < llms_calc_n && llms_cli_inside > 0) { token = llms_calc_tok[llms_calc_cur++]; llms_wrap_forced_now = true; if (llms_calc_cur >= llms_calc_n) llms_calc_cur = -1; }
+            else if ((llms_calc_init(), llms_calc_on > 0) && llms_cli_inside > 0 && token != te && llms_calc_start(engine)) { token = llms_calc_tok[llms_calc_cur++]; llms_wrap_forced_now = true; if (llms_calc_cur >= llms_calc_n) llms_calc_cur = -1; }
+            else if (llms_fl_fired && !llms_fl_done && llms_fl_mode == 2 && llms_cli_inside <= 0) { if (llms_fl_cur == -1) llms_fl_start(engine); if (llms_fl_cur >= 0 && llms_fl_cur < llms_fl_n) { token = llms_fl_tok[llms_fl_cur++]; llms_wrap_forced_now = true; llms_fl_forced++; if (llms_fl_cur >= llms_fl_n) llms_fl_done = 1; } else llms_fl_done = 1; }
+            else if (llms_cov_nudge_cur >= 0 && llms_cov_nudge_cur < llms_cov_nudge_n && llms_cli_inside) { token = llms_cov_nudge_tok[llms_cov_nudge_cur++]; llms_wrap_forced_now = true; if (llms_cov_nudge_cur >= llms_cov_nudge_n) { llms_cov_nudge_cur = -1; llms_cov_nudges++; llms_loop_fired = 0; tlb_reset(); } }
+            else if (llms_cov_nudge_ok() && (llms_loop_fired || llms_cov_pace_due()) && !llms_budget_hit(think_budget_value, generated) && llms_cli_inside && te >= 0 && token != te && llms_cov_nudge_start(engine)) { token = llms_cov_nudge_tok[llms_cov_nudge_cur++]; llms_wrap_forced_now = true; if (llms_cov_nudge_cur >= llms_cov_nudge_n) { llms_cov_nudge_cur = -1; llms_cov_nudges++; llms_loop_fired = 0; tlb_reset(); } }
+            else if (llms_ck_cur >= 0 && llms_ck_cur < llms_ck_n && llms_cli_inside) { token = llms_ck_tok[llms_ck_cur++]; llms_wrap_forced_now = true; if (llms_ck_cur >= llms_ck_n) { llms_ck_cur = -1; llms_ck_used++; tlb_reset(); } }
+            else if (llms_hold_set >= 0 && llms_ck_on() && llms_ck_cur == -1 && llms_cli_inside > 0 && te >= 0 && token != te && ds4_llms_ban_take_wanted()) {
                 if (llms_ck_used < llms_ck_max && llms_ck_start(engine, generated)) { token = llms_ck_tok[llms_ck_cur++]; llms_wrap_forced_now = true; if (llms_ck_cur >= llms_ck_n) { llms_ck_cur = -1; llms_ck_used++; tlb_reset(); } }
-                else if (llms_ck_used >= llms_ck_max && !llms_ck_released) { llms_ck_released = 1; fprintf(stderr, "llms: think check: %ld checks used; the hold releases at completion %d\n", llms_ck_used, generated); }
+                else if (llms_ck_used >= llms_ck_max && !llms_ck_released) { llms_ck_released = 1; ((void)0); }
             }
-            else if (llms_rd_cur >= 0 && llms_rd_cur < llms_rd_n && llms_cli_inside) { token = llms_rd_tok[llms_rd_cur++]; llms_wrap_forced_now = true; if (llms_rd_cur >= llms_rd_n) { llms_rd_cur = -1; llms_rd_used++; llms_loop_fired = 0; llms_tlb_fired_now = 0; tlb_reset(); } }   /* llms THINK_LOOP_REDIRECT: the rest of the redirect */
-            else if (llms_loop_fired && llms_rd_ok() && !llms_budget_hit(think_budget_value, generated) && llms_cli_inside && te >= 0 && token != te && llms_rd_start(engine)) { token = llms_rd_tok[llms_rd_cur++]; llms_wrap_forced_now = true; if (llms_rd_cur >= llms_rd_n) { llms_rd_cur = -1; llms_rd_used++; llms_loop_fired = 0; llms_tlb_fired_now = 0; tlb_reset(); } }   /* llms THINK_LOOP_REDIRECT: the repetition rule fired with budget left: redirect, do not close */
-            else if (llms_wrap_cur >= 0 && llms_wrap_cur < llms_wrap_n && llms_cli_inside) { token = llms_wrap_tok[llms_wrap_cur++]; llms_wrap_forced_now = true; llms_wrap_forced_total++; }   /* llms THINK_WRAP: the rest of the wrap text */
-            else if (llms_wrap_cur == -1 && (llms_budget_hit(think_budget_value, generated) || llms_loop_fired) && llms_cli_inside && te >= 0 && token != te && llms_wrap_start(engine)) { token = llms_wrap_tok[llms_wrap_cur++]; llms_wrap_forced_now = true; llms_wrap_forced_total++; }   /* llms THINK_WRAP: the first token */
+            else if (llms_rd_cur >= 0 && llms_rd_cur < llms_rd_n && llms_cli_inside) { token = llms_rd_tok[llms_rd_cur++]; llms_wrap_forced_now = true; if (llms_rd_cur >= llms_rd_n) { llms_rd_cur = -1; llms_rd_used++; llms_loop_fired = 0; llms_tlb_fired_now = 0; tlb_reset(); } }
+            else if (llms_loop_fired && llms_rd_ok() && !llms_budget_hit(think_budget_value, generated) && llms_cli_inside && te >= 0 && token != te && llms_rd_start(engine)) { token = llms_rd_tok[llms_rd_cur++]; llms_wrap_forced_now = true; if (llms_rd_cur >= llms_rd_n) { llms_rd_cur = -1; llms_rd_used++; llms_loop_fired = 0; llms_tlb_fired_now = 0; tlb_reset(); } }
+            else if (llms_wrap_cur >= 0 && llms_wrap_cur < llms_wrap_n && llms_cli_inside) { token = llms_wrap_tok[llms_wrap_cur++]; llms_wrap_forced_now = true; llms_wrap_forced_total++; }
+            else if (llms_wrap_cur == -1 && (llms_budget_hit(think_budget_value, generated) || llms_loop_fired) && llms_cli_inside && te >= 0 && token != te && llms_wrap_start(engine)) { token = llms_wrap_tok[llms_wrap_cur++]; llms_wrap_forced_now = true; llms_wrap_forced_total++; }
             else if ((llms_budget_hit(think_budget_value, generated) || llms_loop_fired) && llms_cli_inside && te >= 0 && token != te) {
                 token = te;
-                if (llms_loop_fired && !llms_budget_hit(think_budget_value, generated)) fprintf(stderr, "llms: think loop (LOOPBREAK) fired at completion %d: </think> forced\n", generated);
-                else fprintf(stderr, "llms: think budget %ld reached at completion %d: </think> forced\n", think_budget_value, generated);
+                if (llms_loop_fired && !llms_budget_hit(think_budget_value, generated)) ((void)0);
+                else ((void)0);
                 const char *fp = getenv("LLMS_DS4_THINK_FORCE_PREFIX");
                 if (fp && *fp && forced_opening_cursor < 0) {
                     char buf[256]; size_t n = 0;
@@ -1239,13 +1222,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                     ds4_tokens tv = {0}; ds4_tokenize_text(engine, buf, &tv);
                     forced_opening_count = 0; for (int k = 0; k < tv.len && k < 64; k++) forced_opening_tokens[forced_opening_count++] = tv.v[k];
                     ds4_tokens_free(&tv); forced_opening_cursor = 0;
-                    fprintf(stderr, "llms: answer opening forced after the think budget (%d tokens)\n", forced_opening_count);
                 }
             }
-            if (token == te) { if (llms_ew_on) { ds4_session_escalate(session, 0); llms_ew_on = 0; llms_ew_done = 1; fprintf(stderr, "llms: esc window closes at completion %d (the close row runs on the shipped dials)\n", generated); } if (llms_cli_inside && llms_reread_on) llms_think_reread_pending = 1; if (llms_cli_inside && llms_cg_n > 0) llms_cg_left = llms_cg_n; if (llms_cli_inside && llms_cx_n > 0) { ds4_session_escalate(session, 1); llms_cx_end = generated + llms_cx_n; } if (llms_cli_inside && (llms_reread_on || llms_cg_n > 0 || llms_cx_n > 0 || llms_probe_k > 0)) llms_isolate_now = 1; llms_cli_inside = 0; }
+            if (token == te) { if (llms_ew_on) { ds4_session_escalate(session, 0); llms_ew_on = 0; llms_ew_done = 1; ((void)0); } if (llms_cli_inside && llms_reread_on) llms_think_reread_pending = 1; if (llms_cli_inside && llms_cg_n > 0) llms_cg_left = llms_cg_n; if (llms_cli_inside && llms_cx_n > 0) { ds4_session_escalate(session, 1); llms_cx_end = generated + llms_cx_n; } if (llms_cli_inside && (llms_reread_on || llms_cg_n > 0 || llms_cx_n > 0 || llms_probe_k > 0)) llms_isolate_now = 1; llms_cli_inside = 0; }
         }
-        if (!llms_force_through_stop() && ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;   /* llms FORCE_THROUGH_STOP */
-        if (llms_isolate_now) {   /* llms CLOSE: the close token is evaluated alone, so the first post-close token is sampled AFTER the rebuild / by the greedy sample, not inside the close token's speculative cycle */
+        if (!llms_force_through_stop() && ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
+        if (llms_isolate_now) {
             llms_isolate_now = 0;
             size_t piece_len = 0; char *piece = ds4_token_text(engine, token, &piece_len);
             token_printer_write_text(&printer, piece, piece_len); fflush(stdout); free(piece);
@@ -1259,24 +1241,24 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             llms_snap_dump(session, "dec");
             continue;
         }
-        {   /* llms SPEC_COPY (apply_spec_copy.py): verify [token, copy proposal] as one 2-row step */
+        {
             static int spec_copy_state = -1; static int *hist; static int copy_history_count, hcap; static float *rows; static int vocab; static long vsteps, vacc, osteps;
             if (spec_copy_state < 0) { const char *e2 = getenv("LLMS_DS4_SPEC_COPY"); spec_copy_state = e2 && *e2 && *e2 != '0' && cfg->gen.temperature <= 0.0f;
-                          if (spec_copy_state) { fprintf(stderr, "llms: spec copy (a copy drafter's proposal verified as a 2-row step)\n");
+                          if (spec_copy_state) { ((void)0);
                                     hcap = prompt->len + max_tokens + 16; hist = malloc((size_t)hcap * sizeof(int)); memcpy(hist, prompt->v, (size_t)prompt->len * sizeof(int)); copy_history_count = prompt->len;
                                     float probe[1]; (void)probe; vocab = 1 << 17; while (vocab <= (1 << 22)) { float *t = malloc((size_t)vocab * sizeof(float)); const int n = ds4_session_copy_logits(session, t, vocab); free(t); if (n > 0) { vocab = n; break; } vocab *= 2; }
                                     rows = malloc((size_t)2 * vocab * sizeof(float));
-                                    atexit_b(^{ fprintf(stderr, "llms spec copy: %ld verify steps (%ld accepted), %ld one-token steps\n", vsteps, vacc, osteps); }); } }
+                                    atexit_b(^{ ((void)0); }); } }
             if (spec_copy_state) {
                 size_t piece_len = 0; char *piece = ds4_token_text(engine, token, &piece_len);
                 token_printer_write_text(&printer, piece, piece_len); fflush(stdout); free(piece);
                 generated++; hist[copy_history_count++] = token;
                 if (generated >= max_tokens || cli_interrupt_requested()) continue;
-                int prop = -1;   /* the longest earlier occurrence of the current suffix (8 / 6 / 4 / 3 tokens), most recent first */
+                int prop = -1;
                 static const int copy_ngram_sizes[4] = { 8, 6, 4, 3 };
                 for (int q = 0; q < 4 && prop < 0; q++) {
                     const int n = copy_ngram_sizes[q]; if (copy_history_count < n + 1) continue;
-                    for (int jj = copy_history_count - 1; jj >= n; jj--) {   /* an occurrence ending at jj (exclusive) with a known continuation hist[jj], jj < hn */
+                    for (int jj = copy_history_count - 1; jj >= n; jj--) {
                         if (jj == copy_history_count) continue;
                         if (memcmp(&hist[jj - n], &hist[copy_history_count - n], (size_t)n * sizeof(int)) == 0 && jj < copy_history_count) { prop = hist[jj]; break; }
                     }
@@ -1293,9 +1275,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 cli_dist_busy_set(cfg, false);
                 if (rc3 != 0) { fprintf(stderr, "ds4: verify failed: %s\n", err); ds4_session_free(session); return 1; }
                 int a0 = 0; for (int v = 1; v < vocab; v++) if (rows[v] > rows[a0]) a0 = v;
-                if (a0 == prop) {   /* accepted: the proposal is the next token; the second row's logits are in the session already */
+                if (a0 == prop) {
                     vacc++;
-                    if (!llms_force_through_stop() && ds4_token_is_stop_for_think_mode(engine, prop, think_mode)) break;   /* llms FORCE_THROUGH_STOP */
+                    if (!llms_force_through_stop() && ds4_token_is_stop_for_think_mode(engine, prop, think_mode)) break;
                     piece_len = 0; piece = ds4_token_text(engine, prop, &piece_len);
                     token_printer_write_text(&printer, piece, piece_len); fflush(stdout); free(piece);
                     generated++; hist[copy_history_count++] = prop;
@@ -1313,13 +1295,13 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative(
-                session, token, ((llms_wrap_forced_now && !llms_wrap_uncap) || (llms_cli_inside > 0 && llms_calc_hold())) ? 1 : max_tokens - generated,   /* llms THINK_WRAP singleton cap; llms THINK_CALC: one token a cycle while a number follows an operator */
-                (llms_force_through_stop() ? -1 : ds4_token_eos(engine)), cfg->gen.temperature, 0,   /* llms FORCE_THROUGH_STOP */
+                session, token, ((llms_wrap_forced_now && !llms_wrap_uncap) || (llms_cli_inside > 0 && llms_calc_hold())) ? 1 : max_tokens - generated,
+                (llms_force_through_stop() ? -1 : ds4_token_eos(engine)), cfg->gen.temperature, 0,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
             cli_dist_busy_set(cfg, false);
-            if (llms_wrap_forced_now && ntok > 1) llms_wrap_extra += (unsigned long long)(ntok - 1);   /* llms THINK_WRAP singleton cap: the counter */
+            if (llms_wrap_forced_now && ntok > 1) llms_wrap_extra += (unsigned long long)(ntok - 1);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
@@ -1330,18 +1312,18 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             char *piece = ds4_token_text(engine, token, &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
-            const int llms_hit = llms_stop_on > 0 && llms_cli_inside <= 0 && llms_stop_feed(piece, piece_len);   /* llms STOP_LINE */
-            if (piece_len > 0 && memchr(piece, '\n', piece_len)) llms_nl_count++;   /* llms THINK_BUDGET_EOL */
-            if (llms_fl_mode > 0 && llms_fp_n != 0 && llms_cli_inside <= 0 && !llms_fl_done && !llms_fl_fired) llms_fp_feed(piece, piece_len);   /* llms FINAL_PROGRESS */
-            if (llms_cov_g >= 0 && llms_cli_inside > 0) llms_cov_feed(piece, piece_len);   /* llms THINK_COVER */
-            if (llms_calc_on > 0 && llms_cli_inside > 0) llms_calc_feed(piece, piece_len);   /* llms THINK_CALC */
+            const int llms_hit = llms_stop_on > 0 && llms_cli_inside <= 0 && llms_stop_feed(piece, piece_len);
+            if (piece_len > 0 && memchr(piece, '\n', piece_len)) llms_nl_count++;
+            if (llms_fl_mode > 0 && llms_fp_n != 0 && llms_cli_inside <= 0 && !llms_fl_done && !llms_fl_fired) llms_fp_feed(piece, piece_len);
+            if (llms_cov_g >= 0 && llms_cli_inside > 0) llms_cov_feed(piece, piece_len);
+            if (llms_calc_on > 0 && llms_cli_inside > 0) llms_calc_feed(piece, piece_len);
             free(piece);
             generated++;
-            if (ind_pen > 0.0f) ind_feed(token);   /* llms IND_PEN */
-            ds4_session_dry_feed(token, llms_cli_inside > 0);   /* llms DRY */
-            if (llms_loop_on > 0 && llms_cli_inside > 0 && token != ds4_token_think_end(engine) && tlb_feed(token)) { llms_loop_fired = 1; llms_tlb_fired_now = 1; }   /* llms THINK_LOOP (+ the redirect's own flag) */
-            if (llms_cov_g >= 0 && llms_cli_inside > 0 && token != ds4_token_think_end(engine) && llms_cov_hit(generated, llms_nl_count)) llms_loop_fired = 1;   /* llms THINK_COVER */
-            if (llms_fl_mode > 0 && llms_cli_inside <= 0 && !llms_fl_done && !llms_fl_fired && (llms_fl_feed(token) | llms_fp_hit())) { llms_fl_fired = 1; if (llms_fl_mode == 1) { fprintf(stderr, "llms: final loop (LOOPBREAK) stopped the answer at completion %d\n", generated); break; } fprintf(stderr, "llms: final loop (LOOPBREAK) fired at completion %d\n", generated); }   /* llms FINAL_LOOP */
+            if (ind_pen > 0.0f) ind_feed(token);
+            ds4_session_dry_feed(token, llms_cli_inside > 0);
+            if (llms_loop_on > 0 && llms_cli_inside > 0 && token != ds4_token_think_end(engine) && tlb_feed(token)) { llms_loop_fired = 1; llms_tlb_fired_now = 1; }
+            if (llms_cov_g >= 0 && llms_cli_inside > 0 && token != ds4_token_think_end(engine) && llms_cov_hit(generated, llms_nl_count)) llms_loop_fired = 1;
+            if (llms_fl_mode > 0 && llms_cli_inside <= 0 && !llms_fl_done && !llms_fl_fired && (llms_fl_feed(token) | llms_fp_hit())) { llms_fl_fired = 1; if (llms_fl_mode == 1) { ((void)0); break; } ((void)0); }
             if (llms_hit) break;
             if (generated >= max_tokens || cli_interrupt_requested()) {
                 continue;
@@ -1360,7 +1342,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (!llms_force_through_stop() && ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {   /* llms FORCE_THROUGH_STOP */
+            if (!llms_force_through_stop() && ds4_token_is_stop_for_think_mode(engine, toks[j], think_mode)) {
                 stop = true;
                 break;
             }
@@ -1368,28 +1350,28 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             char *piece = ds4_token_text(engine, toks[j], &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
             fflush(stdout);
-            const int llms_hit = llms_stop_on > 0 && llms_cli_inside <= 0 && llms_stop_feed(piece, piece_len);   /* llms STOP_LINE */
-            if (piece_len > 0 && memchr(piece, '\n', piece_len)) llms_nl_count++;   /* llms THINK_BUDGET_EOL */
-            if (llms_fl_mode > 0 && llms_fp_n != 0 && llms_cli_inside <= 0 && !llms_fl_done && !llms_fl_fired) llms_fp_feed(piece, piece_len);   /* llms FINAL_PROGRESS */
-            if (llms_cov_g >= 0 && llms_cli_inside > 0) llms_cov_feed(piece, piece_len);   /* llms THINK_COVER */
-            if (llms_calc_on > 0 && llms_cli_inside > 0) llms_calc_feed(piece, piece_len);   /* llms THINK_CALC */
+            const int llms_hit = llms_stop_on > 0 && llms_cli_inside <= 0 && llms_stop_feed(piece, piece_len);
+            if (piece_len > 0 && memchr(piece, '\n', piece_len)) llms_nl_count++;
+            if (llms_fl_mode > 0 && llms_fp_n != 0 && llms_cli_inside <= 0 && !llms_fl_done && !llms_fl_fired) llms_fp_feed(piece, piece_len);
+            if (llms_cov_g >= 0 && llms_cli_inside > 0) llms_cov_feed(piece, piece_len);
+            if (llms_calc_on > 0 && llms_cli_inside > 0) llms_calc_feed(piece, piece_len);
             free(piece);
-            ds4_session_dry_feed(toks[j], llms_cli_inside > 0);   /* llms DRY: a speculative cycle's accepted tokens */
+            ds4_session_dry_feed(toks[j], llms_cli_inside > 0);
             generated++;
-            if (ind_pen > 0.0f) ind_feed(toks[j]);   /* llms IND_PEN: a speculative cycle's accepted tokens */
+            if (ind_pen > 0.0f) ind_feed(toks[j]);
             if (llms_hit) { stop = true; break; }
-            {   /* llms THINK_LOOP / THINK_REREAD: the cycle's tokens while the thinking is open; a close inside the cycle ends it */
+            {
                 const int te2 = ds4_token_think_end(engine);
-                if (toks[j] == te2 && te2 >= 0) { if (llms_ew_on) { ds4_session_escalate(session, 0); llms_ew_on = 0; llms_ew_done = 1; fprintf(stderr, "llms: esc window closes at completion %d (an accepted-draft close)\n", generated); } if (llms_cli_inside > 0 && llms_reread_on) llms_think_reread_pending = 1; if (llms_cli_inside > 0 && llms_cg_n > 0) llms_cg_left = llms_cg_n; if (llms_cli_inside > 0 && llms_cx_n > 0) { ds4_session_escalate(session, 1); llms_cx_end = generated + llms_cx_n; } llms_cli_inside = 0; }
+                if (toks[j] == te2 && te2 >= 0) { if (llms_ew_on) { ds4_session_escalate(session, 0); llms_ew_on = 0; llms_ew_done = 1; ((void)0); } if (llms_cli_inside > 0 && llms_reread_on) llms_think_reread_pending = 1; if (llms_cli_inside > 0 && llms_cg_n > 0) llms_cg_left = llms_cg_n; if (llms_cli_inside > 0 && llms_cx_n > 0) { ds4_session_escalate(session, 1); llms_cx_end = generated + llms_cx_n; } llms_cli_inside = 0; }
                 else if (llms_loop_on > 0 && llms_cli_inside > 0 && tlb_feed(toks[j])) { llms_loop_fired = 1; llms_tlb_fired_now = 1; }
-                if (llms_cov_g >= 0 && llms_cli_inside > 0 && toks[j] != te2 && llms_cov_hit(generated, llms_nl_count)) llms_loop_fired = 1;   /* llms THINK_COVER */
+                if (llms_cov_g >= 0 && llms_cli_inside > 0 && toks[j] != te2 && llms_cov_hit(generated, llms_nl_count)) llms_loop_fired = 1;
             }
-            if (llms_fl_mode > 0 && llms_cli_inside <= 0 && !llms_fl_done && !llms_fl_fired && (llms_fl_feed(toks[j]) | llms_fp_hit())) { llms_fl_fired = 1; if (llms_fl_mode == 1) { fprintf(stderr, "llms: final loop (LOOPBREAK) stopped the answer at completion %d\n", generated); stop = true; break; } fprintf(stderr, "llms: final loop (LOOPBREAK) fired at completion %d\n", generated); }   /* llms FINAL_LOOP */
+            if (llms_fl_mode > 0 && llms_cli_inside <= 0 && !llms_fl_done && !llms_fl_fired && (llms_fl_feed(toks[j]) | llms_fp_hit())) { llms_fl_fired = 1; if (llms_fl_mode == 1) { ((void)0); stop = true; break; } ((void)0); }
             if (generated >= max_tokens) break;
         }
         if (stop) break;
     }
-    if (ind_pen > 0.0f) fprintf(stderr, "llms ind pen: %.3f, %llu samples biased of %u fed\n", ind_pen, ind_hits, ind_n);   /* llms IND_PEN */
+    if (ind_pen > 0.0f) ((void)0);
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();
@@ -1821,14 +1803,14 @@ static int run_decode_consistency(ds4_engine *engine, const cli_config *cfg,
     return live_top_n > 0 && fresh_top_n > 0 && live_top[0].id == fresh_top[0].id ? 0 : 1;
 }
 
-extern int ds4_session_copy_head_input(ds4_session *s, float *out, int cap, uint32_t *position, uint64_t *serial);   /* llms PPL_HEAD_DUMP: ds4.c (HEAD_FEATURE) */
+extern int ds4_session_copy_head_input(ds4_session *s, float *out, int cap, uint32_t *position, uint64_t *serial);
 static FILE *llms_hd_file; static int llms_hd_state = -1, llms_hd_tok = 128822; static uint64_t llms_hd_rows, llms_hd_miss; static float llms_hd_buf[5120];
-static void llms_hd_print(void) { fprintf(stderr, "llms ppl head dump: %llu rows, %llu without a head input\n", (unsigned long long)llms_hd_rows, (unsigned long long)llms_hd_miss); if (llms_hd_file) fclose(llms_hd_file); }
-static void llms_hd_row(ds4_session *session, int position) {   /* llms PPL_HEAD_DUMP (apply_ppl_head_dump.py): one fixed 20,500-byte record a scored row */
+static void llms_hd_print(void) { ((void)0); if (llms_hd_file) fclose(llms_hd_file); }
+static void llms_hd_row(ds4_session *session, int position) {
     if (llms_hd_state < 0) {
         const char *e = getenv("LLMS_DS4_PPL_HEAD_DUMP"), *t = getenv("LLMS_DS4_PPL_HEAD_TOK"); llms_hd_state = 0;
         if (t && *t) llms_hd_tok = atoi(t);
-        if (e && *e) { llms_hd_file = fopen(e, "wb"); llms_hd_state = llms_hd_file != NULL; if (llms_hd_state) { atexit(llms_hd_print); fprintf(stderr, "llms: ppl head dump to %s (the head input and token %d's logit at every scored row; needs LLMS_DS4_HEAD_FEATURE=1)\n", e, llms_hd_tok); } }
+        if (e && *e) { llms_hd_file = fopen(e, "wb"); llms_hd_state = llms_hd_file != NULL; if (llms_hd_state) { atexit(llms_hd_print); ((void)0); } }
     }
     if (llms_hd_state != 1) return;
     ds4_token_score ts; memset(&ts, 0, sizeof ts); uint32_t hp = 0; uint64_t ser = 0;
@@ -1839,15 +1821,15 @@ static void llms_hd_row(ds4_session *session, int position) {   /* llms PPL_HEAD
     fwrite(hdr, sizeof hdr, 1, llms_hd_file); fwrite(lv, sizeof lv, 1, llms_hd_file); fwrite(&nn, sizeof nn, 1, llms_hd_file); fwrite(llms_hd_buf, sizeof llms_hd_buf, 1, llms_hd_file);
     llms_hd_rows++;
 }
-static FILE *llms_pg_in, *llms_pg_out; static int llms_pg_state = -1; static float *llms_pg_row; static uint64_t llms_pg_rows;   /* llms PPL_GATHER (apply_ppl_gather.py) */
-static void llms_pg_print(void) { fprintf(stderr, "llms ppl gather: %llu rows gathered\n", (unsigned long long)llms_pg_rows); if (llms_pg_out) fclose(llms_pg_out); if (llms_pg_in) fclose(llms_pg_in); }
-static void llms_pg_row_dump(ds4_session *session, int position, int token) {   /* llms PPL_GATHER: 256 fixed ids' log p from the row's full logits */
+static FILE *llms_pg_in, *llms_pg_out; static int llms_pg_state = -1; static float *llms_pg_row; static uint64_t llms_pg_rows;
+static void llms_pg_print(void) { ((void)0); if (llms_pg_out) fclose(llms_pg_out); if (llms_pg_in) fclose(llms_pg_in); }
+static void llms_pg_row_dump(ds4_session *session, int position, int token) {
     if (llms_pg_state < 0) {
         const char *gi = getenv("LLMS_DS4_PPL_GATHER"), *go = getenv("LLMS_DS4_PPL_GATHER_OUT"); llms_pg_state = 0;
         if (gi && *gi) {
             llms_pg_in = fopen(gi, "rb"); llms_pg_out = go && *go ? fopen(go, "wb") : NULL; llms_pg_row = malloc(sizeof(float) * 262144u);
             if (!llms_pg_in || !llms_pg_out || !llms_pg_row) { fprintf(stderr, "llms FATAL: LLMS_DS4_PPL_GATHER=%s needs a readable ids file and a writable LLMS_DS4_PPL_GATHER_OUT\n", gi); exit(3); }
-            llms_pg_state = 1; atexit(llms_pg_print); fprintf(stderr, "llms: ppl gather (256 fixed ids' log p a scored row from %s into %s)\n", gi, go);
+            llms_pg_state = 1; atexit(llms_pg_print); ((void)0);
         }
     }
     if (llms_pg_state != 1) return;
@@ -1866,8 +1848,8 @@ static int ppl_score_row(ds4_session *session, int token, ds4_token_score *score
                          FILE *dump, int position, int topk) {
     ds4_token_score top[256];
     int n = 0;
-    llms_hd_row(session, position);   /* llms PPL_HEAD_DUMP: before the scoring, on the same immutable logit row */
-    llms_pg_row_dump(session, position, token);   /* llms PPL_GATHER: the same row */
+    llms_hd_row(session, position);
+    llms_pg_row_dump(session, position, token);
     if (dump && topk) {
         n = ds4_session_top_logprobs_and_token(session, top, topk, token, score);
         if (!n) return 0;
@@ -1883,7 +1865,6 @@ static int ppl_score_row(ds4_session *session, int token, ds4_token_score *score
     return 1;
 }
 
-/* LLMS_DS4_SCORE_PAIRS: one model, separately allocated prompt sessions. */
 static int run_score_pairs(ds4_engine *engine, const cli_config *cfg) {
     FILE *input = fopen(cfg->gen.perplexity_file_path, "r");
     if (!input) return 1;
@@ -1951,12 +1932,11 @@ static int run_score_pairs(ds4_engine *engine, const cli_config *cfg) {
 static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     char *text = read_prompt_file(cfg->gen.perplexity_file_path, true);
     ds4_tokens tokens = {0};
-    {   /* llms PPL_IDS (drafter fine-tune capture): the file holds whitespace-separated TOKEN IDS, used as is (no * re-tokenization: the agent's special DSML tokens stay single ids); off unless LLMS_DS4_PPL_IDS is set */
+    {
         const char *e = getenv("LLMS_DS4_PPL_IDS");
         if (e && *e && *e != '0') {
             char *s = text, *end = NULL;
             for (long v = strtol(s, &end, 10); end != s; s = end, v = strtol(s, &end, 10)) ds4_tokens_push(&tokens, (int)v);
-            fprintf(stderr, "llms: perplexity ids (%d token ids read from the file, no tokenization)\n", tokens.len);
         } else ds4_tokenize_text(engine, text, &tokens);
     }
     free(text);
@@ -1964,13 +1944,12 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     /* Seed the graph with enough real context to stay on the normal Metal
      * prefill path; scoring starts immediately after this fixed prefix. */
     int prefix_len = 32;
-    { const char *e = getenv("LLMS_DS4_PPL_PREFIX"); if (e && *e && atoi(e) >= 32) { prefix_len = atoi(e); fprintf(stderr, "llms: perplexity prefix %d tokens (through the prompt path)\n", prefix_len); } }   /* llms PPL_PREFIX (apply_ppl_prefix.py) */
-    {   /* llms PPL_PREFIX_FILE (2026-10-16, ffdp.py): the prefix length = the token count of this file's text (a leading part of the scored
-         * text), so only the rest (e.g. a flaw-field verdict) is scored one-token; off unless set */
+    { const char *e = getenv("LLMS_DS4_PPL_PREFIX"); if (e && *e && atoi(e) >= 32) { prefix_len = atoi(e); ((void)0); } }
+    {
         const char *pf = getenv("LLMS_DS4_PPL_PREFIX_FILE");
         if (pf && *pf) { char *t2 = read_prompt_file(pf, true); ds4_tokens tp = {0}; ds4_tokenize_text(engine, t2, &tp); free(t2);
                          if (tp.len >= 32) prefix_len = tp.len;
-                         fprintf(stderr, "llms: perplexity prefix file %d tokens (of %d)\n", prefix_len, tokens.len); ds4_tokens_free(&tp); }
+                         ((void)0); ds4_tokens_free(&tp); }
     }
     if (tokens.len <= prefix_len) {
         fprintf(stderr, "ds4: --perplexity-file needs more than %d tokens\n", prefix_len);
@@ -2015,8 +1994,8 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     int topk = topk_env ? atoi(topk_env) : 0;
     if (topk < 0) topk = 0;
     if (topk > 256) topk = 256;
-    double nll = 0.0;   /* llms VERIFY_ROWS: shared with the one-token loop below */
-    {   /* llms PPL_MASKS (apply_dims_zero.py): one pass per lane mask, the prefix re-synced under each */
+    double nll = 0.0;
+    {
         const char *mf = getenv("LLMS_DS4_PPL_MASKS"), *pr = getenv("LLMS_DS4_PPL_ROWS"); const int K = pr ? atoi(pr) : 0;
         if (mf && *mf) {
             extern void ds4_llms_dims_zero_set(const uint32_t *lanes, uint32_t n);
@@ -2027,16 +2006,15 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
             vocab = ds4_session_copy_logits(session, held, vocab); free(held);
             float *rows = malloc((size_t)K * (size_t)vocab * sizeof(float)), *lp = malloc((size_t)sc_n * sizeof(float));
             char line[65536]; int mi = 0; static uint32_t lanes[8192];
-            fprintf(stderr, "llms: ppl masks (%s; %d scored tokens per mask in %d-row steps)\n", mf, sc_n, K);
-            extern int ds4_gpu_llms_route_record(const char *path); extern int ds4_gpu_llms_route_replay(const char *path, int ids_only);   /* llms ROUTE_FREEZE */
+            extern int ds4_gpu_llms_route_record(const char *path); extern int ds4_gpu_llms_route_replay(const char *path, int ids_only);
             extern void ds4_gpu_llms_route_counters(uint64_t *replayed, uint64_t *mismatched, uint64_t *short_reads, uint64_t *logged);
             const char *fz = getenv("LLMS_DS4_PPL_MASKS_FREEZE"); const char *fzw = getenv("LLMS_DS4_PPL_MASKS_FREEZE_W"); const int fz_ids = !(fzw && !strcmp(fzw, "pin"));
-            if (fz && *fz) fprintf(stderr, "llms: ppl masks freeze (mask 0's routing recorded to %s, replayed in every later mask; weights %s)\n", fz, fz_ids ? "recomputed from each pass's scores" : "pinned");
+            if (fz && *fz) ((void)0);
             while (fgets(line, sizeof line, fm)) {
                 uint32_t n = 0;
                 for (char *p = line; *p && n < 8192u; ) { char *q; const long v = strtol(p, &q, 10); if (q == p) { p++; continue; } if (v >= 0) lanes[n++] = (uint32_t)v; p = q; }
                 ds4_llms_dims_zero_set(lanes, n);
-                uint64_t c0[4] = {0}; if (fz && *fz) { if (mi == 0) ds4_gpu_llms_route_record(fz); else ds4_gpu_llms_route_replay(fz, fz_ids); ds4_gpu_llms_route_counters(&c0[0], &c0[1], &c0[2], &c0[3]); }   /* llms ROUTE_FREEZE */
+                uint64_t c0[4] = {0}; if (fz && *fz) { if (mi == 0) ds4_gpu_llms_route_record(fz); else ds4_gpu_llms_route_replay(fz, fz_ids); ds4_gpu_llms_route_counters(&c0[0], &c0[1], &c0[2], &c0[3]); }
                 ds4_session_invalidate(session);
                 ds4_tokens pfx = {0}; for (int q2 = 0; q2 < prefix_len; q2++) ds4_tokens_push(&pfx, tokens.v[q2]);
                 if (ds4_session_sync(session, &pfx, err, sizeof(err)) != 0) { fprintf(stderr, "ds4: PPL_MASKS: prefix sync failed (mask %d): %s\n", mi, err); return 1; }
@@ -2054,9 +2032,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
                     }
                     ds4_session_set_logits(session, rows + (size_t)(K - 1) * vocab, vocab);
                 }
-                if (fz && *fz) { uint64_t c1[4]; ds4_gpu_llms_route_counters(&c1[0], &c1[1], &c1[2], &c1[3]);   /* llms ROUTE_FREEZE: this pass's counters */
-                    fprintf(stderr, "llms ppl masks freeze: mask %d logged %llu, replayed %llu, mismatched %llu, short %llu\n", mi, (unsigned long long)(c1[3] - c0[3]),
-                            (unsigned long long)(c1[0] - c0[0]), (unsigned long long)(c1[1] - c0[1]), (unsigned long long)(c1[2] - c0[2]));
+                if (fz && *fz) { uint64_t c1[4]; ds4_gpu_llms_route_counters(&c1[0], &c1[1], &c1[2], &c1[3]);
                     if (mi == 0) ds4_gpu_llms_route_record(NULL); }
                 printf("mask %d lanes %u nll %.9f avg %.9f\n", mi, n, mnll, mnll / (double)sc_n); fflush(stdout);
                 if (flp) { fwrite(lp, sizeof(float), (size_t)sc_n, flp); fflush(flp); }
@@ -2067,9 +2043,9 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
             return 0;
         }
     }
-    {   /* llms VERIFY_ROWS: LLMS_DS4_PPL_ROWS=k scores the text through k-row verify steps (perfect drafts) */
+    {
         const char *pr = getenv("LLMS_DS4_PPL_ROWS"); const int K = pr ? atoi(pr) : 0;
-        if (K >= 2 || (K == 1 && getenv("LLMS_DS4_VERIFY_ONE"))) {   /* llms VERIFY_ONE: K = 1 through the batched step */
+        if (K >= 2 || (K == 1 && getenv("LLMS_DS4_VERIFY_ONE"))) {
             const char *lp = getenv("LLMS_DS4_PPL_ROWS_LOG"); FILE *lf = lp && *lp ? fopen(lp, "w") : NULL;
             const char *pp = getenv("LLMS_DS4_PPL_LOGPROB_DUMP"); FILE *pd = pp && *pp ? fopen(pp, "w") : NULL;
             const int nv = ds4_session_copy_logits(session, NULL, 0) ;
@@ -2086,10 +2062,10 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
                 if (!ppl_score_row(session, tokens.v[i], &sc, pd, i, topk)) { fprintf(stderr, "ds4: failed to score token %d\n", i); return 1; }
                 nll -= (double)sc.logprob;
                 int c = scored - j; if (c > K) c = K;
-                if (j + c >= scored) c = scored - j;   /* the last chunk: its final row's logits are never used */
+                if (j + c >= scored) c = scored - j;
                 if (c < (K == 1 ? 1 : 2)) { j += 1; if (j < scored && ds4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) { fprintf(stderr, "\nds4: eval failed at %d: %s\n", i, err); return 1; } continue; }
-                {   /* llms PPL_JUNK (apply_ppl_junk.py): [x_i, junk] rolled back to row 0 */
-                    static int ppl_junk_state = -1; if (ppl_junk_state < 0) { ppl_junk_state = getenv("LLMS_DS4_PPL_JUNK") != NULL; if (ppl_junk_state) fprintf(stderr, "llms: ppl junk (2-row steps [x, junk] rolled back to row 0)\n"); }
+                {
+                    static int ppl_junk_state = -1; if (ppl_junk_state < 0) { ppl_junk_state = getenv("LLMS_DS4_PPL_JUNK") != NULL; if (ppl_junk_state) ((void)0); }
                     if (ppl_junk_state && K == 2) {
                         const int jt[2] = { tokens.v[i], tokens.v[i] == 13 ? 14 : 13 };
                         if (ds4_session_eval_rows(session, jt, 2, rows, err, sizeof(err)) != 0 || ds4_session_rollback_rows(session, 1, 2) != 0) {
@@ -2103,9 +2079,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
                 if (ds4_session_eval_rows(session, &tokens.v[i], c, rows, err, sizeof(err)) != 0) { fprintf(stderr, "\nds4: verify rows failed at %d: %s\n", i, err); return 1; }
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 if (lf) { fprintf(lf, "%.3f %d %d\n", (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, c, i); fflush(lf); }
-                {   /* llms PPL_REPEAT (apply_rep.py): the same step R - 1 more times, each after a keep-0 rollback */
-                    /* llms PPL_REP_NAME may name up to 8 ALTW switches, comma-separated (mgate.py, 2026-10-19 12:5x): the log's last field is the
-                       bitmask of their OFF states, bit j = the j-th name -- one name gives 0 / 1 as before */
+                {
 #define llms_rep_am(nm) ({ int _am = -1; if (nm) { _am = 0; char _nb[256]; snprintf(_nb, sizeof _nb, "%s", nm); int _bi = 0; char *_sv = NULL; \
     for (char *_t = strtok_r(_nb, ",", &_sv); _t && _bi < 8; _t = strtok_r(NULL, ",", &_sv), _bi++) _am |= ds4_gpu_llms_alt_off(_t) << _bi; } _am; })
                     static int ppl_random_state = -1; static FILE *ppl_random_file; static const char *rname; static float *ppl_random_held_logits; static size_t ppl_random_held_floats;
@@ -2114,13 +2088,13 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
                     if (randrep < 0) { const char *e = getenv("LLMS_DS4_PPL_RANDOM"); randrep = e && *e && *e != '0'; }
                     if (ppl_random_state < 0) { const char *e = getenv("LLMS_DS4_PPL_REPEAT"); ppl_random_state = e && atoi(e) > 1 ? atoi(e) : 0; const char *p = getenv("LLMS_DS4_PPL_REP_LOG");
                                    ppl_random_file = p && *p ? fopen(p, "w") : NULL; rname = getenv("LLMS_DS4_PPL_REP_NAME"); if (rname && !*rname) rname = NULL;
-                                   if (ppl_random_state) fprintf(stderr, "llms: ppl repeat %d (each full %d-row step re-run at its position after a keep-0 rollback; LLMS_DS4_DEEPRB=1 needed)\n", ppl_random_state, K); }
+                                   if (ppl_random_state) ((void)0); }
                     if (ppl_random_state && c == K) {
                         int phase = 0;
                         if (randrep) {
                             const char *a = getenv("LLMS_DS4_ALTW"), *b = getenv("LLMS_DS4_ALT");
                             if (ppl_random_state != 5 || !ppl_random_file || !rname || strchr(rname, ',') || (a && *a) || (b && *b)) {
-                                fprintf(stderr, "random repeat requires R5, log, one ALT name and no periodic ALT schedule\n"); return 1;
+                                ((void)0); return 1;
                             }
                             phase = arc4random_uniform(2) ? 1 : -1;
                             fprintf(ppl_random_file, "R %d %d\n", i, phase); fflush(ppl_random_file);
@@ -2146,11 +2120,11 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
                         if (ppl_random_file) fflush(ppl_random_file);
                     }
                 }
-                {   /* llms ELIDE_SWEEP (apply_elide_sweep.py): every masked layer dropped alone on a re-run of this step; KL per row; a clean restore */
+                {
                     static int sw_state = -1; static unsigned long long sw_mask; static FILE *sw_log; static float *sw_held; static size_t sw_held_n;
                     if (sw_state < 0) { const char *e = getenv("LLMS_DS4_ELIDE_SWEEP"); sw_mask = e && *e ? strtoull(e, NULL, 16) : 0ull; const char *p = getenv("LLMS_DS4_ELIDE_SWEEP_LOG");
                                         sw_log = sw_mask && p && *p ? fopen(p, "w") : NULL; sw_state = sw_mask && sw_log ? 1 : 0;
-                                        if (sw_mask) fprintf(stderr, "llms: ELIDE_SWEEP %llx -- MEASUREMENT: each step re-run once per masked layer with its attention output zeroed (LLMS_DS4_DEEPRB=1 needed)%s\n", sw_mask, sw_state ? "" : " -- NO LOG, OFF"); }
+                                        if (sw_mask) ((void)0); }
                     if (sw_state && c == K) {
                         const size_t nf = (size_t)c * (size_t)vocab;
                         if (sw_held_n < nf) { free(sw_held); sw_held = malloc(nf * sizeof(float)); sw_held_n = sw_held ? nf : 0; }
@@ -2172,14 +2146,14 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
                                 fprintf(sw_log, "%d %d %d %.6g %d\n", i, L, r, kl, ha == qa);
                             }
                         }
-                        const int rr = ds4_session_llms_rerun_rows(session, &tokens.v[i], c, rows);   /* the clean restore: the session's KV and the logits as first run */
+                        const int rr = ds4_session_llms_rerun_rows(session, &tokens.v[i], c, rows);
                         if (rr != 0) { fprintf(stderr, "\nds4: sweep restore failed at %d (code %d)\n", i, rr); return 1; }
                         double mx = 0.0; for (size_t z = 0; z < nf; z++) { const double dd = fabs((double)rows[z] - (double)sw_held[z]); if (dd > mx) mx = dd; }
                         fprintf(sw_log, "%d -1 restore %.3g\n", i, mx); fflush(sw_log);
                         memcpy(rows, sw_held, nf * sizeof(float));
                     }
                 }
-                for (int r = 0; r + 1 < c; r++) {   /* row r's logits predict token i + r + 1 */
+                for (int r = 0; r + 1 < c; r++) {
                     ds4_session_set_logits(session, rows + (size_t)r * vocab, vocab);
                     if (!ppl_score_row(session, tokens.v[i + r + 1], &sc, pd, i + r + 1, topk)) { fprintf(stderr, "ds4: failed to score token %d\n", i + r + 1); return 1; }
                     nll -= (double)sc.logprob;
@@ -2222,22 +2196,22 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
             fflush(stderr);
         }
 
-        {   /* llms PPL_APPEND (apply_ppl_append.py): every S scored steps, A tokens through the prompt path */
+        {
             static int app_s = -1, app_a = 0; static long app_n = 0;
             if (app_s < 0) { app_s = 0; const char *e = getenv("LLMS_DS4_PPL_APPEND");
                              if (e && *e && strchr(e, ':')) { app_s = atoi(e); app_a = atoi(strchr(e, ':') + 1); if (app_s < 1 || app_a < 2) app_s = 0; }
-                             if (app_s) fprintf(stderr, "llms: perplexity append %d:%d (after every %d scored steps, %d tokens through the prompt path, unscored)\n", app_s, app_a, app_s, app_a); }
+                             if (app_s) ((void)0); }
             if (app_s && j + 1 < scored && ((j + 1) % app_s) == 0 && j + app_a < scored) {
                 ds4_tokens pr = {0};
                 for (int q = 0; q < i + app_a; q++) ds4_tokens_push(&pr, tokens.v[q]);
                 const int rc = ds4_session_sync(session, &pr, err, sizeof(err)); ds4_tokens_free(&pr);
                 if (rc != 0) { fprintf(stderr, "\nds4: perplexity append failed at token %d: %s\n", i, err); ds4_session_free(session); ds4_tokens_free(&tokens); return 1; }
-                app_n++; if (app_n == 1) atexit_b(^{ fprintf(stderr, "llms ppl append: %ld appends of %d tokens\n", app_n, app_a); });
+                app_n++; if (app_n == 1) atexit_b(^{ ((void)0); });
                 j += app_a - 1;
                 continue;
             }
         }
-        {   /* llms PPL_SEGMENTS (apply_ppl_segments.py): append segments [a, b) through the prompt path, every other row one decode step */
+        {
             static int sg_state = -1; static int *sg_a, *sg_b; static int sg_n, sg_k; static long sg_tok;
             if (sg_state < 0) {
                 sg_state = 0; const char *e = getenv("LLMS_DS4_PPL_SEGMENTS");
@@ -2248,11 +2222,10 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
                         if (sg_n == cap) { cap = cap ? cap * 2 : 64; sg_a = realloc(sg_a, sizeof(int) * cap); sg_b = realloc(sg_b, sizeof(int) * cap); }
                         sg_a[sg_n] = a; sg_b[sg_n] = b; sg_n++; }
                     fclose(f); sg_state = 1;
-                    fprintf(stderr, "llms: ppl segments %d appends from %s (each through the prompt path after its first token is scored)\n", sg_n, e);
-                    atexit_b(^{ fprintf(stderr, "llms ppl segments: %d appends of %ld tokens\n", sg_k, sg_tok); });
+                    atexit_b(^{ ((void)0); });
                 }
             }
-            while (sg_state == 1 && sg_k < sg_n && sg_a[sg_k] < i) sg_k++;   /* a segment that starts before the scored range is skipped */
+            while (sg_state == 1 && sg_k < sg_n && sg_a[sg_k] < i) sg_k++;
             if (sg_state == 1 && sg_k < sg_n && sg_a[sg_k] == i && sg_b[sg_k] < prefix_len + scored) {
                 const int b = sg_b[sg_k]; ds4_tokens pr = {0};
                 for (int q = 0; q < b; q++) ds4_tokens_push(&pr, tokens.v[q]);
@@ -2659,27 +2632,27 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
     int sync_rc;
-    {   /* llms PFPAIR (apply_pfpair.py): LLMS_DS4_PFPAIR=name -- the turn prefilled twice on the same tokens, ALT 'name' forced off / on */
+    {
         static const char *pf_name = (const char *)1; static int pf_turn;
         if (pf_name == (const char *)1) { pf_name = getenv("LLMS_DS4_PFPAIR"); if (pf_name && !*pf_name) pf_name = NULL;
-                                          if (pf_name) fprintf(stderr, "llms: pfpair '%s' (each turn prefilled twice: ALT forced off / on, a snapshot restored between) -- INSTRUMENT\n", pf_name); }
+                                          if (pf_name) ((void)0); }
         ds4_session_snapshot pf_snap = {0}; char pf_err[160] = {0};
         if (pf_name && cached > 0 && suffix > 0 && chat->image_count == 0 && ds4_session_save_snapshot(chat->session, &pf_snap, pf_err, sizeof pf_err) == 0) {
             extern void ds4_gpu_llms_alt_force(const char *names);
             const int off_first = (pf_turn & 1) == 0; double ms_off = -1.0, ms_on = -1.0; sync_rc = 0;
-            static int pf_warm = -1; if (pf_warm < 0) { const char *e = getenv("LLMS_DS4_PFPAIR_WARM"); pf_warm = e && *e ? atoi(e) : 0; if (pf_warm < 0 || pf_warm > 4) pf_warm = 0;   /* llms PFPAIR2 (apply_pfpair2.py) */
-                                                          if (pf_warm) fprintf(stderr, "llms: pfpair warm %d (discarded warm-up prefills of each turn before the measured pair)\n", pf_warm); }
+            static int pf_warm = -1; if (pf_warm < 0) { const char *e = getenv("LLMS_DS4_PFPAIR_WARM"); pf_warm = e && *e ? atoi(e) : 0; if (pf_warm < 0 || pf_warm > 4) pf_warm = 0;
+                                                          if (pf_warm) ((void)0); }
             for (int k = 0; k < pf_warm + 2 && sync_rc == 0; k++) {
-                const int m = k - pf_warm;   /* < 0: a warm-up, alternating off / on */
+                const int m = k - pf_warm;
                 const int off = m < 0 ? (k & 1) == 0 : (m == 0 ? off_first : !off_first);
                 ds4_gpu_llms_alt_force(off ? pf_name : "");
                 const double t0 = cli_now_sec();
                 sync_rc = ds4_session_sync_multimodal(chat->session, &chat->transcript, chat->images, chat->image_count, err, sizeof(err));
                 const double dt = (cli_now_sec() - t0) * 1000.0; if (m >= 0) { if (off) ms_off = dt; else ms_on = dt; }
-                if (k < pf_warm + 1 && sync_rc == 0 && ds4_session_load_snapshot(chat->session, &pf_snap, pf_err, sizeof pf_err) != 0) { fprintf(stderr, "llms pfpair: restore failed (%s) -- the turn keeps this run\n", pf_err); break; }
+                if (k < pf_warm + 1 && sync_rc == 0 && ds4_session_load_snapshot(chat->session, &pf_snap, pf_err, sizeof pf_err) != 0) { ((void)0); break; }
             }
             ds4_gpu_llms_alt_force("");
-            if (sync_rc == 0 && ms_off >= 0.0 && ms_on >= 0.0) fprintf(stderr, "llms pfpair: turn %d rows %d first %s ms_off %.3f ms_on %.3f warm %d\n", pf_turn, suffix, off_first ? "off" : "on", ms_off, ms_on, pf_warm);
+            if (sync_rc == 0 && ms_off >= 0.0 && ms_on >= 0.0) ((void)0);
             ds4_session_snapshot_free(&pf_snap); pf_turn++;
         } else {
             if (pf_name && pf_snap.ptr) ds4_session_snapshot_free(&pf_snap);

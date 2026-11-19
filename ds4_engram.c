@@ -2,7 +2,6 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "ds4_engram.h"
-#include "llms_diag.h"   /* llms DIAG */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -130,7 +129,7 @@ void ds4_engram_table_close(ds4_engram_table *t) {
     *t = (ds4_engram_table){.fd = -1};
 }
 
-static bool read_row(int fd, uint64_t offset, uint8_t *row, size_t bytes) {   /* llms ENGRAM_IQ4: the row size is the table's */
+static bool read_row(int fd, uint64_t offset, uint8_t *row, size_t bytes) {
     size_t done = 0;
     while (done < bytes) {
         ssize_t n = pread(fd, row + done, bytes - done,
@@ -173,7 +172,6 @@ static void init_engram_bf16(void) {
     }
 }
 
-/* llms ENGRAM_IQ4: the IQ4_NL decode -- 8 blocks of {fp16 d, 16 bytes}; value j of a block = d * kvalues[nibble], low nibbles first; bf16-rounded like the reference */
 enum { ENGRAM_IQ4_ROW = 144 };
 static const int8_t engram_iq4_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 static void engram_decode_iq4(const uint8_t *raw, float *out) {
@@ -240,7 +238,7 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
     const uint32_t rb = ds4_engram_row_bytes(t);
     for (size_t i = 0; i < count; i++) {
         if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * rb, raw, rb)) return false;
-        if (rb == (uint32_t)ENGRAM_IQ4_ROW) { engram_decode_iq4(raw, out + i * DS4_ENGRAM_DIM); continue; }   /* llms ENGRAM_IQ4 */
+        if (rb == (uint32_t)ENGRAM_IQ4_ROW) { engram_decode_iq4(raw, out + i * DS4_ENGRAM_DIM); continue; }
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
             const uint16_t value = engram_bf16[raw[DS4_ENGRAM_DIM + j / 32]][raw[j]];
             if (value == UINT16_MAX) {
@@ -254,7 +252,6 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
     return true;
 }
 
-/* llms ENGRAM_RA (apply_ds4_engram_ra.py): ds4_engram_read's decode, from a read-only mapping of the table instead of pread */
 bool ds4_engram_read_mapped(const ds4_engram_table *t, const uint8_t *map, uint64_t map_file_off,
                             const uint32_t *rows, size_t count, float *out) {
     if (!t || !map || t->offset < map_file_off || (count && (!rows || !out)) ||
@@ -271,7 +268,7 @@ bool ds4_engram_read_mapped(const ds4_engram_table *t, const uint8_t *map, uint6
     pthread_once(&engram_bf16_once, init_engram_bf16);
     for (size_t i = 0; i < count; i++) {
         const uint8_t *raw = map + (t->offset - map_file_off) + (uint64_t)rows[i] * ds4_engram_row_bytes(t);
-        if (t->row_bytes == (uint32_t)ENGRAM_IQ4_ROW) { engram_decode_iq4(raw, out + i * DS4_ENGRAM_DIM); continue; }   /* llms ENGRAM_IQ4 */
+        if (t->row_bytes == (uint32_t)ENGRAM_IQ4_ROW) { engram_decode_iq4(raw, out + i * DS4_ENGRAM_DIM); continue; }
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
             const uint16_t value = engram_bf16[raw[DS4_ENGRAM_DIM + j / 32]][raw[j]];
             if (value == UINT16_MAX) { errno = EDOM; return false; }
@@ -414,7 +411,6 @@ static bool ds4_engram_read_batch_impl(const ds4_engram_table *t, const uint32_t
     return ok;
 }
 
-/* llms ENGRAM_TIME (apply_engram_time.py): LLMS_DS4_ENGRAM_TIME=1 times every batch read; off = one getenv, then a branch. */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -422,18 +418,18 @@ static bool ds4_engram_read_batch_impl(const ds4_engram_table *t, const uint32_t
 static unsigned long long engram_time_calls[2], engram_time_tokens[2], engram_time_ns[2];
 static void engram_time_report(void) {
     for (int k = 1; k >= 0; k--)
-        fprintf(stderr, "llms engram time (%s thread): %llu batch reads, %llu tokens, %.1f ms\n", k ? "main" : "other", engram_time_calls[k], engram_time_tokens[k], engram_time_ns[k] * 1e-6);
+        ((void)0);
 }
 bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows, size_t tokens, size_t stride, float *out) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("LLMS_DS4_ENGRAM_TIME"); on = e && *e && *e != '0'; if (on) { fprintf(stderr, "llms: engram time (every batch read timed)\n"); atexit(engram_time_report); } }
+    if (on < 0) { const char *e = getenv("LLMS_DS4_ENGRAM_TIME"); on = e && *e && *e != '0'; if (on) { ((void)0); atexit(engram_time_report); } }
     if (!on) return ds4_engram_read_batch_impl(t, rows, tokens, stride, out);
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
     const bool ok = ds4_engram_read_batch_impl(t, rows, tokens, stride, out);
     clock_gettime(CLOCK_MONOTONIC, &b);
     const int mainthread = pthread_main_np() ? 1 : 0; const unsigned long long ns = (unsigned long long)((b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec));
     __atomic_fetch_add(&engram_time_calls[mainthread], 1, __ATOMIC_RELAXED); __atomic_fetch_add(&engram_time_tokens[mainthread], tokens, __ATOMIC_RELAXED); __atomic_fetch_add(&engram_time_ns[mainthread], ns, __ATOMIC_RELAXED);
-    if (tokens >= 32) fprintf(stderr, "llms engram read: t=%.3f tokens %zu stride %zu main %d ok %d ms %.2f\n", a.tv_sec + a.tv_nsec * 1e-9, tokens, stride, mainthread, ok ? 1 : 0, ns * 1e-6);
+    if (tokens >= 32) ((void)0);
     return ok;
 }
 

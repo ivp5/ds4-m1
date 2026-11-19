@@ -2576,15 +2576,15 @@ bad:
     return false;
 }
 
-static int llms_server_official_tools(void) {   /* llms SERVER_OFFICIAL_TOOLS (apply_server_official_tools.py) */
+static int llms_server_official_tools(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("LLMS_DS4_SERVER_OFFICIAL_TOOLS"); v = e && *e && *e != '0';
-                 if (v) fprintf(stderr, "llms: server official tools (the V4.1 tools section in the official encoder's text, after the first system message)\n"); }
+                 if (v) ((void)0); }
     return v;
 }
 static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
     if (!tool_schemas || !tool_schemas[0]) return;
-    if (v41 && llms_server_official_tools()) { buf_puts(b, "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n"); buf_puts(b, tool_schemas); buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n"); return; }   /* llms SERVER_OFFICIAL_TOOLS */
+    if (v41 && llms_server_official_tools()) { buf_puts(b, "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n"); buf_puts(b, tool_schemas); buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n"); return; }
     if (v41) buf_puts(b,
         "## Tools\n\n"
         "You can invoke tools using this format:\n\n"
@@ -3146,7 +3146,7 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
     const char *effort = ds4_deepseek41_reasoning_effort_text(mode);
     bool initial_system = false, pending = false, user_open = false;
     int last_user = -1;
-    const bool llms_ot_defer = llms_server_official_tools() && !live_tail && tool_schemas && tool_schemas[0] && msgs && start == 0 && msgs->len > 0 && role_is_system(ordered[0]->role);   /* llms SERVER_OFFICIAL_TOOLS: the official order */
+    const bool llms_ot_defer = llms_server_official_tools() && !live_tail && tool_schemas && tool_schemas[0] && msgs && start == 0 && msgs->len > 0 && role_is_system(ordered[0]->role);
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role) || (i > 0 && role_is_system(m->role))) last_user = i;
@@ -3170,7 +3170,7 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
                 if (tool_schemas && tool_schemas[0] && !llms_ot_defer) buf_puts(&out, "\n\n");
             } else buf_puts(&out, "<｜System｜>");
             buf_puts(&out, m->content ? m->content : "");
-            if (i == 0 && llms_ot_defer) { buf_puts(&out, "\n\n"); append_tools_prompt_text(&out, tool_schemas, true); }   /* llms SERVER_OFFICIAL_TOOLS: content, then the tools */
+            if (i == 0 && llms_ot_defer) { buf_puts(&out, "\n\n"); append_tools_prompt_text(&out, tool_schemas, true); }
             pending = i > 0 || live_tail;
             user_open = false;
         } else if (role_is_user_like(m->role)) {
@@ -5270,9 +5270,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     chat_msgs msgs = {0};
-    if (getenv("LLMS_DS4_RAW_COMPLETION")) {   /* llms RAW_COMPLETION (2026-10-11): "prompt" is already-rendered chat text (BOS, <｜User｜>, an open
-                                                 * <think> ... e.g. a stored reasoning cut at a budget + </think>\n\nFLAWS:), tokenized with its special
-                                                 * tokens and continued as is -- forks of finished draws. Off unless set. */
+    if (getenv("LLMS_DS4_RAW_COMPLETION")) {
         r->prompt_text = prompt; prompt = NULL;
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
@@ -11801,19 +11799,17 @@ static int server_session_sync(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
-    {   /* llms LLMS_DS4_LOCKSTEP_PREFILL=N (see apply_lockstep.py) */
+    {
         static int lockstep = -1;
         if (lockstep < 0) {
             const char *e = getenv("LLMS_DS4_LOCKSTEP_PREFILL");
             lockstep = e && *e ? atoi(e) : 0;
-            if (lockstep > 0) fprintf(stderr, "llms: lockstep prefill (prompt suffixes under %d tokens ride the decode batch, one token per step)\n", lockstep);
+            if (lockstep > 0) ((void)0);
         }
         if (lockstep > 0 && prompt->len > done && prompt->len - done < lockstep) {
             if (done == 0) {
                 ds4_tokens first = *prompt;
                 first.len = 1;
-                /* one token: inference_mu alone serializes it with the decode worker's batch; the prefill gate would wait for
-                   decode_pending == 0, which lockstep sessions (re-posting at once) can keep from happening */
                 if (g_stop_requested || slot_job_cancelled(slot)) return DS4_SESSION_SYNC_INTERRUPTED;
                 pthread_mutex_lock(&s->inference_mu);
                 int rc0 = ds4_session_sync(slot->session, &first, err, errlen);
@@ -13310,7 +13306,7 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
-    int llms_fpv[64]; int llms_fpn = 0, llms_fpi = -1;   /* llms THINK_FORCE_PREFIX: the forced answer opening, its length, the next index */
+    int llms_fpv[64]; int llms_fpn = 0, llms_fpi = -1;
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -13359,18 +13355,18 @@ decode_again:
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
             break;
         }
-        {   /* llms LLMS_DS4_THINK_BUDGET: force the end of thinking once the budget is spent */
+        {
             static long llms_tb = -2;
             if (llms_tb == -2) { const char *e = getenv("LLMS_DS4_THINK_BUDGET"); llms_tb = (e && *e) ? atol(e) : -1; }
-            if (llms_fpi >= 0 && llms_fpi < llms_fpn) token = llms_fpv[llms_fpi++];   /* llms THINK_FORCE_PREFIX: the next forced token */
+            if (llms_fpi >= 0 && llms_fpi < llms_fpn) token = llms_fpv[llms_fpi++];
             if (llms_tb > 0 && thinking.inside && completion >= llms_tb) {
                 const int te = ds4_token_think_end(s->engine);
                 if (te >= 0 && token != te) {
                     token = te;
                     server_log(DS4_LOG_DEFAULT, "llms: think budget %ld reached at completion %d: </think> forced", llms_tb, completion);
-                    const char *fp = getenv("LLMS_DS4_THINK_FORCE_PREFIX");   /* llms THINK_FORCE_PREFIX */
+                    const char *fp = getenv("LLMS_DS4_THINK_FORCE_PREFIX");
                     if (fp && *fp && llms_fpi < 0) {
-                        char buf[256]; size_t n = 0;   /* '\n' in the variable stands for a newline */
+                        char buf[256]; size_t n = 0;
                         for (const char *q = fp; *q && n + 1 < sizeof buf; q++) { if (q[0] == '\\' && q[1] == 'n') { buf[n++] = '\n'; q++; } else buf[n++] = *q; }
                         buf[n] = 0;
                         ds4_tokens tv = {0}; ds4_tokenize_text(s->engine, buf, &tv);

@@ -4242,11 +4242,11 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
     static ds4_tokens llms_cp_toks; static int llms_cp_state = -1; int llms_cp_pos = -1;   /* llms CLOSE_PREFIX (ds4-eval port) */
-    if (llms_cp_state < 0) { const char *cpe = getenv("LLMS_DS4_CLOSE_PREFIX"); llms_cp_state = 0; if (cpe && *cpe) { ds4_tokenize_text(engine, cpe, &llms_cp_toks); llms_cp_state = llms_cp_toks.len > 0; if (llms_cp_state) fprintf(stderr, "llms: close prefix '%s' (ds4-eval: %d tokens forced right after the thinking's close) -- FIDELITY DIAL\n", cpe, llms_cp_toks.len); } }
+    if (llms_cp_state < 0) { const char *cpe = getenv("LLMS_DS4_CLOSE_PREFIX"); llms_cp_state = 0; if (cpe && *cpe) { ds4_tokenize_text(engine, cpe, &llms_cp_toks); llms_cp_state = llms_cp_toks.len > 0; if (llms_cp_state) ((void)0); } }
     int llms_cx_left = 0; static int llms_cx_n = -1;   /* llms CLOSE_EXACT (ds4-eval port) */
-    if (llms_cx_n < 0) { const char *cxe = getenv("LLMS_DS4_CLOSE_EXACT"); llms_cx_n = cxe && *cxe ? atoi(cxe) : 0; if (llms_cx_n < 0) llms_cx_n = 0; if (llms_cx_n) fprintf(stderr, "llms: close exact %d (ds4-eval: from the thinking's close token on the decode runs on exact routing for %d generated tokens) -- FIDELITY DIAL\n", llms_cx_n, llms_cx_n); }
+    if (llms_cx_n < 0) { const char *cxe = getenv("LLMS_DS4_CLOSE_EXACT"); llms_cx_n = cxe && *cxe ? atoi(cxe) : 0; if (llms_cx_n < 0) llms_cx_n = 0; if (llms_cx_n) ((void)0); }
     static int llms_cs = -1;   /* llms EVAL_CLOSE_SPECIAL (ds4-eval): the hard-forced close is the single trained close token (the CLI's budget close is that token) instead of the plain-text pieces of "</think>" */
-    if (llms_cs < 0) { const char *cse = getenv("LLMS_DS4_EVAL_CLOSE_SPECIAL"); llms_cs = cse && *cse && *cse != '0'; if (llms_cs) fprintf(stderr, "llms: eval close special (the hard-forced close is the single close token %d instead of the %d plain-text pieces of '</think>'; the soft close stays off) -- FIDELITY DIAL\n", ds4_token_think_end(engine), think_close_tokens.len); }
+    if (llms_cs < 0) { const char *cse = getenv("LLMS_DS4_EVAL_CLOSE_SPECIAL"); llms_cs = cse && *cse && *cse != '0'; if (llms_cs) ((void)(ds4_token_think_end(engine)), (void)(think_close_tokens.len)); }
     if (llms_cs && generation_in_think && ds4_token_think_end(engine) >= 0 && think_close_tokens.len != 1) { ds4_tokens_free(&think_close_tokens); think_close_tokens.v = NULL; think_close_tokens.len = 0; think_close_tokens.cap = 0; ds4_tokens_push(&think_close_tokens, ds4_token_think_end(engine)); }
     int spec_blocks = 0, spec_tokens = 0, spec_plain = 0;   /* llms EVAL_SPEC: the execution witness, printed per case when the switch is on */
     for (int i = 0; i < generation_limit; i++) {
@@ -4355,8 +4355,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             token = ds4_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
         if (ds4_token_is_stop(engine, token)) break;
-        if (llms_cx_n > 0 && generation_in_think && llms_cx_left == 0 && (token == ds4_token_think_end(engine) || (close_kind != EVAL_THINK_CLOSE_NONE && think_close.kind == EVAL_THINK_CLOSE_NONE))) { ds4_session_escalate(session, 1); llms_cx_left = llms_cx_n + (close_kind != EVAL_THINK_CLOSE_NONE ? think_close_tokens.len : 1); fprintf(stderr, "llms: close exact armed at generated token %d (window %d tokens)\n", ui->generated, llms_cx_n); }   /* llms CLOSE_EXACT: arms on the close token the model writes, or on the FIRST piece of a forced close (06:05 gate: the forced close is 3 plain pieces, none equal to the close token) */
-        if (llms_cs && close_kind == EVAL_THINK_CLOSE_HARD) fprintf(stderr, "llms: eval close special forced the close token %d (%d close token)\n", token, think_close_tokens.len);
+        if (llms_cx_n > 0 && generation_in_think && llms_cx_left == 0 && (token == ds4_token_think_end(engine) || (close_kind != EVAL_THINK_CLOSE_NONE && think_close.kind == EVAL_THINK_CLOSE_NONE))) { ds4_session_escalate(session, 1); llms_cx_left = llms_cx_n + (close_kind != EVAL_THINK_CLOSE_NONE ? think_close_tokens.len : 1); ((void)0); }   /* llms CLOSE_EXACT: arms on the close token the model writes, or on the FIRST piece of a forced close (06:05 gate: the forced close is 3 plain pieces, none equal to the close token) */
+        if (llms_cs && close_kind == EVAL_THINK_CLOSE_HARD) ((void)0);
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
             think_close.kind = close_kind;
@@ -4369,7 +4369,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         {
             static int eval_spec = -1;
             if (eval_spec < 0) { const char *e = getenv("LLMS_DS4_EVAL_SPEC"); eval_spec = e && *e && *e != '0';
-                                 if (eval_spec) fprintf(stderr, "llms: eval spec (ds4-eval decodes through ds4_session_eval_speculative, the agent's drafted path; the think-close controller's last %d tokens one at a time)\n", cfg->soft_limit_reply_budget); }
+                                 if (eval_spec) ((void)0); }
             const int spec_cap = generation_in_think ? remaining_budget - cfg->soft_limit_reply_budget : remaining_budget;
             if (eval_spec && close_kind == EVAL_THINK_CLOSE_NONE && forced_close_pos < 0 && spec_cap >= 2 &&
                 ds4_engine_mtp_draft_tokens(engine) > 1 && getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -4437,7 +4437,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         if (spec_stop) break;
     }
     { const char *e = getenv("LLMS_DS4_EVAL_SPEC");
-      if (e && *e && *e != '0') fprintf(stderr, "llms eval spec: case %s: %d speculative blocks committed %d tokens; %d plain evals\n", tc->id, spec_blocks, spec_tokens, spec_plain); }
+      if (e && *e && *e != '0') ((void)0); }
     if (tty) {
         stream_append_token_text(ui, NULL, 0, true);
         tui_draw_stream(ui);

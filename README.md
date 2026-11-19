@@ -173,8 +173,6 @@ expert-streaming layer (Qwen MoE streaming and the GLM exact-typed indexed decod
 128 GB-class machines. The merged engine computes exactly what was measured above: its deterministic dump on the published model files is
 identical to the measured engine's, all 818 positions.
 
-**The engine's diagnostic lines stay out of your terminal.** The patches print many lines that open with `llms` (counters and witnesses for test logs). They are printed when stderr is a file or a pipe and dropped when it is a terminal; failures always print. `LLMS_DS4_DIAG=1` shows them on a terminal, `LLMS_DS4_DIAG=0` drops them everywhere.
-
 ## Known issues
 
 - With memory limits lower than step 2's the engine cannot lock all of its tables (it prints `NOT locked (mlock failed)`) and can run at

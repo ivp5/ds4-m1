@@ -78,11 +78,9 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
-/* llms LLMS_DS4_STEP_LOG: ds4's cumulative streamed-expert sync / bind ms (read-only) */
 void ds4_gpu_llms_stream_timing(double *sync_ms, double *bind_ms);
-uint64_t ds4_gpu_llms_stream_misses(void);   /* llms step alt */
-uint64_t ds4_gpu_llms_stream_misses_ctx(void);   /* SP_BATON cold: the calling context's misses */
-/* llms LLMS_DS4_LOOKAHEAD_PREFETCH: readahead hint for a later layer's expert unless the stream cache holds it (0 skipped, 1 cached, 2 hinted) */
+uint64_t ds4_gpu_llms_stream_misses(void);
+uint64_t ds4_gpu_llms_stream_misses_ctx(void);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -388,109 +386,100 @@ static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 static inline int ds4_gpu_device_is_m5_or_m6_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
-/* llms LLMS_DS4_SHARED_AFTER_SYNC: one-shot hook run after the routed selected-id readback, then flushed */
 void ds4_gpu_llms_set_after_selected(void (*cb)(void *), void *ud);
-void ds4_gpu_llms_set_route_probs(const ds4_gpu_tensor *probs);   /* llms MISS_SKIP_SUB */
-void ds4_gpu_llms_set_route_bias(const float *bias);   /* llms ONE_RPOL */
-int ds4_gpu_llms_commit_close(void);   /* llms BATCH_SAS: commit the open batch without waiting and leave none open */
-void *ds4_gpu_llms_commit_close_handle(void);   /* llms BATCH_PIPE */
+void ds4_gpu_llms_set_route_probs(const ds4_gpu_tensor *probs);
+void ds4_gpu_llms_set_route_bias(const float *bias);
+int ds4_gpu_llms_commit_close(void);
+void *ds4_gpu_llms_commit_close_handle(void);
 int ds4_gpu_llms_wait_handle(void *h);
 void ds4_gpu_llms_set_pipe(int on);
-void ds4_gpu_llms_ss(int s); void ds4_gpu_llms_ss_signal(unsigned tag); void ds4_gpu_llms_ss_wait(unsigned tag); void ds4_gpu_llms_ss_want(int w);   /* llms SUBSTREAMS */
-/* llms LLMS_DS4_Q4_OVERLAY (apply_ds4_q4_overlay.py): the routed MoE of chosen layers computed on the CPU. what: 0 overlay
- * (Q4 experts from the separate files), 1 verify (the model file's own experts). Returns 1 on success. */
+void ds4_gpu_llms_ss(int s); void ds4_gpu_llms_ss_signal(unsigned tag); void ds4_gpu_llms_ss_wait(unsigned tag); void ds4_gpu_llms_ss_want(int w);
 int ds4_gpu_llms_resident_mask(uint32_t layer, uint8_t *mask, uint32_t n);
-int ds4_gpu_llms_rows_copy(ds4_gpu_tensor *const *dst, const uint64_t *dst_off, ds4_gpu_tensor *const *src, const uint64_t *src_off, uint32_t n, uint64_t bytes, int canary);   /* llms ROWS_WIN */
-void ds4_gpu_llms_step_clock(void);   /* llms STEP_CLOCK */
-void ds4_gpu_llms_set_ra0_canary(int on);   /* llms ROWS_ATTN0 */
-void ds4_gpu_llms_set_kv_fp4(int flag);   /* llms KV_FP4 */
-int ds4_gpu_llms_kv_fp4_pack(ds4_gpu_tensor *x, uint32_t rows, ds4_gpu_tensor *dst, uint64_t dst_row0);   /* llms KV_FP4 */
-int ds4_gpu_llms_fp4_rows_to_half(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint32_t rows);   /* llms KV_FP4 */
-int ds4_gpu_llms_fp4_pack_selected(ds4_gpu_tensor *dst, ds4_gpu_tensor *ids, const ds4_gpu_tensor *src, const ds4_gpu_tensor *sel, uint32_t n_sel, uint32_t visible);   /* llms C2H_SEL */
-void ds4_gpu_llms_mark(const char *tag);   /* llms LLMS_DS4_COUNT_OPS: print the counters now (apply_ds4_gpu_ledger.py) */
-/* llms LLMS_DS4_BATCH_ASYNC: asynchronous expert loads + deferred in-order commits (apply_ds4_batch_async.py) */
+int ds4_gpu_llms_rows_copy(ds4_gpu_tensor *const *dst, const uint64_t *dst_off, ds4_gpu_tensor *const *src, const uint64_t *src_off, uint32_t n, uint64_t bytes, int canary);
+void ds4_gpu_llms_step_clock(void);
+void ds4_gpu_llms_set_ra0_canary(int on);
+void ds4_gpu_llms_set_kv_fp4(int flag);
+int ds4_gpu_llms_kv_fp4_pack(ds4_gpu_tensor *x, uint32_t rows, ds4_gpu_tensor *dst, uint64_t dst_row0);
+int ds4_gpu_llms_fp4_rows_to_half(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint32_t rows);
+int ds4_gpu_llms_fp4_pack_selected(ds4_gpu_tensor *dst, ds4_gpu_tensor *ids, const ds4_gpu_tensor *src, const ds4_gpu_tensor *sel, uint32_t n_sel, uint32_t visible);
+void ds4_gpu_llms_mark(const char *tag);
 void ds4_gpu_llms_set_async_loads(int on);
 void *ds4_gpu_llms_close_nocommit(void);
 int ds4_gpu_llms_commit_pending(void *h);
 int ds4_gpu_llms_wait_pending(void *h);
-/* llms LLMS_DS4_BATCH_ASYNC=2: deferred commits (apply_ds4_batch_async2.py) */
-int ds4_gpu_llms_try_commit_pending(void *h);      /* 1 committed (now or before), 0 its tickets are not complete, -1 error; never blocks */
+int ds4_gpu_llms_try_commit_pending(void *h);
 uint64_t ds4_gpu_llms_pending_seq(void *h);
 void ds4_gpu_llms_set_flush_hook(void (*fn)(void));
 void ds4_gpu_llms_set_load_concurrent(int on);
 int ds4_gpu_llms_matmul_f32_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
-                                 uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t rows);   /* llms F32_ROWS */
+                                 uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t rows);
 int ds4_gpu_llms_dsv41_rope_rows(ds4_gpu_tensor *const *x, const uint32_t *pos, uint32_t n, uint32_t width, uint32_t heads,
-                                 bool compressed, bool inverse, bool bf16_first);   /* llms ROWS_ROPE */
-void ds4_gpu_llms_set_ledger_tag(uint32_t kind, uint32_t group, uint32_t layer);   /* llms LEDGER_TAGS */
-void ds4_gpu_llms_set_kv_half(int flag);   /* llms KV_HALF */
+                                 bool compressed, bool inverse, bool bf16_first);
+void ds4_gpu_llms_set_ledger_tag(uint32_t kind, uint32_t group, uint32_t layer);
+void ds4_gpu_llms_set_kv_half(int flag);
 int ds4_gpu_llms_copy_f32_f16(ds4_gpu_tensor *dst, uint64_t dst_off, const ds4_gpu_tensor *src, uint64_t src_off, uint32_t n);
-int ds4_gpu_llms_copy_f16_f32(ds4_gpu_tensor *dst, uint64_t dst_off, const ds4_gpu_tensor *src, uint64_t src_off, uint32_t n);   /* llms IDX_HALF */
-void ds4_gpu_llms_set_step(uint32_t step);   /* llms ALT */
-void ds4_gpu_llms_set_unit(int unit, int group);   /* llms ALT2D: the pipeline unit (routed layer, group) being encoded */
+int ds4_gpu_llms_copy_f16_f32(ds4_gpu_tensor *dst, uint64_t dst_off, const ds4_gpu_tensor *src, uint64_t src_off, uint32_t n);
+void ds4_gpu_llms_set_step(uint32_t step);
+void ds4_gpu_llms_set_unit(int unit, int group);
 int ds4_gpu_llms_shexp_pair(ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
-                            uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, float limit);   /* llms SHEXP_PAIR */
-int ds4_gpu_llms_alt_off(const char *name);   /* llms ALT */
-void ds4_gpu_llms_conc_skip(int on);   /* llms CONC */
-/* llms HC_OWED (apply_owed.py): the two-row HC pre-sublayer's owed tail. kind 1: the split (Sinkhorn of mix) is owed; kind 2: the mixer (hin -> mix) and then the split. ds4_metal.m holds one record per side ([0] attention, [1] FFN) and settles each exactly once: taken by the side's dual dispatch, forced by any other reader, or dropped when a tensor it names is freed. */
+                            uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, float limit);
+int ds4_gpu_llms_alt_off(const char *name);
+void ds4_gpu_llms_conc_skip(int on);
 typedef struct { int kind; ds4_gpu_tensor *split, *mix, *xo, *no; const ds4_gpu_tensor *hin, *pre; const void *map; uint64_t size, fn_off, scale_off, base_off, nw_off;
                  uint32_t pre_stride, rows, n_embd, n_hc, iters, take_iters; float rms_eps, hc_eps; int flags; } ds4_gpu_llms_owed;
 void ds4_gpu_llms_owe(int side, const ds4_gpu_llms_owed *rec);
-int ds4_gpu_llms_owed_force(int side);   /* side -1: both sides; 1 = encoded (or nothing owed) */
+int ds4_gpu_llms_owed_force(int side);
 #define DS4_GPU_LLMS_HCFR_MIX 16  /* ... the mixer threadgroups only */
 int ds4_gpu_llms_hc_pre_fused_rows(ds4_gpu_tensor *split, ds4_gpu_tensor *xo, ds4_gpu_tensor *no, const ds4_gpu_tensor *residual, const ds4_gpu_tensor *pre,
     uint32_t pre_stride, ds4_gpu_tensor *mixo, const void *model_map, uint64_t model_size, uint64_t fn_off, uint64_t scale_off, uint64_t base_off, uint64_t nw_off,
-    uint32_t n_embd, uint32_t n_hc, uint32_t iters, float rms_eps, float hc_eps, int flags, uint32_t rows);   /* llms HCF_ROWS */
-void ds4_gpu_llms_q4l_bypass(int on);   /* llms DSP41 */
-void ds4_gpu_llms_dcrh_hold(int on);   /* llms DCRH_SAFE: 1 holds DECODE_COROUTE_HARD off until 0 */
-void ds4_gpu_llms_erowd_rows(uint32_t n);   /* llms EROWD: rows < n of the next verify are decoder-lean (layers >= 20) */
-void ds4_gpu_llms_gtopk_row0(uint32_t k);   /* llms GTOPK_ROW0: the next verify's FIRST row keeps at most k routed picks (0 = off); cleared by every gtopk_step call */
-void ds4_gpu_llms_gtopk_step(uint32_t k);   /* llms GTOPK: the next verify's rows keep at most k routed picks (0 = off) */
+    uint32_t n_embd, uint32_t n_hc, uint32_t iters, float rms_eps, float hc_eps, int flags, uint32_t rows);
+void ds4_gpu_llms_q4l_bypass(int on);
+void ds4_gpu_llms_dcrh_hold(int on);
+void ds4_gpu_llms_erowd_rows(uint32_t n);
+void ds4_gpu_llms_gtopk_row0(uint32_t k);
+void ds4_gpu_llms_gtopk_step(uint32_t k);
 void ds4_gpu_llms_ucap_step(uint32_t k);
-void ds4_gpu_llms_route_class(int noncall);   /* llms UCAP_CLASS */
+void ds4_gpu_llms_route_class(int noncall);
 void ds4_gpu_llms_exact_step(uint32_t on);
-void ds4_gpu_llms_rescue_step(uint32_t on);   /* llms RESCUE: 1 = the listener refills the kept set with the router's resident originals until 0 */   /* llms EXACT_STEP: 1 = the listener keeps the router's six (no re-pick, no union cap) until 0 */   /* llms UCAP_GATE: the next verify's union cap (0 = the shipped cap) */
-int ds4_gpu_llms_q4l_short(ds4_gpu_tensor *out, uint64_t weight_abs, uint32_t k, uint32_t n_out, const ds4_gpu_tensor *x, const int32_t *ids, uint32_t n_ids);   /* llms DSP41_SHORT */
-int ds4_gpu_llms_add_model_views(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);   /* llms DSP41 */
-int ds4_gpu_llms_add_model_view_span(const void *model_map, uint64_t model_size, uint64_t off, uint64_t len, uint64_t max_tensor_bytes);   /* llms DSP41_BANK */
-void ds4_gpu_llms_router_bias_override(const ds4_gpu_tensor *bias);   /* llms DSP41_BANK: NULL clears */
+void ds4_gpu_llms_rescue_step(uint32_t on);      
+int ds4_gpu_llms_q4l_short(ds4_gpu_tensor *out, uint64_t weight_abs, uint32_t k, uint32_t n_out, const ds4_gpu_tensor *x, const int32_t *ids, uint32_t n_ids);
+int ds4_gpu_llms_add_model_views(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+int ds4_gpu_llms_add_model_view_span(const void *model_map, uint64_t model_size, uint64_t off, uint64_t len, uint64_t max_tensor_bytes);
+void ds4_gpu_llms_router_bias_override(const ds4_gpu_tensor *bias);
 int ds4_gpu_llms_dsp_moe_bank(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
     const ds4_gpu_tensor *gbank, const ds4_gpu_tensor *ubank, const ds4_gpu_tensor *dbank, const ds4_gpu_tensor *map, ds4_gpu_tensor *selb,
     uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes,
     uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_orig, uint32_t n_bank,
-    uint32_t n_used, float clamp, const ds4_gpu_tensor *x);   /* llms DSP41_BANK */
+    uint32_t n_used, float clamp, const ds4_gpu_tensor *x);
 int ds4_gpu_llms_dsp_moe(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
                          const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
                          uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
                          uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
                          const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total, uint32_t n_used, float clamp,
-                         const ds4_gpu_tensor *x);   /* llms DSP41 */
-int ds4_gpu_llms_attn_out_k(ds4_gpu_tensor *out, ds4_gpu_tensor *low, uint64_t out_a_offset, uint64_t out_b_offset, const ds4_gpu_tensor *heads, uint32_t rows);   /* llms Q4L_KG */
-void ds4_gpu_llms_krow_la(const ds4_gpu_tensor *norm, uint32_t rows);   /* llms KROW_LA */
+                         const ds4_gpu_tensor *x);
+int ds4_gpu_llms_attn_out_k(ds4_gpu_tensor *out, ds4_gpu_tensor *low, uint64_t out_a_offset, uint64_t out_b_offset, const ds4_gpu_tensor *heads, uint32_t rows);
+void ds4_gpu_llms_krow_la(const ds4_gpu_tensor *norm, uint32_t rows);
 int ds4_gpu_llms_mqa4_heads(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q,
                             const ds4_gpu_tensor *raw_kv, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, const ds4_gpu_tensor *comp_half,
-                            const ds4_gpu_tensor *ids, uint32_t n_sel, uint32_t n_head, uint32_t head_dim, int canary);   /* llms MQA4 */
+                            const ds4_gpu_tensor *ids, uint32_t n_sel, uint32_t n_head, uint32_t head_dim, int canary);
 int ds4_gpu_llms_q4l_dual(ds4_gpu_tensor *out_a, uint64_t wa_abs, uint32_t n_a, ds4_gpu_tensor *out_b, uint64_t wb_abs, uint32_t n_b,
                           const ds4_gpu_tensor *x, uint32_t k, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix, const void *model_map,
-                          uint64_t model_size, uint64_t scale_off, uint64_t base_off, uint32_t iters, float eps, int canary);   /* llms Q4L_DUAL */
-uint64_t ds4_gpu_llms_conc_count(void);   /* llms CONC_SKIP */
-int ds4_gpu_llms_ed_rows_begin(const ds4_gpu_tensor *probs, const ds4_gpu_tensor *weights, uint32_t layer_index, int canary);   /* llms SP_ED */
-int ds4_gpu_llms_ed_rows_end(uint32_t layer_index, int ok, int due_override);   /* llms SP_ED; llms EDR_PHASE: due_override -1 = the shipped counter rule, 0 / 1 = ds4.c decides */
-int ds4_gpu_llms_add6_arm(const ds4_gpu_tensor *routed, const ds4_gpu_tensor *shared, const ds4_gpu_tensor *block, uint32_t rows);   /* llms ADD6 */
-int ds4_gpu_llms_add6_take(void);   /* llms ADD6: 1 = the G32 sum wrote block = routed + shared */
-void ds4_gpu_llms_add6_invalidate(void);   /* llms ADD6: shared is written after the routed call */
-uint32_t ds4_gpu_llms_ed_commit_every(void);   /* llms EDR_PHASE: the ED cadence k (LLMS_DS4_ED) */
-int ds4_gpu_llms_alt_off_next(const char *name);   /* llms ALT (ENGRAM_ASYNC) */
+                          uint64_t model_size, uint64_t scale_off, uint64_t base_off, uint32_t iters, float eps, int canary);
+uint64_t ds4_gpu_llms_conc_count(void);
+int ds4_gpu_llms_ed_rows_begin(const ds4_gpu_tensor *probs, const ds4_gpu_tensor *weights, uint32_t layer_index, int canary);
+int ds4_gpu_llms_ed_rows_end(uint32_t layer_index, int ok, int due_override);
+int ds4_gpu_llms_add6_arm(const ds4_gpu_tensor *routed, const ds4_gpu_tensor *shared, const ds4_gpu_tensor *block, uint32_t rows);
+int ds4_gpu_llms_add6_take(void);
+void ds4_gpu_llms_add6_invalidate(void);
+uint32_t ds4_gpu_llms_ed_commit_every(void);
+int ds4_gpu_llms_alt_off_next(const char *name);
 void ds4_gpu_llms_set_route_layer(int il);
-int ds4_gpu_llms_fixset_guard_state(void);   /* llms FIXSET_GUARD v2 (apply_fixset_guard2.py): 0 pending, 1 soft, 2 hard, 3 no guard */
-   /* llms LLMS_DS4_CACHE_ROUTE: one-shot layer for the next router call */
-/* llms LLMS_DS4_V41_ROWS_ATTN: decode attention of n rows (different sessions) in one split dispatch + one reduce */
+int ds4_gpu_llms_fixset_guard_state(void);
 int ds4_gpu_llms_v41_rows_attention(const void *model_map, uint64_t model_size, uint64_t sinks_offset, uint32_t n,
         ds4_gpu_tensor *const *q, ds4_gpu_tensor *const *raw, ds4_gpu_tensor *const *comp, ds4_gpu_tensor *const *topk,
         ds4_gpu_tensor *const *heads, const uint32_t *pos, const uint32_t *n_comp, uint32_t top_k, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim);
-void ds4_gpu_llms_set_after_union_read(void (*cb)(void *), void *ud);   /* llms BATCH_SAS hook */
-/* llms LLMS_DS4_SLOT_PREFETCH: async load of predicted experts into cache slots; installed before the next routed peek */
+void ds4_gpu_llms_set_after_union_read(void (*cb)(void *), void *ud);
 int ds4_gpu_llms_slot_prefetch(const void *map, uint64_t size, uint32_t layer, uint32_t n_total, uint64_t gate_off, uint64_t up_off,
                                uint64_t down_off, uint64_t gate_bytes, uint64_t down_bytes, const int32_t *ids, uint32_t n);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
@@ -1788,15 +1777,15 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
         float           beta_fast,
         float           beta_slow);
 
-void ds4_gpu_llms_slot_seed(uint64_t gate_expert_bytes, uint64_t down_expert_bytes);   /* llms SLOT_SEED */
-int ds4_gpu_llms_indexer_score_rows(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,   /* llms SP_IDXB */
+void ds4_gpu_llms_slot_seed(uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+int ds4_gpu_llms_indexer_score_rows(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *cache, const uint32_t *ncomp, uint32_t rows, uint32_t stride,
         const ds4_gpu_tensor *mask, uint32_t mask_stride, uint32_t mask_base);
-int ds4_gpu_llms_idx_rows_ok(void);   /* llms SP_IDXB: the per-row score would run the half-cache t4 body */
-void ds4_gpu_llms_redrope_set(int bf16, int compressed, int canary);   /* llms REDROPE: the next split reduces carry the heads' tail */
-uint64_t ds4_gpu_llms_redrope_take(void);   /* llms REDROPE: how many reduces fused since the set; clears the request */
-void ds4_gpu_llms_qrope_set(int compressed, int canary);   /* llms QROPE: the next attention call rotates q (fused, or in place first) */
-void ds4_gpu_llms_qrope_clear(void);   /* llms QROPE: drop an unconsumed request */
+int ds4_gpu_llms_idx_rows_ok(void);
+void ds4_gpu_llms_redrope_set(int bf16, int compressed, int canary);
+uint64_t ds4_gpu_llms_redrope_take(void);
+void ds4_gpu_llms_qrope_set(int compressed, int canary);
+void ds4_gpu_llms_qrope_clear(void);
 /* Scores GPU-selected eight-key blocks into the original cache positions.
  * Other score slots remain untouched until the candidate mask is applied. */
 int ds4_gpu_dsv41_indexer_score_blocks(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
@@ -2606,7 +2595,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-/* Explicit decode-order split batching; fast Metal mode, <=16 rows. */
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor_ex(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -4025,19 +4013,19 @@ int ds4_gpu_qwen4_mtp_project_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
-void ds4_gpu_llms_set_baton(void (*rel)(void), void (*acq)(void));   /* llms SP_BATON b2 (stage C): the pair's baton around each owned batch's wait */
+void ds4_gpu_llms_set_baton(void (*rel)(void), void (*acq)(void));
 
 void ds4_gpu_llms_bctx_select(int k);
-void ds4_gpu_llms_baton_window(int on);   /* llms SP_BATON b4 (stage C): the baton is released only at waits inside this window */   /* llms SP_BATON b3 (stage C): the backend context of the call holding the baton */
+void ds4_gpu_llms_baton_window(int on);   
 
 #ifdef __cplusplus
 }
 #endif
 
-void ds4_gpu_llms_fc_arm(void);    /* llms VSPLIT3: arm the first-commit stamp */
-double ds4_gpu_llms_fc_sec(void);  /* llms VSPLIT3: its CLOCK_MONOTONIC seconds (0 = none yet) */
+void ds4_gpu_llms_fc_arm(void);
+double ds4_gpu_llms_fc_sec(void);
 void ds4_gpu_llms_vg_read(double *busy_ms, double *span_ms, int *n);
-int ds4_gpu_llms_vg_each(double *out, int cap);   /* llms VSPLIT5: each verify buffer's GPU ms in commit order */
-uint32_t ds4_gpu_llms_db_polls(void);   /* llms VSPLIT6: the doorbell's GPU poll count so far */
-void ds4_gpu_llms_edf_sums(double *serve_us, double *gap_us);   /* llms VSPLIT7: the ED listener's serve / gap time so far (LLMS_DS4_EDF_TIME on) */   /* llms VSPLIT4: the armed verify's buffers' summed GPU time, span, count */
+int ds4_gpu_llms_vg_each(double *out, int cap);
+uint32_t ds4_gpu_llms_db_polls(void);
+void ds4_gpu_llms_edf_sums(double *serve_us, double *gap_us);   
 #endif
