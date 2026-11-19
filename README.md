@@ -90,7 +90,7 @@ make -j8 ds4 ds4-agent ds4-server
 | wiki1100 vs official, the whole model | KL 0.833 · top-1 73.6% | **EXL3: KL 0.088 · top-1 88.2% (its own slice)** | KL 0.203 · top-1 90.5% (its own slice) |
 | KL vs official on its card's own text | — | EXL3: 0.088 wiki1100, 0.098 e2e_eval; REXL3: 0.051 e2e_eval | 0.203 wiki1100, 0.142 long17k |
 | Top-1 on its card's own text | — | EXL3: 88.2% wiki1100, 94.5% e2e_eval | 90.5% wiki1100, 91.2% long17k |
-| Whole model vs Q8_0 reference (4 agent sessions) | KL 0.118 · top-1 90.5% | — | — |
+| Whole model vs Q8_0 reference (4 agent sessions, 2026-11-19) | KL 0.105 · top-1 90.7% | — | — |
 | Coding-agent tasks (2026-11-19) | **15/15 solved, 595 tokens and 17.9 s per solution** | — | — |
 
 — = not stated on that card. The same-test row swaps only the routed experts (attention, dense layers, router and head are
@@ -104,9 +104,9 @@ the official weights in both), so it compares the two expert codecs directly.
 | same, steady tasks 5-15 | 40.7 tok/s | 306.0 tok/s | 1,026 MHz |
 | same build with the schema rule on, last eight tasks of a second run | 41.3 tok/s | 312.7 tok/s | 1,043 MHz |
 | 2026-11-08 build: 16 coding-agent tasks back to back | 48.4 tok/s | 342.6 tok/s | 1,061 MHz |
-| `ds4` one-shot, WikiText prompt of 2,062 tokens + 256 generated (a fresh process) | 26.9 tok/s | 198.0 tok/s | |
-| `ds4` one-shot, WikiText prompt of 8,172 tokens + 256 generated (a fresh process) | 31.8 tok/s | 324.9 tok/s | |
-| `ds4` one-shot, WikiText prompt of 32,803 tokens + 256 generated (a fresh process) | 27.1 tok/s | 383.2 tok/s | |
+| `ds4` one-shot, WikiText prompt of 2,062 tokens + 256 generated (a fresh process) | 20.0 tok/s | 247.7 tok/s | |
+| `ds4` one-shot, WikiText prompt of 8,172 tokens + 256 generated (a fresh process) | 19.3 tok/s | 268.1 tok/s | |
+| `ds4` one-shot, WikiText prompt of 32,803 tokens + 256 generated (a fresh process) | 22.7 tok/s | 291.0 tok/s | |
 
 The agent rows are agent work (code, tool calls), where the drafter's tokens are accepted 75-80 % of the time; on encyclopedic prose it accepts
 25-70 %, so the one-shot rows generate slower. A fresh process also installs its first experts from the SSD (a few seconds).
@@ -135,15 +135,16 @@ Two runs of the shipped configuration differ from each other by KL 0.1116 (mean)
 
 vcruz305 and Unsloth do not say which 1,100 tokens of WikiText-2 they used or how they scored them. On this slice, against this reference, SAGE REXL3's routed experts alone read KL 0.380, while vcruz305's card reports 0.088 for its whole EXL3 model on its own slice: numbers from different cards are not on one scale. The routed-experts row compares like with like: both codecs on the same positions against the same official log-probabilities.
 
-**The whole published model** against the Q8_0 GGUF, teacher-forced on four coding-agent sessions (thinking / answer tokens split):
+**The whole published model** against the Q8_0 GGUF, teacher-forced on four coding-agent sessions (thinking / answer tokens split), measured 2026-11-19 on this build:
 
 | Session | Positions | KL mean | KL p50 | Top-1 | Top-5 | Thinking KL / top-1 | Answer KL / top-1 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| calc | 818 | 0.118 | 0.00088 | 89.9% | 69.8% | 0.212 / 81.8% | 0.039 / 96.6% |
-| textutil | 536 | 0.053 | 0.00006 | 97.4% | 63.8% | 0.255 / 86.7% | 0.020 / 99.1% |
-| roman (long thinking) | 1,254 | 0.147 | 0.01430 | 88.4% | 72.2% | 0.181 / 85.3% | 0.082 / 94.6% |
-| matrix (long thinking) | 777 | 0.116 | 0.00083 | 89.6% | 70.1% | 0.198 / 82.2% | 0.046 / 95.9% |
-| **pooled** | **3,385** | **0.118** | | **90.5%** | **69.8%** | | |
+| calc | 696 | 0.117 | 0.00099 | 89.5% | 74.3% | 0.182 / 84.7% | 0.042 / 95.0% |
+| textutil | 404 | 0.070 | 0.00001 | 95.3% | 69.0% | 0.259 / 82.7% | 0.027 / 98.2% |
+| roman (long thinking) | 1,148 | 0.115 | 0.00855 | 90.2% | 77.4% | 0.133 / 88.6% | 0.066 / 94.3% |
+| matrix (long thinking) | 668 | 0.097 | 0.00079 | 90.3% | 75.2% | 0.145 / 85.8% | 0.040 / 95.5% |
+| **pooled, 2026-11-19** | **2,916** | **0.105** | | **90.7%** | **75.0%** | | |
+| pooled, 2026-11-08 | 3,385 | 0.118 | | 90.5% | 69.8% | | |
 
 ## Tokens per correct solution
 
