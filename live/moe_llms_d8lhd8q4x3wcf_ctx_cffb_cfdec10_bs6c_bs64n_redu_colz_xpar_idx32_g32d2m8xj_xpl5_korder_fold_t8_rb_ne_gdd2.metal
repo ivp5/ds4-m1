@@ -11142,7 +11142,7 @@ static inline void llms_q2k_down_col_impl(constant ds4_metal_args_mul_mv_id & ar
                 float v = part;
                 v += simd_shuffle_xor(v, (ushort)1);
                 v += simd_shuffle_xor(v, (ushort)2);              /* the four quarter lanes of a row now hold its block-8 sum */
-                v = simd_shuffle_xor(v, (ushort)(((tiisg >> 2) ^ (tiisg & 7)) << 2));   /*) */   /* lane L takes row 8 t + (L & 7)'s */
+                v = simd_shuffle_xor(v, (ushort)(((tiisg >> 2) ^ (tiisg & 7)) << 2));   /* llms tail_xor (build_tailxor.py) */   /* lane L takes row 8 t + (L & 7)'s */
                 acc += (tiisg >> 3) == t ? v : 0.f;               /* and keeps it when that row is its own */
                 b += 8 * rs;
             }
@@ -11195,7 +11195,7 @@ static inline void llms_q2k_down_col_t8_impl(constant ds4_metal_args_mul_mv_id &
                 float v = part;
                 v += simd_shuffle_xor(v, (ushort)1);
                 v += simd_shuffle_xor(v, (ushort)2);              /* the four quarter lanes of a row now hold its block-8 sum */
-                v = simd_shuffle_xor(v, (ushort)(((tiisg >> 2) ^ (tiisg & 7)) << 2));   /*) */   /* lane L takes row 8 t + (L & 7)'s */
+                v = simd_shuffle_xor(v, (ushort)(((tiisg >> 2) ^ (tiisg & 7)) << 2));   /* llms tail_xor (build_tailxor.py) */   /* lane L takes row 8 t + (L & 7)'s */
                 acc += (tiisg >> 3) == t ? v : 0.f;               /* and keeps it when that row is its own */
                 b += 8 * rs;
             }
@@ -11246,7 +11246,7 @@ static inline void llms_q2k_down_colz_impl(constant ds4_metal_args_mul_mv_id & a
                 float v = part;
                 v += simd_shuffle_xor(v, (ushort)1);
                 v += simd_shuffle_xor(v, (ushort)2);              /* the four quarter lanes of a row now hold its block-8 sum */
-                v = simd_shuffle_xor(v, (ushort)(((tiisg >> 2) ^ (tiisg & 7)) << 2));   /*) */   /* lane L takes row 8 t + (L & 7)'s */
+                v = simd_shuffle_xor(v, (ushort)(((tiisg >> 2) ^ (tiisg & 7)) << 2));   /* llms tail_xor (build_tailxor.py) */   /* lane L takes row 8 t + (L & 7)'s */
                 acc += (tiisg >> 3) == t ? v : 0.f;               /* and keeps it when that row is its own */
                 b += 8 * rs;
             }
@@ -11804,7 +11804,7 @@ static inline void llms_bs64_impl(constant ds4_metal_args_mul_mv_id & args, cons
     device const uchar * gb = reinterpret_cast<device const uchar *>(gate_addr) + (uint64_t)r0 * LLMS_BS64_ROWB;
     device const uchar * ub = reinterpret_cast<device const uchar *>(up_addr) + (uint64_t)r0 * LLMS_BS64_ROWB;
     for (int r = 0; r < RTG; r++) {
-        const uint qi = uint(r) * 175u + uint(tid);   /* llms IDX32 : bounded 32-bit local indices on the wide base */
+        const uint qi = uint(r) * 175u + uint(tid);   /* llms IDX32 (Llms bs64_address_hoist): bounded 32-bit local indices on the wide base */
         const uint ci = uint(r) * 1400u + 1280u + (uint(tid) >> 1);
         const uint di = uint(r) * 350u + 340u + (uint(tid) >> 4);
         uint2 qg = ((device const uint2 *)gb)[qi], qu = ((device const uint2 *)ub)[qi];
@@ -11910,7 +11910,7 @@ static inline void llms_bs64u_impl(constant ds4_metal_args_mul_mv_id & args, con
     device const uchar * gb = reinterpret_cast<device const uchar *>(gate_addr) + (uint64_t)r0 * LLMS_BS64_ROWB;
     device const uchar * ub = reinterpret_cast<device const uchar *>(up_addr) + (uint64_t)r0 * LLMS_BS64_ROWB;
     for (int r = 0; r < RTG; r++) {
-        const uint qi = uint(r) * 175u + uint(tid);   /* llms IDX32 : bounded 32-bit local indices on the wide base */
+        const uint qi = uint(r) * 175u + uint(tid);   /* llms IDX32 (Llms bs64_address_hoist): bounded 32-bit local indices on the wide base */
         const uint ci = uint(r) * 1400u + 1280u + (uint(tid) >> 1);
         const uint di = uint(r) * 350u + 340u + (uint(tid) >> 4);
         uint2 qg = ((device const uint2 *)gb)[qi], qu = ((device const uint2 *)ub)[qi];
@@ -11989,7 +11989,7 @@ static inline void llms_bs64uf_impl(constant ds4_metal_args_mul_mv_id & args, co
     device const uchar * gb = reinterpret_cast<device const uchar *>(gate_addr) + (uint64_t)r0 * LLMS_BS64_ROWB;
     device const uchar * ub = reinterpret_cast<device const uchar *>(up_addr) + (uint64_t)r0 * LLMS_BS64_ROWB;
     for (int r = 0; r < RTG; r++) {
-        const uint qi = uint(r) * 175u + uint(tid);   /* llms IDX32 : bounded 32-bit local indices on the wide base */
+        const uint qi = uint(r) * 175u + uint(tid);   /* llms IDX32 (Llms bs64_address_hoist): bounded 32-bit local indices on the wide base */
         const uint ci = uint(r) * 1400u + 1280u + (uint(tid) >> 1);
         const uint di = uint(r) * 350u + 340u + (uint(tid) >> 4);
         uint2 qg = ((device const uint2 *)gb)[qi], qu = ((device const uint2 *)ub)[qi];
@@ -12679,3 +12679,189 @@ LLMS_BS64UF_KERNEL(kernel_llms_bs64_k4_p4_f32_uf, 4, uint4, 4)
 LLMS_BS64UF_KERNEL(kernel_llms_bs64_k1_p5_f32_uf, 1, uint, 5)
 LLMS_BS64UF_KERNEL(kernel_llms_bs64_k2_p5_f32_uf, 2, uint2, 5)
 LLMS_BS64UF_KERNEL(kernel_llms_bs64_k4_p5_f32_uf, 4, uint4, 5)
+
+/* ==== llms BS64_RB (make_moe_rb.py): row-batched reduction twins of the decode gate / up fold body ==== */
+#undef LLMS_RED_LVLF
+#define LLMS_RED_LVLF(H, OFF) { const bool up = (tiisg & (ushort)(OFF)) != 0; \
+    FOR_UNROLL (int i = 0; i < (H); i++) { const float send = up ? v[i] : v[i + (H)], keep = up ? v[i + (H)] : v[i]; v[i] = keep + simd_shuffle_xor(send, (ushort)(OFF)); } }
+#undef LLMS_RED_LVLH
+#define LLMS_RED_LVLH(H, OFF) { const bool up = (tiisg & (ushort)(OFF)) != 0; \
+    FOR_UNROLL (int i = 0; i < (H); i++) { const half2 send = up ? w[i] : w[i + (H)], keep = up ? w[i + (H)] : w[i]; w[i] = keep + as_type<half2>(simd_shuffle_xor(as_type<uint>(send), (ushort)(OFF))); } }
+template <int K, typename ET, int NPL, bool CANARY>
+static inline void llms_bs64ufrb_impl(constant ds4_metal_args_mul_mv_id & args, constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const uint64_t * gate_addrs, device const uint64_t * up_addrs, device char * dst_gate, device char * dst_up, device char * dst_mid,
+        device const char * ids, device const char * weights, device const ET * entries, device const uint * XP, device const float2 * XS, device uint * DXP, device float2 * DXS,
+        threadgroup char * shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    constexpr int V = 2 * K, NSGV = 5, RTG = 32;
+    uint pn[K]; int nrow = K;
+    uint4 e4 = uint4(0xFFFFFFFFu);
+    if (K == 8) { device const uint * e8 = (device const uint *)entries + 8u * tgpig.z; for (int k = 0; k < K; ++k) pn[k] = e8[k]; }   /* 21:0x: CF8's entries, always full */
+    else e4 = llms_cf_en(entries[tgpig.z]);
+    if (K == 8) { }
+    else if (K == 4) { nrow = e4.w != 0xFFFFFFFFu ? 4 : 3; pn[0] = e4.x; pn[1 % K] = e4.y; pn[2 % K] = e4.z; pn[K - 1] = nrow == 4 ? e4.w : e4.x; }
+    else if (K == 2) { nrow = e4.y != 0xFFFFFFFFu ? 2 : 1; pn[0] = e4.x; pn[K - 1] = nrow == 2 ? e4.y : e4.x; }
+    else { nrow = 1; pn[0] = e4.x; }
+    const bool full = nrow == K;
+    int iid1[K], idx[K];
+    for (int k = 0; k < K; ++k) { iid1[k] = (int)(pn[k] / (uint)args.nei0); idx[k] = (int)(pn[k] % (uint)args.nei0); }
+    const int32_t i02 = ((device const int32_t *)(ids + iid1[0] * args.nbi1))[idx[0]];
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) return;
+    const uint64_t gate_addr = gate_addrs[(uint)i02], up_addr = up_addrs[(uint)i02];
+    if (gate_addr == 0 || up_addr == 0) return;
+    threadgroup float * part = (threadgroup float *)shmem;   // [RTG][V][NSGV]
+    threadgroup float * fmid = part + RTG * V * NSGV;   // llms G32D_FOLD: [K][RTG] each pair's 32 mid outputs
+    const ushort tid = sgitg * 32 + tiisg, nthr = 32 * NSGV;   // the lane's sub-block of 32 inputs, 0..159
+    uint B[K][NPL]; float sx[K], sm[K];
+    for (int t = 0; t < K; t++) {
+        device const uint * xp = XP + ((uint64_t)iid1[t] * 160u + tid) * 8u;
+        for (int p = 0; p < NPL; p++) B[t][p] = xp[p];
+        const float2 s2 = XS[(uint64_t)iid1[t] * 160u + tid]; sx[t] = s2.x; sm[t] = s2.y;
+    }
+    const int r0 = tgpig.x * RTG;
+    device const uchar * gb = reinterpret_cast<device const uchar *>(gate_addr) + (uint64_t)r0 * LLMS_BS64_ROWB;
+    device const uchar * ub = reinterpret_cast<device const uchar *>(up_addr) + (uint64_t)r0 * LLMS_BS64_ROWB;
+    constexpr int RB = V >= 8 ? 1 : 8 / V;   /* llms BS64_RB: RB rows' V values reduced once as eight */
+    for (int r0 = 0; r0 < RTG; r0 += RB) {
+        float v[8];
+        for (int rr = 0; rr < RB; rr++) {
+            const int r = r0 + rr;
+            const uint qi = uint(r) * 175u + uint(tid);
+            const uint ci = uint(r) * 1400u + 1280u + (uint(tid) >> 1);
+            const uint di = uint(r) * 350u + 340u + (uint(tid) >> 4);
+            uint2 qg = ((device const uint2 *)gb)[qi], qu = ((device const uint2 *)ub)[qi];
+            if (CANARY) { qg = qg.yx; qu = qu.yx; }
+            const uint cg = gb[ci], cu = ub[ci];
+            const float2 Dg = float2(((device const half2 *)gb)[di]), Du = float2(((device const half2 *)ub)[di]);
+            const float gsx = Dg.x * float(cg & 15u), gsm = -Dg.y * float(cg >> 4), usx = Du.x * float(cu & 15u), usm = -Du.y * float(cu >> 4);
+            for (int t = 0; t < K; t++) {
+                int ag = -(int)(2u * popcount(qg.y & B[t][NPL - 1]) + popcount(qg.x & B[t][NPL - 1]));
+                int au = -(int)(2u * popcount(qu.y & B[t][NPL - 1]) + popcount(qu.x & B[t][NPL - 1]));
+                for (int p = NPL - 2; p >= 0; p--) {
+                    ag = 2 * ag + (int)(2u * popcount(qg.y & B[t][p]) + popcount(qg.x & B[t][p]));
+                    au = 2 * au + (int)(2u * popcount(qu.y & B[t][p]) + popcount(qu.x & B[t][p]));
+                }
+                v[rr * V + t] = gsx * float(ag) * sx[t] + gsm * sm[t];
+                v[rr * V + K + t] = usx * float(au) * sx[t] + usm * sm[t];
+            }
+        }
+        LLMS_RED_LVLF(4, 16) LLMS_RED_LVLF(2, 8) LLMS_RED_LVLF(1, 4) v[0] += simd_shuffle_xor(v[0], (ushort)2); v[0] += simd_shuffle_xor(v[0], (ushort)1);
+        if ((tiisg & 3) == 0) { const int q = tiisg >> 2; part[((r0 + q / V) * V + (q % V)) * NSGV + sgitg] = v[0]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float c = act.clamp_value;
+    for (int e = tid; e < RTG * K; e += nthr) {
+        const int r = e / K, t = e % K;
+        if (t == K - 1 && !full) continue;
+        float g = 0.f, u = 0.f;
+        for (int q = 0; q < NSGV; q++) { g += part[(r * V + t) * NSGV + q]; u += part[(r * V + K + t) * NSGV + q]; }
+        const uint out_row = (uint)(r0 + r);
+        /* llms RB_NE: the g store elided; nothing reads it */
+        /* llms RB_NE: the u store elided */
+        const uint64_t pair_row = (uint64_t)iid1[t] * (uint64_t)args.nei0 + (uint64_t)idx[t];
+        device float * mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
+        const float route_weight = ((device const float *)(weights + pair_row * act.weight_stride))[0];
+        if (c > 1.0e-6f) { g = min(g, c); u = clamp(u, -c, c); }
+        const float silu = g / (1.0f + exp(-g));
+        const float hv = silu * u * route_weight;
+        mid_f32[out_row] = hv;
+        fmid[t * RTG + r] = hv;   // llms G32D_FOLD
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((int)sgitg < K && ((int)sgitg < K - 1 || full)) {   /* llms G32D_FOLD: simdgroup t quantizes pair t's 32 outputs as kernel_llms_g32d_xplanes_jobs2 does (NPL 5) */
+        const int t = (int)sgitg;
+        const float v = fmid[t * RTG + (int)tiisg];
+        const float a = simd_max(fabs(v));
+        const float qmax = float((1u << (5u - 1u)) - 1u);
+        const float sc = a > 0.f ? a / qmax : 1.f;
+        const int q = (int)rint(v / sc);
+        const int sum = simd_sum(q);
+        const uint u5 = (uint)q & 31u;
+        uint pl[5];
+        FOR_UNROLL (uint b = 0; b < 5u; b++) pl[b] = (uint)(static_cast<simd_vote::vote_t>(simd_ballot(((u5 >> b) & 1u) != 0u)) & 0xFFFFFFFFull);
+        if (tiisg == 0) {
+            const uint64_t pair_row = (uint64_t)iid1[t] * (uint64_t)args.nei0 + (uint64_t)idx[t];
+            device uint * o = DXP + (pair_row * 72u + (uint64_t)tgpig.x) * 8u;
+            FOR_UNROLL (uint b = 0; b < 5u; b++) o[b] = pl[b];
+            o[5] = 0u; o[6] = 0u; o[7] = 0u;
+            DXS[pair_row * 72u + (uint64_t)tgpig.x] = float2(sc, sc * (float)sum);
+        }
+    }
+}
+#define LLMS_BS64UFRB_KERNEL(NAME, KK, ET, NPL) \
+kernel void NAME(constant ds4_metal_args_mul_mv_id & args, constant ds4_metal_dsv4_moe_swiglu_weight_args & act, \
+        device const uint64_t * gate_addrs, device const uint64_t * up_addrs, device const char * src1, device char * dst_gate, device char * dst_up, \
+        device char * dst_mid, device const char * ids, device const char * weights, device const ET * entries [[buffer(10)]], \
+        device const uint * XP [[buffer(12)]], device const float2 * XS [[buffer(13)]], device uint * DXP [[buffer(15)]], device float2 * DXS [[buffer(16)]], \
+        threadgroup char * shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    (void)src1; llms_bs64ufrb_impl<KK, ET, NPL, false>(args, act, gate_addrs, up_addrs, dst_gate, dst_up, dst_mid, ids, weights, entries, XP, XS, DXP, DXS, shmem, tgpig, tiisg, sgitg); }
+LLMS_BS64UFRB_KERNEL(kernel_llms_bs64_k1_p4_f32_ufrb, 1, uint, 4)
+LLMS_BS64UFRB_KERNEL(kernel_llms_bs64_k1_p5_f32_ufrb, 1, uint, 5)
+LLMS_BS64UFRB_KERNEL(kernel_llms_bs64_k2_p4_f32_ufrb, 2, uint2, 4)
+LLMS_BS64UFRB_KERNEL(kernel_llms_bs64_k2_p5_f32_ufrb, 2, uint2, 5)
+
+// ---- llms BS64_GDD (make_moe_gdd.py): the two-row decode call's pairs deduplicated ON THE GPU -- the routed call is event-driven,
+// encoded before the picks exist, so the host cannot build its two-row entries; a builder kernel writes them from the ids the routed kernels read. ----
+kernel void kernel_llms_bs64_gdd_build(constant ds4_metal_args_mul_mv_id & args [[buffer(0)]], device const char * ids [[buffer(8)]], device uint2 * E [[buffer(10)]],
+        device atomic_uint * stat [[buffer(19)]], uint gid [[thread_position_in_grid]]) {
+    const uint n0 = (uint)args.nei0, row = gid / n0, slot = gid % n0;
+    if (row > 1u) { E[gid] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu); return; }
+    device const int32_t * r0 = (device const int32_t *)(ids), * r1 = (device const int32_t *)(ids + args.nbi1);
+    const int32_t id = (row == 0u ? r0 : r1)[slot];
+    if (id < 0 || id >= args.ne02 || id >= 384) { E[gid] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu); return; }
+    device const int32_t * other = row == 0u ? r1 : r0; uint m = 0xFFFFFFFFu;
+    for (uint j = 0; j < n0; ++j) if (other[j] == id) { m = j; break; }
+    if (m == 0xFFFFFFFFu) { E[gid] = uint2(gid, 0xFFFFFFFFu); atomic_fetch_add_explicit(&stat[1], 1u, memory_order_relaxed); return; }
+    if (row == 0u) { E[gid] = uint2(gid, n0 + m); atomic_fetch_add_explicit(&stat[0], 1u, memory_order_relaxed); }
+    else E[gid] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+}
+#define LLMS_BS64_GDD_KERNEL(NAME, IMPL, NPL) \
+kernel void NAME(constant ds4_metal_args_mul_mv_id & args, constant ds4_metal_dsv4_moe_swiglu_weight_args & act, \
+        device const uint64_t * gate_addrs, device const uint64_t * up_addrs, device const char * src1, device char * dst_gate, device char * dst_up, \
+        device char * dst_mid, device const char * ids, device const char * weights, device const uint2 * entries [[buffer(10)]], \
+        device const uint * XP [[buffer(12)]], device const float2 * XS [[buffer(13)]], device uint * DXP [[buffer(15)]], device float2 * DXS [[buffer(16)]], \
+        threadgroup char * shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    (void)src1; if (entries[tgpig.z].x == 0xFFFFFFFFu) return;   /* a duplicate's second pair, or an invalid id: its partner's job (or nobody) computes it */ \
+    IMPL<2, uint2, NPL, false>(args, act, gate_addrs, up_addrs, dst_gate, dst_up, dst_mid, ids, weights, entries, XP, XS, DXP, DXS, shmem, tgpig, tiisg, sgitg); }
+LLMS_BS64_GDD_KERNEL(kernel_llms_bs64_k2_p4_f32_uf_gdd, llms_bs64uf_impl, 4)
+LLMS_BS64_GDD_KERNEL(kernel_llms_bs64_k2_p5_f32_uf_gdd, llms_bs64uf_impl, 5)
+LLMS_BS64_GDD_KERNEL(kernel_llms_bs64_k2_p4_f32_ufrb_gdd, llms_bs64ufrb_impl, 4)
+LLMS_BS64_GDD_KERNEL(kernel_llms_bs64_k2_p5_f32_ufrb_gdd, llms_bs64ufrb_impl, 5)
+
+// ---- llms BS64_GDD 3 (make_moe_gdd2.py): singles on the shipped row-batched one-row body, duplicates on the two-row body ----
+kernel void kernel_llms_bs64_gdd_build2(constant ds4_metal_args_mul_mv_id & args [[buffer(0)]], device const char * ids [[buffer(8)]], device uint2 * E [[buffer(10)]],
+        device atomic_uint * stat [[buffer(19)]], device uint * S [[buffer(20)]], uint gid [[thread_position_in_grid]]) {
+    const uint n0 = (uint)args.nei0, row = gid / n0, slot = gid % n0;
+    E[gid] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu); S[gid] = 0xFFFFFFFFu;
+    if (row > 1u) return;
+    device const int32_t * r0 = (device const int32_t *)(ids), * r1 = (device const int32_t *)(ids + args.nbi1);
+    const int32_t id = (row == 0u ? r0 : r1)[slot];
+    if (id < 0 || id >= args.ne02 || id >= 384) return;
+    device const int32_t * other = row == 0u ? r1 : r0; uint m = 0xFFFFFFFFu;
+    for (uint j = 0; j < n0; ++j) if (other[j] == id) { m = j; break; }
+    if (m == 0xFFFFFFFFu) { S[gid] = gid; atomic_fetch_add_explicit(&stat[1], 1u, memory_order_relaxed); return; }
+    if (row == 0u) { E[gid] = uint2(gid, n0 + m); atomic_fetch_add_explicit(&stat[0], 1u, memory_order_relaxed); }
+}
+#define LLMS_BS64_GDD1_KERNEL(NAME, NPL) \
+kernel void NAME(constant ds4_metal_args_mul_mv_id & args, constant ds4_metal_dsv4_moe_swiglu_weight_args & act, \
+        device const uint64_t * gate_addrs, device const uint64_t * up_addrs, device const char * src1, device char * dst_gate, device char * dst_up, \
+        device char * dst_mid, device const char * ids, device const char * weights, device const uint * entries [[buffer(10)]], \
+        device const uint * XP [[buffer(12)]], device const float2 * XS [[buffer(13)]], device uint * DXP [[buffer(15)]], device float2 * DXS [[buffer(16)]], \
+        threadgroup char * shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    (void)src1; if (entries[tgpig.z] == 0xFFFFFFFFu) return;   /* not a single: its two-row job, or nobody, computes it */ \
+    llms_bs64ufrb_impl<1, uint, NPL, false>(args, act, gate_addrs, up_addrs, dst_gate, dst_up, dst_mid, ids, weights, entries, XP, XS, DXP, DXS, shmem, tgpig, tiisg, sgitg); }
+LLMS_BS64_GDD1_KERNEL(kernel_llms_bs64_k1_p4_f32_ufrb_gdd, 4)
+LLMS_BS64_GDD1_KERNEL(kernel_llms_bs64_k1_p5_f32_ufrb_gdd, 5)
+#define LLMS_BS64_GDD2_KERNEL(NAME, NPL) \
+kernel void NAME(constant ds4_metal_args_mul_mv_id & args, constant ds4_metal_dsv4_moe_swiglu_weight_args & act, \
+        device const uint64_t * gate_addrs, device const uint64_t * up_addrs, device const char * src1, device char * dst_gate, device char * dst_up, \
+        device char * dst_mid, device const char * ids, device const char * weights, device const uint2 * entries [[buffer(10)]], \
+        device const uint * XP [[buffer(12)]], device const float2 * XS [[buffer(13)]], device uint * DXP [[buffer(15)]], device float2 * DXS [[buffer(16)]], \
+        threadgroup char * shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    (void)src1; { const uint2 e = entries[tgpig.z]; if (e.x == 0xFFFFFFFFu || e.y == 0xFFFFFFFFu) return; }   /* only a true two-row entry */ \
+    llms_bs64ufrb_impl<2, uint2, NPL, false>(args, act, gate_addrs, up_addrs, dst_gate, dst_up, dst_mid, ids, weights, entries, XP, XS, DXP, DXS, shmem, tgpig, tiisg, sgitg); }
+LLMS_BS64_GDD2_KERNEL(kernel_llms_bs64_k2_p4_f32_ufrb_gdd2, 4)
+LLMS_BS64_GDD2_KERNEL(kernel_llms_bs64_k2_p5_f32_ufrb_gdd2, 5)

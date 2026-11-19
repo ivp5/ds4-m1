@@ -2576,8 +2576,15 @@ bad:
     return false;
 }
 
+static int llms_server_official_tools(void) {   /* llms SERVER_OFFICIAL_TOOLS (apply_server_official_tools.py) */
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LLMS_DS4_SERVER_OFFICIAL_TOOLS"); v = e && *e && *e != '0';
+                 if (v) fprintf(stderr, "llms: server official tools (the V4.1 tools section in the official encoder's text, after the first system message)\n"); }
+    return v;
+}
 static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
     if (!tool_schemas || !tool_schemas[0]) return;
+    if (v41 && llms_server_official_tools()) { buf_puts(b, "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n"); buf_puts(b, tool_schemas); buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n"); return; }   /* llms SERVER_OFFICIAL_TOOLS */
     if (v41) buf_puts(b,
         "## Tools\n\n"
         "You can invoke tools using this format:\n\n"
@@ -3139,6 +3146,7 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
     const char *effort = ds4_deepseek41_reasoning_effort_text(mode);
     bool initial_system = false, pending = false, user_open = false;
     int last_user = -1;
+    const bool llms_ot_defer = llms_server_official_tools() && !live_tail && tool_schemas && tool_schemas[0] && msgs && start == 0 && msgs->len > 0 && role_is_system(ordered[0]->role);   /* llms SERVER_OFFICIAL_TOOLS: the official order */
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role) || (i > 0 && role_is_system(m->role))) last_user = i;
@@ -3151,7 +3159,7 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
             buf_puts(&out, "<｜System｜>");
             initial_system = true;
             if (effort) buf_puts(&out, effort);
-            if (tool_schemas && tool_schemas[0])
+            if (tool_schemas && tool_schemas[0] && !llms_ot_defer)
                 append_tools_prompt_text(&out, tool_schemas, true);
         }
     }
@@ -3159,9 +3167,10 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
         const chat_msg *m = ordered[i];
         if (role_is_system(m->role)) {
             if (i == 0 && initial_system) {
-                if (tool_schemas && tool_schemas[0]) buf_puts(&out, "\n\n");
+                if (tool_schemas && tool_schemas[0] && !llms_ot_defer) buf_puts(&out, "\n\n");
             } else buf_puts(&out, "<｜System｜>");
             buf_puts(&out, m->content ? m->content : "");
+            if (i == 0 && llms_ot_defer) { buf_puts(&out, "\n\n"); append_tools_prompt_text(&out, tool_schemas, true); }   /* llms SERVER_OFFICIAL_TOOLS: content, then the tools */
             pending = i > 0 || live_tail;
             user_open = false;
         } else if (role_is_user_like(m->role)) {

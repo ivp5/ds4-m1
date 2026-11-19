@@ -1800,6 +1800,11 @@ static void report_gateup_side(void) {
             (unsigned long long)gateup_side_translated_calls, (unsigned long long)gateup_side_tables_translated, (unsigned long long)gateup_side_reads, (unsigned long long)gateup_side_rejected_notes);
 }
 static int bs64_side_format;   /* llms BS64 (apply_bs64_gen.py): the side file is the G64 code (1,400 B rows) */
+static int compact_nw_state = -1;   /* llms COMPACT_NW (apply_compact_nw.py): side files holding 1,024-unit experts only; OFF unless set */
+static int compact_nw_on(void) { if (compact_nw_state < 0) { const char *e = getenv("LLMS_DS4_COMPACT_NW"); compact_nw_state = e && *e && strcmp(e, "0") ? (strcmp(e, "1") ? atoi(e) : 32) : 0;   /* llms compact_nw_groups (apply_compact_nw2.py): the width in groups of 32 units; '1' = 32 */
+    if (compact_nw_state && (compact_nw_state % 8 || compact_nw_state < 8 || compact_nw_state > 64)) { fprintf(stderr, "llms: COMPACT_NW refused: %d groups is not a multiple of 8 in 8..64\n", compact_nw_state); exit(2); }
+    if (compact_nw_state) fprintf(stderr, "llms: COMPACT_NW -- the routed side files hold %d-unit experts (gate / up %d rows, the down's first %d column groups); every layer must run LLMS_DS4_ROUTED_G %d\n", 32 * compact_nw_state, 32 * compact_nw_state, compact_nw_state, compact_nw_state); }
+    return compact_nw_state; }
 static int gateup_side_on(void) {
     if (gateup_side_state > -2) return gateup_side_state;
     gateup_side_state = 0;
@@ -1812,7 +1817,9 @@ static int gateup_side_on(void) {
     if (pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h || (memcmp(h, "BS6C", 4) != 0 && memcmp(h, "BS64", 4) != 0)) { fprintf(stderr, "llms: LLMS_DS4_GATEUP_BS64 ignored: %s is not a BS6C / BS64 file\n", e); close(fd); return 0; }
     bs64_side_format = memcmp(h, "BS64", 4) == 0;   /* llms BS64 */
     memcpy(u32, h + 4, sizeof u32); memcpy(u64, h + 24, sizeof u64);   /* version, layers, experts, rows, cols | matrix, expert, layer bytes, data offset */
-    if (u32[0] != 1u || u32[1] != 40u || u32[2] != 384u || u32[3] != 2304u || u32[4] != 5120u || u64[0] != 2304ull * (bs64_side_format ? 1400ull : 1520ull) ||   /* llms BS64 */ u64[1] != 2ull * u64[0] ||
+    const uint32_t gu_rows = compact_nw_on() ? 32u * (uint32_t)compact_nw_on() : 2304u;   /* llms COMPACT_NW (width in groups, apply_compact_nw2.py) */
+    if (compact_nw_on() && !bs64_side_format) { fprintf(stderr, "llms: COMPACT_NW refused: it needs a BS64 side file\n"); exit(2); }
+    if (u32[0] != 1u || u32[1] != 40u || u32[2] != 384u || u32[3] != gu_rows || u32[4] != 5120u || u64[0] != (uint64_t)gu_rows * (bs64_side_format ? 1400ull : 1520ull) ||   /* llms BS64 */ u64[1] != 2ull * u64[0] ||
         u64[2] != 384ull * u64[1] || u64[3] != 16384ull) { fprintf(stderr, "llms: LLMS_DS4_GATEUP_BS64 ignored: unexpected header in %s\n", e); close(fd); return 0; }
     const int gateup_partial_env = getenv("LLMS_DS4_GATEUP_BS64_PARTIAL") != NULL;   /* apply_bs6c_partial.py */
     if (gateup_partial_env) fprintf(stderr, "llms: bs6c PARTIAL -- the completeness check is skipped: missing layers read as zero weights (a plumbing test, NOT the model)\n");
@@ -1855,6 +1862,7 @@ static int gateup_mix_on(void) {
 
 #include "ds4_g16_delta.h"   /* LLMS_DS4_DOWN_G16_DELTA / LLMS_DS4_DOWN_G8_DELTA: OFF unless set; source/layout pairing checked below. */
 
+static int g8f_direct; static uint64_t g8f_identity;   /* llms G8_FILE (apply_g8_file.py): the G8 down read from one materialized file; the delta reader stays inactive */
 static int g16d_mtp_source_format(const char *src) {
     int fd=open(src,O_RDONLY|O_CLOEXEC); if(fd<0)return 0;
     char header[256]={0}; ssize_t n=pread(fd,header,sizeof header-1,0); close(fd);
@@ -1882,8 +1890,9 @@ static int down_side_on(void) {
     unsigned char h[72]; uint32_t u32[5]; uint64_t u64[6];
     if (pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h || memcmp(h, "G32D", 4) != 0) { fprintf(stderr, "llms: LLMS_DS4_DOWN_G32 ignored: %s is not a G32D file\n", e); close(fd); return 0; }
     memcpy(u32, h + 4, sizeof u32); memcpy(u64, h + 24, sizeof u64);   /* version, layers, experts, rows, cols | matrix, layer bytes, data offset, q / s / dd offsets */
-    if (u32[0] != 1u || u32[1] != 40u || u32[2] != 384u || u32[3] != 5120u || u32[4] != 2304u || u64[0] != 3502080ull || u64[1] != 384ull * u64[0] ||
-        u64[2] != 16384ull || u64[3] != 0ull || u64[4] != 2949120ull || u64[5] != 3317760ull) { fprintf(stderr, "llms: LLMS_DS4_DOWN_G32 ignored: unexpected header in %s\n", e); close(fd); return 0; }
+    const int cnw = compact_nw_on();   /* llms COMPACT_NW: the record is the first 32 groups' Q, S and the first 4 super-blocks' DD */
+    if (u32[0] != 1u || u32[1] != 40u || u32[2] != 384u || u32[3] != 5120u || u32[4] != (cnw ? 32u * (uint32_t)cnw : 2304u) || u64[0] != (cnw ? 48640ull * (uint64_t)cnw : 3502080ull) || u64[1] != 384ull * u64[0] ||   /* apply_compact_nw2.py: N groups */
+        u64[2] != 16384ull || u64[3] != 0ull || u64[4] != (cnw ? 40960ull * (uint64_t)cnw : 2949120ull) || u64[5] != (cnw ? 46080ull * (uint64_t)cnw : 3317760ull)) { fprintf(stderr, "llms: LLMS_DS4_DOWN_G32 ignored: unexpected header in %s\n", e); close(fd); return 0; }
     for (uint32_t L = 0; L < 40u; L++) {   /* a layer never written is a hole of zeros: check its first and its last record */
         unsigned char a[64], b[64]; int nz = 0;
         if (pread(fd, a, 64, (off_t)(u64[2] + L * u64[1])) != 64 || pread(fd, b, 64, (off_t)(u64[2] + (L + 1ull) * u64[1] - 64ull)) != 64) nz = -1;
@@ -1896,11 +1905,24 @@ static int down_side_on(void) {
         const char *gd16=getenv("LLMS_DS4_DOWN_G16_DELTA"), *gd8=getenv("LLMS_DS4_DOWN_G8_DELTA");
         const int want16=gd16&&*gd16&&strcmp(gd16,"0"), want8=gd8&&*gd8&&strcmp(gd8,"0");
         if(want16&&want8){fprintf(stderr,"llms down delta: two formats selected; refusing\n");_exit(2);}
-        const unsigned group=want8 ? 8u : want16 ? 16u : 0u;
+        const char *g8f=getenv("LLMS_DS4_DOWN_G8_FILE"); const int wantf=g8f&&*g8f&&strcmp(g8f,"0");   /* llms G8_FILE */
+        if(wantf&&(want16||want8)){fprintf(stderr,"llms down g8 file: a delta switch is also set; refusing\n");_exit(2);}
+        const unsigned group=(want8||wantf) ? 8u : want16 ? 16u : 0u;
         if(g16d_source_group(src)!=(int)group){fprintf(stderr,"llms down delta: source/layout mismatch; refusing\n");_exit(2);}
         if(group){
             if(!g16d_mtp_source_format(src)){fprintf(stderr,"llms down delta: original G32 drafter bank consumer missing; refusing\n");_exit(2);}
-            if(!g16d_choose_group(group) || !g16d_open(want8 ? gd8 : gd16,fd,u64[2]))_exit(2);
+            if(wantf){   /* llms G8_FILE: header 'G8DF', then the G32D file's fields with the G8 record size; records at 16384 + (layer * 384 + expert) * 4608000 */
+                if(!g16d_choose_group(8u))_exit(2);
+                const int f8=open(g8f,O_RDONLY|O_CLOEXEC); unsigned char h8[72]; uint32_t a32[5]; uint64_t a64[6]; struct stat st8;
+                if(f8<0 || fstat(f8,&st8) || pread(f8,h8,sizeof h8,0)!=(ssize_t)sizeof h8 || memcmp(h8,"G8DF",4)){fprintf(stderr,"llms down g8 file: cannot open %s or not a G8DF file; refusing\n",g8f);_exit(2);}
+                memcpy(a32,h8+4,sizeof a32); memcpy(a64,h8+24,sizeof a64);
+                if(a32[0]!=1u||a32[1]!=40u||a32[2]!=384u||a32[3]!=5120u||a32[4]!=2304u||a64[0]!=(uint64_t)g16d_new_bytes||a64[1]!=384ull*a64[0]||a64[2]!=16384ull||a64[3]!=0ull||a64[4]!=2949120ull||a64[5]!=2949120ull+1474560ull||
+                   (uint64_t)st8.st_size!=16384ull+40ull*a64[1]){fprintf(stderr,"llms down g8 file: unexpected header or size in %s; refusing\n",g8f);_exit(2);}
+                (void)fcntl(f8,F_NOCACHE,1); (void)fcntl(f8,F_RDAHEAD,0);
+                close(fd); down_side_fd=f8; down_side_data_offset=a64[2]; g8f_direct=1;
+                { const uint64_t meta[]={(uint64_t)st8.st_ino,(uint64_t)st8.st_size,(uint64_t)st8.st_mtimespec.tv_sec,(uint64_t)st8.st_mtimespec.tv_nsec}; g8f_identity=g16d_mix(g16d_mix(1469598103934665603ull,meta,sizeof meta),h8,sizeof h8); }
+                fprintf(stderr,"llms: group8 down FILE (%s; %zu-byte records read directly; identity %016llx)\n",g8f,g16d_new_bytes,(unsigned long long)g8f_identity);
+            } else if(!g16d_choose_group(group) || !g16d_open(want8 ? gd8 : gd16,fd,u64[2]))_exit(2);
             down_side_matrix_bytes=g16d_new_bytes;down_side_layer_bytes=384ull*g16d_new_bytes;
         }
     }
@@ -2067,6 +2089,18 @@ static int event_driven_on(void) {
 static int decode_route_state = -1; static float decode_resident_bonus; static int decode_route_check_mode;   /* llms ONE_RPOL (apply_one_rpol.py) */
 /* llms SP_BCTX: moved to struct sp_bctx */ /* route_bias_host */
 static int gateup_side_refused;    /* llms BS6C_FALLBACK (apply_bs6c_fallback.py) */
+static uint64_t g_routed_g_calls; static int g_llms_routed_layer = -1, g_routed_g_lo = 0, g_routed_g_hi = 63;   /* llms ROUTED_G by layer (apply_routed_g2.py) */
+static NSUInteger llms_routed_g(void) {   /* llms ROUTED_G (apply_routed_g.py): the first G of 72 hidden-unit groups; unset = 72 */
+    static int g = -1;
+    if (g < 0) { const char *e = getenv("LLMS_DS4_ROUTED_G"), *r = getenv("LLMS_DS4_ROUTED_G_LAYERS"); g = e && *e ? atoi(e) : 72; if (g < 1 || g > 72) g = 72;
+                 if (r && *r && strchr(r, '-')) { g_routed_g_lo = atoi(r); g_routed_g_hi = atoi(strchr(r, '-') + 1); if (g != 72) fprintf(stderr, "llms: ROUTED_G confined to layers %d-%d\n", g_routed_g_lo, g_routed_g_hi); }
+                 if (compact_nw_on() && (g != compact_nw_on() || g_routed_g_lo > 0 || g_routed_g_hi < 39)) { fprintf(stderr, "llms: COMPACT_NW refused: it needs LLMS_DS4_ROUTED_G %d on layers 0-39 (got G %d, layers %d-%d)\n", compact_nw_on(), g, g_routed_g_lo, g_routed_g_hi); exit(2); }
+                 if (g != 72) { fprintf(stderr, "llms: ROUTED_G %d -- routed gate / up and the down's mid planes run on the first %d hidden units of 2304 (a PRICING INSTRUMENT unless the payload is narrow)\n", g, g * 32);
+                                atexit_b(^{ fprintf(stderr, "llms routed g: %llu limited dispatches\n", (unsigned long long)g_routed_g_calls); }); } }
+    if (g == 72 || g_llms_routed_layer < g_routed_g_lo || g_llms_routed_layer > g_routed_g_hi) return 72;
+    g_routed_g_calls++;
+    return (NSUInteger)g;
+}
 static uint64_t decode_route_calls, decode_selections_changed, decode_experts_swapped, decode_check_mismatches, decode_calls_without_inputs;
 void ds4_gpu_llms_set_route_bias(const float *bias) { route_bias_host = bias; }
 static void report_decode_route(void) {
@@ -7925,11 +7959,27 @@ static int g32fold_on(void) {
                                                  (unsigned long long)g32fold_armed_calls, (unsigned long long)g32fold_used_calls, (unsigned long long)g32fold_declined_calls); }); } }
     return g32fold_state && !llms_alt_off("g32fold");
 }
+
+
+static int bs64_rb_state = -1; static unsigned bs64_rb_picked; static uint64_t bs64_rb_calls, bs64_rb_alt_off;   /* llms BS64_RB v2 (apply_bs64_rb.py): row-batched reduction twin of the decode gate / up K 1 fold body */
+static int bs64_rb_on(void) {
+    if (bs64_rb_state < 0) { const char *e = getenv("LLMS_DS4_BS64_RB"); bs64_rb_state = e && *e && *e != '0';
+        if (bs64_rb_state) { fprintf(stderr, "llms: bs64 rb (the decode gate / up K 1 fold body reduces 4 weight rows at once: kernel_llms_bs64_k1_p*_f32_ufrb; ALT rb)\n");
+                             atexit_b(^{ fprintf(stderr, "llms bs64 rb: %u pipelines picked, %llu calls on the rb body, %llu calls ALT-off\n", bs64_rb_picked, (unsigned long long)bs64_rb_calls, (unsigned long long)bs64_rb_alt_off); }); } }
+    return bs64_rb_state;
+}
 static id<MTLComputePipelineState> pick_bs64_fold_pipeline(int kq, int npl) {   /* llms G32D_FOLD: the *_uf twin, or nil (the fold then stays off) */
     static id<MTLComputePipelineState> c[3][2]; static int tried[3][2]; if (npl != 4 && npl != 5) return nil; const int ni = npl == 5 ? 1 : 0;
     if (!tried[kq][ni]) { tried[kq][ni] = 1; char nm[80]; snprintf(nm, sizeof nm, "kernel_llms_bs64_k%d_p%d_f32_uf", kq == 0 ? 1 : kq == 1 ? 2 : 4, npl);
         c[kq][ni] = has_kernel(nm) ? ds4_gpu_get_pipeline_or_die(nm) : nil;
         if (!c[kq][ni]) fprintf(stderr, "llms g32d fold: %s is not in DS4_METAL_MOE_SOURCE (make_moe_fold.py) -- the fold stays off\n", nm); }
+    if (kq == 0 && c[0][ni] && bs64_rb_on()) {   /* llms BS64_RB v2: K 1 only; ALT 'rb' OFF -> the shipped body on this step */
+        static id<MTLComputePipelineState> crb[2]; static int rtried[2];
+        if (!rtried[ni]) { rtried[ni] = 1; char nr[80]; snprintf(nr, sizeof nr, "kernel_llms_bs64_k1_p%d_f32_ufrb", npl);
+            if (has_kernel(nr)) { crb[ni] = ds4_gpu_get_pipeline_or_die(nr); bs64_rb_picked++; }
+            else fprintf(stderr, "llms bs64 rb: %s is not in DS4_METAL_MOE_SOURCE (make_moe_rb.py) -- the shipped body runs\n", nr); }
+        if (crb[ni]) { if (llms_alt_off("rb")) bs64_rb_alt_off++; else { bs64_rb_calls++; return crb[ni]; } }
+    }
     return c[kq][ni];
 }
 /* llms ROUTED_DC (apply_routed_dc.py): the per-expert DC correction of the routed codec -- b1 / b3 added to the gate / up pre-activations (the *_dc twins, buffer 18) and w x b2 added per live slot in the down's six-slot sum. LLMS_DS4_ROUTED_DC=<DCV1 side file>; off unless set; ALT 'rdc'. The source must be make_moe_dc.py's *_dc MoE source. */
@@ -12674,6 +12724,20 @@ static id make_ane_request(unsigned k, uint64_t wv, id<MTLSharedEvent> wev, uint
     if (ane_reuse_requests) { ane_request_cache[ane_current_layer][k] = rq; ane_wait_event_cache[ane_current_layer][k] = we; ane_signal_event_cache[ane_current_layer][k] = se; }   /* llms ANE_STALL */
     return rq;
 }
+/* llms ANE_NOCOMPILE (apply_ane_nocompile.py): LLMS_DS4_ANE_NOCOMPILE=1 -- skip compileModel when the client says a compiled model exists */
+static int ane_nocompile_state = -1; static uint64_t ane_nocompile_skipped, ane_nocompile_ran, ane_nocompile_nosel;
+static BOOL llms_ane_compile(id client, id model, id opt, NSError **err) {
+    if (ane_nocompile_state < 0) { const char *e = getenv("LLMS_DS4_ANE_NOCOMPILE"); ane_nocompile_state = e && *e && *e != '0';
+        if (ane_nocompile_state) { fprintf(stderr, "llms: ane nocompile (compileModel skipped when compiledModelExistsFor: answers yes)\n");
+            atexit_b(^{ fprintf(stderr, "llms ane nocompile: %llu compiles skipped, %llu run, %llu without the selector\n", (unsigned long long)ane_nocompile_skipped, (unsigned long long)ane_nocompile_ran, (unsigned long long)ane_nocompile_nosel); }); } }
+    if (ane_nocompile_state && model) {
+        SEL s = sel_registerName("compiledModelExistsFor:");
+        if ([client respondsToSelector:s]) { if (((BOOL(*)(id, SEL, id))objc_msgSend)(client, s, model)) { ane_nocompile_skipped++; return YES; } }
+        else ane_nocompile_nosel++;
+    }
+    if (ane_nocompile_state) ane_nocompile_ran++;
+    return ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(client, sel_registerName("compileModel:options:qos:error:"), model, opt, (NSInteger)0x21, err);
+}
 static int init_ane_shexp(void) {
     @autoreleasepool {
         const double t0 = ds4_gpu_now_ms();
@@ -12693,7 +12757,7 @@ static int init_ane_shexp(void) {
         for (unsigned l = 0; l < ane_shexp_layers(); l++) {   /* llms ANE_SHEXP_LAYERS */
             NSString *p = [NSString stringWithFormat:@"%@/shexp_L%u_T128.mlmodelc", dir, l]; NSError *e = nil;
             id m = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], [NSString stringWithFormat:@"shexp%u", l]);
-            BOOL ok = m && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("compileModel:options:qos:error:"), m, opt, (NSInteger)0x21, &e) &&
+            BOOL ok = m && llms_ane_compile(ane_client, m, opt, &e) &&
                            ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("loadModel:options:qos:error:"), m, opt, (NSInteger)0x21, &e);
             if (!ok) { fprintf(stderr, "llms ane shexp: layer %u program %s failed to load (%s) -- off\n", l, [p UTF8String], e ? [[e localizedDescription] UTF8String] : "?"); return 0; }
             ane_layer_models[l] = m;
@@ -12743,7 +12807,7 @@ static int init_ane_shexp(void) {
           if (ane_keepalive_on || dense_prewarm_on()) {   /* llms DPREWARM: the program loads for the worker too */   /* the keepalive's tiny program: 64 x 512 -> 256 fp16 (models/fp16_T64_K512_N256.mlmodelc) */
               NSString *p = [NSString stringWithFormat:@"%@/fp16_T64_K512_N256.mlmodelc", dir]; NSError *ee = nil;
               id m = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], @"shexp_ka");
-              BOOL ok = m && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("compileModel:options:qos:error:"), m, opt, (NSInteger)0x21, &ee) &&
+              BOOL ok = m && llms_ane_compile(ane_client, m, opt, &ee) &&
                              ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("loadModel:options:qos:error:"), m, opt, (NSInteger)0x21, &ee);
               if (ok) {
                   IOSurfaceRef kx = ((IOSurfaceRef(*)(Class, SEL, NSInteger, NSInteger, NSInteger))objc_msgSend)(SO, sel_registerName("createIOSurfaceWithWidth:pixel_size:height:"), 512, 2, 64);
@@ -13044,7 +13108,7 @@ static int init_ane_qb(void) {
     for (unsigned l = 0; l < ane_qb_nlayers; l++) for (unsigned hh = 0; hh < 2; hh++) {
         NSString *p = [NSString stringWithFormat:@"%@/L%u_q_b_h%u.mlmodelc", dir, l, hh]; NSError *er = nil;
         id m = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], [NSString stringWithFormat:@"qb%u_%u", l, hh]);
-        BOOL ok = m && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_qb_client, sel_registerName("compileModel:options:qos:error:"), m, opt, (NSInteger)0x21, &er) &&
+        BOOL ok = m && llms_ane_compile(ane_qb_client, m, opt, &er) &&
                        ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_qb_client, sel_registerName("loadModel:options:qos:error:"), m, opt, (NSInteger)0x21, &er);
         if (!ok) { fprintf(stderr, "llms ane qb: layer %u half %u program %s failed to load (%s) -- off\n", l, hh, [p UTF8String], er ? [[er localizedDescription] UTF8String] : "?"); return 0; }
         ane_qb_models[l][hh] = m;
@@ -13205,7 +13269,7 @@ static int inload_start(void) {
     for (int j = 0; j < 4; j++) {
         NSString *p = [NSString stringWithFormat:@"ane/dense2s/%s.mlmodelc", paths[j]]; NSError *e = nil;
         id md = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], [NSString stringWithFormat:@"inl_%d", j]);
-        const BOOL ok = md && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(inload_cl, sel_registerName("compileModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e)
+        const BOOL ok = md && llms_ane_compile(inload_cl, md, opt, &e)
                            && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(inload_cl, sel_registerName("loadModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e);
         if (!ok) { fprintf(stderr, "llms ane inload: load FAILED %s (%s) -- off\n", paths[j], e ? [[e localizedDescription] UTF8String] : "?"); return 0; }
         IOSurfaceRef sx = ((IOSurfaceRef(*)(Class, SEL, NSInteger, NSInteger, NSInteger))objc_msgSend)(SO, sel_registerName("createIOSurfaceWithWidth:pixel_size:height:"), K[j], 2, 128);
@@ -13231,6 +13295,7 @@ void ds4_gpu_llms_inload_phase(int on) {
     else { const uint64_t q = __atomic_load_n(&inload_seq, __ATOMIC_ACQUIRE); if (q < INL2_C) inl2_end[q] = inload_now_ms(); }
     __atomic_store_n(&inload_phase, on, __ATOMIC_RELEASE);
 }
+static uint64_t ane_post_slow, ane_post_slow_ok; static double ane_post_slow_max_ms;   /* llms POST_WAIT */
 static int ane_dense_post; static id<MTLBuffer> ane_dense_post_box, ane_dense_flag_buf, ane_dense_flag_st; static id<MTLComputePipelineState> ane_dense_post_ps, ane_dense_poll_ps;   /* llms V12B_POST */
 static int ane_dense_pollw; static id<MTLBuffer> ane_dense_pollw_done; static id<MTLComputePipelineState> ane_dense_pollw_ps; static uint64_t ane_dense_pollw_n;   /* llms POLLW (apply_pollw.py) */
 static int ane_dense_evdist = -1; static float ane_dense_ev_ms[8192]; static unsigned ane_dense_ev_n;   /* llms V12B_EVDIST */
@@ -13303,7 +13368,7 @@ static int init_ane_dense(void) {
         { const char *qa = getenv("LLMS_DS4_ANE_DENSE_QAKV_MODEL"); if (j == 0 && qa && *qa) { p = [NSString stringWithUTF8String:qa]; fprintf(stderr, "llms ane dense multi: qakv model %s (pack)\n", qa); } }   /* ds4m1 pack: the qakv model's path from the pack */
         { const char *qm = getenv("LLMS_DS4_ANE_DENSE_QB_MODEL"); if (j == 1 && qm && *qm) { p = [NSString stringWithUTF8String:qm]; fprintf(stderr, "llms ane dense multi: q_b model %s (T1QBMODEL)\n", qm); } }   /* llms T1QBMODEL*/
         id md = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], [NSString stringWithFormat:@"admq_%u", j]);
-        BOOL ok = md && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("compileModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e) &&
+        BOOL ok = md && llms_ane_compile(ane_client, md, opt, &e) &&
                        ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("loadModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e);
         if (!ok) { fprintf(stderr, "llms ane dense multi: %s failed to load (%s) -- off\n", [p UTF8String], e ? [[e localizedDescription] UTF8String] : "?"); return 0; }
         ane_dense_mm[j] = md; }
@@ -13311,7 +13376,7 @@ static int init_ane_dense(void) {
         if (ane_dense_multi) { ane_dense_programs[l][j] = ane_dense_mm[j]; continue; }   /* llms T1MULTI: the model of its kind; the request picks the procedure */
         NSString *p = [NSString stringWithFormat:@"%@/L%u_%s.mlmodelc", dir, l, nm[j]]; NSError *e = nil;
         id md = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], [NSString stringWithFormat:@"ad%u_%u", l, j]);
-        BOOL ok = md && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("compileModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e) &&
+        BOOL ok = md && llms_ane_compile(ane_client, md, opt, &e) &&
                        ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("loadModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e);
         if (!ok) { fprintf(stderr, "llms ane dense: layer %u program %s failed to load (%s) -- off\n", l, [p UTF8String], e ? [[e localizedDescription] UTF8String] : "?"); return 0; }
         ane_dense_programs[l][j] = md;
@@ -13434,14 +13499,14 @@ static int init_ane_oab(void) {
     if (ane_oab_multi) { NSError *e = nil; NSString *p = @"ane/dense3_multi/oab20.mlmodelc";
         { const char *mp = getenv("LLMS_DS4_ANE_OAB_MULTI_MODEL"); if (mp && *mp) { p = [NSString stringWithUTF8String:mp]; fprintf(stderr, "llms ane oab multi: model %s (T2MODEL)\n", mp); } }   /* llms T2MODEL*/
         id md = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], @"aom");
-        BOOL ok = md && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("compileModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e) &&
+        BOOL ok = md && llms_ane_compile(ane_client, md, opt, &e) &&
                        ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("loadModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e);
         if (!ok) { fprintf(stderr, "llms ane oab multi: %s failed to load (%s) -- off\n", [p UTF8String], e ? [[e localizedDescription] UTF8String] : "?"); return 0; }
         ane_oab_mm = md; for (unsigned l = 0; l < ane_oab_layers; l++) ane_oab_programs[l] = md; }
     for (unsigned l = 0; l < ane_oab_layers && !ane_oab_multi; l++) {
         NSString *p = [NSString stringWithFormat:@"%@/L%u_oab.mlmodelc", dir, l]; NSError *e = nil;
         id md = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], [NSString stringWithFormat:@"ao%u", l]);
-        BOOL ok = md && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("compileModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e) &&
+        BOOL ok = md && llms_ane_compile(ane_client, md, opt, &e) &&
                        ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("loadModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e);
         if (!ok) { fprintf(stderr, "llms ane oab: layer %u (%s) failed to load (%s) -- off\n", l, [p UTF8String], e ? [[e localizedDescription] UTF8String] : "?"); return 0; }
         ane_oab_programs[l] = md;
@@ -13490,7 +13555,7 @@ static int init_ane_eng(void) {
     NSString *p = @"ane/engram_multi/eng2.mlmodelc";
     NSDictionary *opt = @{@"kANEFModelType": @"kANEFModelMIL", @"kANEFKeepModelMemoryWiredKey": @NO};
     id md = ((id(*)(Class, SEL, id, id))objc_msgSend)(MD, sel_registerName("modelAtURL:key:"), [NSURL fileURLWithPath:p], @"aeng");
-    BOOL ok = md && ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("compileModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e) &&
+    BOOL ok = md && llms_ane_compile(ane_client, md, opt, &e) &&
                    ((BOOL(*)(id, SEL, id, id, NSInteger, NSError **))objc_msgSend)(ane_client, sel_registerName("loadModel:options:qos:error:"), md, opt, (NSInteger)0x21, &e);
     if (!ok) { fprintf(stderr, "llms ane eng: %s failed to load (%s) -- off\n", [p UTF8String], e ? [[e localizedDescription] UTF8String] : "?"); return 0; }
     NSDictionary *at = [md valueForKey:@"modelAttributes"]; NSArray *procs = at[@"ANEFModelDescription"][@"ANEFModelProcedures"], *nsl = at[@"NetworkStatusList"];
@@ -13655,17 +13720,24 @@ int ds4_gpu_llms_ane_dense_begin(const ds4_gpu_tensor *x, uint32_t count, uint32
             const uint32_t pv = (uint32_t)target; [pe setComputePipelineState:ane_dense_post_ps]; [pe setBuffer:ane_dense_post_box offset:0 atIndex:0]; [pe setBytes:&pv length:4 atIndex:1]; [pe setBuffer:ane_dense_input[k].b offset:0 atIndex:2];   /* the input surface bound: tracking orders the post after the conversion */
             [pe dispatchThreads:MTLSizeMake(32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             volatile uint32_t *box = (volatile uint32_t *)[ane_dense_post_box contents], *flag = (volatile uint32_t *)[ane_dense_flag_buf contents];
+            static double post_wait_ms = -1.0;   /* llms POST_WAIT (apply_post_wait.py): the fatal wait's ceiling; unset = the shipped 10,000 ms */
+            if (post_wait_ms < 0.0) { const char *e = getenv("LLMS_DS4_ANE_POST_WAIT_MS"); const double v = e && *e ? atof(e) : 10000.0; post_wait_ms = (v >= 10000.0 && v <= 600000.0) ? v : 10000.0;
+                                      if (e && *e) { fprintf(stderr, "llms: ane dense post wait %.0f ms (LLMS_DS4_ANE_POST_WAIT_MS; the shipped wait is 10,000; a wait past 10 s prints SLOW)\n", post_wait_ms);
+                                                     atexit_b(^{ fprintf(stderr, "llms ane dense post wait: %llu waits past 10 s (each one the shipped wait would have ended with exit 79), %llu of them resolved, longest %.1f s\n", (unsigned long long)ane_post_slow, (unsigned long long)ane_post_slow_ok, ane_post_slow_max_ms / 1000.0); }); } }
             dispatch_async(q, ^{ @autoreleasepool {
-                const double w0 = ds4_gpu_now_ms(); uint64_t it = 0;
+                const double w0 = ds4_gpu_now_ms(); uint64_t it = 0; int slow = 0;
                 for (;;) { uint32_t v; __asm__ volatile("ldaxr %w0, [%1]" : "=r"(v) : "r"(box) : "memory"); if ((int32_t)(v - pv) >= 0) break;
-                    if ((++it & 1023u) == 0u && ds4_gpu_now_ms() - w0 > 10000.0) { fprintf(stderr, "llms ane dense post: FATAL -- the GPU's post %u never came (10 s); exit 79\n", pv); fflush(stderr); _exit(79); }
+                    if ((++it & 1023u) == 0u) { const double el = ds4_gpu_now_ms() - w0;   /* llms POST_WAIT */
+                        if (el > post_wait_ms) { fprintf(stderr, "llms ane dense post: FATAL -- the GPU's post %u never came (%.0f s); exit 79\n", pv, post_wait_ms / 1000.0); fflush(stderr); _exit(79); }
+                        if (el > 10000.0 && !slow) { slow = 1; __atomic_add_fetch(&ane_post_slow, 1, __ATOMIC_RELAXED); fprintf(stderr, "llms ane dense post: SLOW -- post %u not yet after 10 s (the shipped wait exits 79 here); waiting to %.0f s\n", pv, post_wait_ms / 1000.0); fflush(stderr); } }
                     if (ane_dense_prewarm > 0 && ane_keepalive_model && __atomic_load_n(&ane_real_inflight, __ATOMIC_ACQUIRE) == 0) {   /* llms DPREWARM: a filler, then re-check the post */
                         __asm__ volatile("clrex" ::: "memory"); NSError *pwe = nil;
                         ((BOOL(*)(id, SEL, id, id, id, NSInteger, NSError **))objc_msgSend)(cl, sel_registerName("doEvaluateDirectWithModel:options:request:qos:error:"), ane_keepalive_model, @{}, ane_keepalive_request, (NSInteger)0x21, &pwe);
                         ane_dense_prewarms++; continue; }
                     __asm__ volatile("wfe" ::: "memory"); }
                 __asm__ volatile("clrex" ::: "memory");
-                const double t0 = ds4_gpu_now_ms(); ane_dense_post_wait_ms += t0 - w0; ane_dense_post_waits++; id ms[2] = { m0, m1 }, rs[2] = { rq0, rq1 }; int ok = 1;
+                const double t0 = ds4_gpu_now_ms(); ane_dense_post_wait_ms += t0 - w0; ane_dense_post_waits++;
+                if (slow) { __atomic_add_fetch(&ane_post_slow_ok, 1, __ATOMIC_RELAXED); if (t0 - w0 > ane_post_slow_max_ms) ane_post_slow_max_ms = t0 - w0; fprintf(stderr, "llms ane dense post: post %u came after %.1f s\n", pv, (t0 - w0) / 1000.0); }   /* llms POST_WAIT */ id ms[2] = { m0, m1 }, rs[2] = { rq0, rq1 }; int ok = 1;
                 for (int rep = 0; rep < ane_dense_repeat() && ok; rep++)   /* llms ANE_REPEAT: k evaluations of the same piece (an instrument) */
                 for (int j = 0; j < 2 && ok; j++) { NSError *he = nil;
                     ok = ane_eval_real(cl, ms[j], rs[j], &he) ? 1 : 0;
@@ -15853,7 +15925,13 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) { pthread_setname_np("ds4
     memset(scratch.contents, 0, 256u * sizeof(float));
     const uint32_t iters = 1u;
     uint64_t period_ms = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 10000u);
+    static uint64_t qka_sent, qka_skipped; uint64_t qka_seen = all_commits;   /* llms QKA: the idle-only form and the execution counter */
+    const char *qie = getenv("LLMS_DS4_QKA_IDLE"); const int qka_idle = qie && *qie && *qie != '0';
+    fprintf(stderr, "llms qka: queue keepalive every %llu ms%s\n", (unsigned long long)period_ms, qka_idle ? " (idle-only: a tick commits only when the queue committed nothing since the last)" : "");
+    atexit_b(^{ fprintf(stderr, "llms qka: %llu keepalive commits, %llu ticks skipped\n", (unsigned long long)qka_sent, (unsigned long long)qka_skipped); });
     while (!g_queue_keepalive_stop) {
+        if (qka_idle && all_commits != qka_seen) { qka_seen = all_commits; qka_skipped++; for (uint64_t slept = 0; slept < period_ms && !g_queue_keepalive_stop; slept += 50) usleep(50000); continue; }
+        qka_sent++;
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [g_queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -15864,6 +15942,7 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) { pthread_setname_np("ds4
             [enc endEncoding];
             track_command_buffer(cb); llms_order_commit(cb); all_commits++;
         }
+        qka_seen = all_commits;   /* llms QKA: the keepalive's own commit does not count as work */
         for (uint64_t slept = 0; slept < period_ms && !g_queue_keepalive_stop; slept += 50)
             usleep(50000);
     }
@@ -15872,7 +15951,8 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) { pthread_setname_np("ds4
 
 static void ds4_gpu_queue_keepalive_start(void) {
     if (g_queue_keepalive_running) return;
-    if (getenv("DS4_METAL_DISABLE_QUEUE_KEEPALIVE")) return;
+    { const char *qd = getenv("DS4_METAL_DISABLE_QUEUE_KEEPALIVE"); if (qd && strcmp(qd, "0")) return; }   /* llms QKA (apply_qka.py): '0' runs it under a generator that sets the name */
+
     g_queue_keepalive_stop = 0;
     if (pthread_create(&g_queue_keepalive_thread, NULL, ds4_gpu_queue_keepalive_thread, NULL) == 0)
         g_queue_keepalive_running = 1;
@@ -17875,8 +17955,9 @@ static void attach_shm_cache(uint64_t slot_bytes, uint32_t budget) {   /* once, 
     const int lfd = open(lp, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     if (lfd < 0 || flock(lfd, LOCK_EX | LOCK_NB) != 0) { fprintf(stderr, "llms memguard: REFUSING TO RUN -- another engine holds %s (a private second expert cache would exceed memory) (exit 75)\n", lp); _exit(75); }   /* llms MEMGUARD (1): was a private-slab fallback */   /* the lock lives as long as the process */
     char k1[64], k2[64], k3[64]; append_file_identity(k1, sizeof k1, "m", g_model_fd, NULL); append_file_identity(k2, sizeof k2, "b", -1, getenv("LLMS_DS4_GATEUP_BS64"));
-    append_file_identity(k3, sizeof k3, "d", down_side_fd, NULL);   /*: the G32 down file (fd -1 -> zeros when G32 is off) */
-    if (g16d_active) { size_t z16 = strlen(k3); snprintf(k3 + z16, sizeof k3 - z16, "g16%016llx;", (unsigned long long)g16d_identity); }   /* include ALL delta headers/identities: no G32/G16 or changed-delta alias */
+    append_file_identity(k3, sizeof k3, "d", down_side_fd, NULL);   /* Llms 04:00: the G32 down file (fd -1 -> zeros when G32 is off) */
+    if (g16d_active) { size_t z16 = strlen(k3); snprintf(k3 + z16, sizeof k3 - z16, "g16%016llx;", (unsigned long long)g16d_identity); }
+    if (g8f_direct) { size_t z8 = strlen(k3); snprintf(k3 + z8, sizeof k3 - z8, "g8f%016llx;", (unsigned long long)g8f_identity); }   /* llms G8_FILE: no alias with a G32 or delta cache */   /* include ALL delta headers/identities: no G32/G16 or changed-delta alias */
     char shm_stamp[96]; if (shm_keep_builds()) snprintf(shm_stamp, sizeof shm_stamp, "LAYOUT1 e%zu h%zu", sizeof(shm_cache_entry), sizeof(shm_cache_header));   /* llms SHM_KEEP_BUILDS */
     else snprintf(shm_stamp, sizeof shm_stamp, "%s %s", __DATE__, __TIME__);
     snprintf(shm_cache_key, sizeof shm_cache_key, "%s%s%ss%llx;n%u;p%d.%llx;%s", k1, k2, k3, (unsigned long long)slot_bytes, budget, background_slabs_planned,
@@ -23680,6 +23761,8 @@ static int pair_list_mode(void) {   /* 0 full grid, 1 list, 2 listnocommit, 3 li
     }
     return m;
 }
+static int llms_dcrh_hold_flag;   /* llms DCRH_SAFE (apply_dcrh_safe.py): set by ds4.c around a grammar-depth / copy verify */
+void ds4_gpu_llms_dcrh_hold(int on) { llms_dcrh_hold_flag = on; }
 static uint32_t lean_row_count; static uint64_t lean_rows_done, lean_row_drops;   /* llms EROWD */
 void ds4_gpu_llms_erowd_rows(uint32_t n) {   /* rows < n of the current verify are decoder-lean: one routed pick each in layers >= 20 */
     static int exit_report_registered; lean_row_count = n;
@@ -23718,8 +23801,10 @@ void ds4_gpu_llms_rescue_step(uint32_t on) {
     if (on && !rescue_step_on) rescue_steps_seen++;
     rescue_step_on = on;
 }
+static uint32_t gtopk_row0_cap; static uint64_t gtopk_row0_rows;   /* llms GTOPK_ROW0 (apply_gtopk_row0.py): the confidence gate's cap for the verify's first row only */
+void ds4_gpu_llms_gtopk_row0(uint32_t k) { static int reg; gtopk_row0_cap = k; if (k && !reg) { reg = 1; atexit_b(^{ fprintf(stderr, "llms gtopk row0: %llu first rows re-picked under the gate's cap\n", (unsigned long long)gtopk_row0_rows); }); } }
 void ds4_gpu_llms_gtopk_step(uint32_t k) {   /* set by the cycle around one verify: its rows keep at most k routed picks (0 = off) */
-    static int exit_report_registered; gtopk_step_cap = k;
+    static int exit_report_registered; gtopk_step_cap = k; gtopk_row0_cap = 0;   /* llms GTOPK_ROW0: every step-cap call ends the row-0 cap */
     if (k && !exit_report_registered) { exit_report_registered = 1; atexit_b(^{ fprintf(stderr, "llms gtopk: %llu rows re-picked under a step cap\n", (unsigned long long)gtopk_rows); }); }
 }
 static uint32_t conf_gate_open = 1; static int conf_gate_state = -1, conf_gate_mode = 3; static uint64_t conf_gate_closed_rows, conf_gate_steps, conf_gate_closed_steps;   /* llms CONF_GATE (apply_conf_gate_metal.py) */
@@ -25924,7 +26009,7 @@ static int parse_overlay_u64(const char *s, uint64_t *out) {
  * Called only before newBufferWithBytesNoCopy. No writes to either source file. */
 static int apply_dense4_overlay(void *mp, uint64_t maplen, const char *index,
                                   const dense4_entry *base, int count,
-                                  uint64_t expected_gguf_bytes) {
+                                  uint64_t expected_gguf_bytes, int q4s8) {
     typedef struct { uint64_t dst, src, len; int entry; } patch_range;
     FILE *fi = NULL; int fd = -1, ok = 0, used = 0;
     patch_range *ranges = NULL;
@@ -25940,6 +26025,7 @@ static int apply_dense4_overlay(void *mp, uint64_t maplen, const char *index,
     if (!fgets(path, sizeof path, fi) || !strchr(path, '\n')) Q4OV_FAIL("missing/long payload path");
     path[strcspn(path, "\r\n")] = 0;
     if (!*path) Q4OV_FAIL("empty payload path");
+    if ((strstr(path,"_q4s8")!=NULL)!=q4s8) Q4OV_FAIL("overlay payload row format mismatch");
     if (!fgets(line, sizeof line, fi) || sscanf(line,"gguf_bytes %31s %c",gs,&extra)!=1 || !parse_overlay_u64(gs,&gb) || gb!=expected_gguf_bytes)
         Q4OV_FAIL("model size mismatch");
     fd = open(path, O_RDONLY);
@@ -25964,27 +26050,39 @@ static int apply_dense4_overlay(void *mp, uint64_t maplen, const char *index,
         }
         if (found<0 || !k || !n || k%256u || base[found].k!=k || base[found].n!=n)
             Q4OV_FAIL("unknown key or shape mismatch");
-        const uint64_t rowbytes=(uint64_t)(k/16u)*9u;
+        const uint64_t rowbytes=q4s8 ? (uint64_t)(k/32u)*17u : (uint64_t)(k/16u)*9u;
         if (rowbytes && (uint64_t)n>UINT64_MAX/rowbytes) Q4OV_FAIL("tensor size overflow");
         const uint64_t len=rowbytes*(uint64_t)n, dst=base[found].off;
         if (!len || len>SIZE_MAX || dst>maplen || len>maplen-dst || off>(uint64_t)fsz || len>(uint64_t)fsz-off)
             Q4OV_FAIL("range outside mapped payload");
-        if ((dst%16384u)||(off%16384u)||(len%16384u)) Q4OV_FAIL("tensor range is not a complete Metal page");
+        if ((dst%16384u)||(off%16384u)||(!q4s8 && len%16384u)) Q4OV_FAIL("unaligned tensor range");
+        if (len>SIZE_MAX-16383u) Q4OV_FAIL("mapped page size overflow");
+        const uint64_t mapped_len=(len+16383u)&~UINT64_C(16383);
+        if (mapped_len>maplen-dst || mapped_len>(uint64_t)fsz-off)
+            Q4OV_FAIL("rounded page outside payload");
+        /* An adjacent tensor may share the last page. Preserve its actual bytes. */
+        if (mapped_len!=len) {
+            uint8_t tail[16384];
+            const size_t pad=(size_t)(mapped_len-len);
+            if (pread(fd,tail,pad,(off_t)(off+len))!=(ssize_t)pad ||
+                memcmp(tail,(const uint8_t *)mp+dst+len,pad)!=0)
+                Q4OV_FAIL("adjacent bytes changed in partial page");
+        }
         for (int j=0;j<used;j++) {
             if (ranges[j].entry==found) Q4OV_FAIL("duplicate override key");
-            if (dst<ranges[j].dst+ranges[j].len && ranges[j].dst<dst+len)
+            if (dst<ranges[j].dst+ranges[j].len && ranges[j].dst<dst+mapped_len)
                 Q4OV_FAIL("overlapping override destinations");
         }
         /* A replacement may not touch a different tensor, even if that tensor
          * is absent from this overlay index. Bounds use subtraction first. */
         for (int j=0;j<count;j++) if(j!=found) {
-            const uint64_t rb=(uint64_t)(base[j].k/16u)*9u;
+            const uint64_t rb=q4s8 ? (uint64_t)(base[j].k/32u)*17u : (uint64_t)(base[j].k/16u)*9u;
             if (!rb || (uint64_t)base[j].n>UINT64_MAX/rb) Q4OV_FAIL("invalid base extent");
             const uint64_t blen=rb*(uint64_t)base[j].n, boff=base[j].off;
             if (boff>maplen || blen>maplen-boff) Q4OV_FAIL("invalid base range");
             if (dst<boff+blen && boff<dst+len) Q4OV_FAIL("override aliases another base tensor");
         }
-        ranges[used++]=(patch_range){dst,off,len,found};
+        ranges[used++]=(patch_range){dst,off,mapped_len,found};
     }
     if (ferror(fi)||!used) Q4OV_FAIL("empty or unreadable index");
     for(int j=0;j<used;j++) {
@@ -26065,8 +26163,8 @@ static void swr_encode(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> xb, NSUIn
 static void q4s8_guard(const char *what, const char *path) {   /* the switch, the payload and the dense source must agree on the row format */
     const int named = path && strstr(path, "_q4s8") != NULL; const char *src = getenv("DS4_METAL_DENSE_SOURCE"); const int srcq = src && strstr(src, "_q4s8") != NULL;
     if (named != q4s8_on() || srcq != q4s8_on()) { fprintf(stderr, "llms: q4s8 MISMATCH (%s): switch %d, payload %s (%s), dense source %s -- refusing a mixed row format\n", what, q4s8_on(), named ? "q4s8" : "fp16", path ? path : "?", srcq ? "q4s8" : "fp16"); abort(); }
-    if (q4s8_on()) { const char *ov = getenv("LLMS_DS4_Q4L_OVERLAY"), *qi = getenv("LLMS_DS4_Q4I");
-        if ((ov && *ov && strcmp(ov, "0")) || (qi && *qi && strcmp(qi, "0"))) { fprintf(stderr, "llms: q4s8 refuses LLMS_DS4_Q4L_OVERLAY / LLMS_DS4_Q4I (their rows stay fp16)\n"); abort(); } } }
+    if (q4s8_on()) { const char *qi = getenv("LLMS_DS4_Q4I");
+        if (qi && *qi && strcmp(qi, "0")) { fprintf(stderr, "llms: q4s8 refuses LLMS_DS4_Q4I (its rows stay fp16)\n"); abort(); } } }
 static void llms_idx_beside(char *path, size_t cap, const char *idx) {   /* ds4m1 pack: a relative payload path is relative to the index's own directory */
     if (!path[0] || path[0] == '/') return;
     const char *slash = strrchr(idx, '/'); if (!slash) return;
@@ -26105,7 +26203,7 @@ static void load_dense4_table(void) {
         }
     /* Sparse experimental copies replace only owned pages before Metal wraps them. */
     if (!apply_dense4_overlay(mp, len, getenv("LLMS_DS4_Q4L_OVERLAY"),
-                                dense4_table, dense4_count, (uint64_t)gb)) abort();
+                                dense4_table, dense4_count, (uint64_t)gb, q4s8_on())) abort();
     {   /* llms Q4L_WRAP: one no-copy buffer per listed tensor; Metal makes only those ranges resident */
         dense4_buffers_alive = [NSMutableArray arrayWithCapacity:(NSUInteger)dense4_count]; uint64_t wrapped = 0;
         for (int i = 0; i < dense4_count; i++) {
@@ -26343,6 +26441,7 @@ static void dispatch_interleaved(id<MTLComputeCommandEncoder> enc, const interle
 }
 /* llms DSP41_SHORT (apply_short.py): the drafter's head over a shortlist of vocabulary rows (kernel_llms_q4l_mv_ix); * ids[0..n) are copied into a shared buffer as they grow (appends only between drafter batches). Returns 0 when it cannot run (the caller * then runs the full head). */
 static uint64_t q4l_short_calls;
+static int dsp_short_q2s_try(ds4_gpu_tensor *out, uint64_t weight_abs, uint32_t k, uint32_t n_out, const ds4_gpu_tensor *x, id<MTLBuffer> idb, uint32_t n_ids);   /* llms DSP_SHORT_Q2S */
 int ds4_gpu_llms_q4l_short(ds4_gpu_tensor *out, uint64_t weight_abs, uint32_t k, uint32_t n_out, const ds4_gpu_tensor *x, const int32_t *ids, uint32_t n_ids) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (llms_alt_off("short") || n_ids == 0 || n_ids > n_out) return 0;
@@ -26357,6 +26456,7 @@ int ds4_gpu_llms_q4l_short(ds4_gpu_tensor *out, uint64_t weight_abs, uint32_t k,
     if (!qp || !idb) return 0;
     if (n_ids < synced) synced = 0;
     if (n_ids > synced) { memcpy((int32_t *)[idb contents] + synced, ids + synced, (size_t)(n_ids - synced) * sizeof(int32_t)); synced = n_ids; }
+    if (dsp_short_q2s_try(out, weight_abs, k, n_out, x, idb, n_ids)) { q4l_short_calls++; return 1; }   /* llms DSP_SHORT_Q2S: off unless set */
     @autoreleasepool {
         ds4_gpu_q8_0_matvec_args qa = ds4_gpu_make_q8_0_mv_args(k, n_ids);
         qa.nb00 = 1; qa.nb01 = q4l_rowb(k); qa.nb02 = qa.nb01 * n_out; qa.nb03 = qa.nb02; qa.nr0 = 4;
@@ -26596,6 +26696,8 @@ static const q3m_entry *q3m_find(uint64_t abs, uint64_t k, uint64_t n) {
 /* llms Q2S (apply_q2s.py): the two-row dense matvecs of the listed tensors on a 2-BIT SLOT side file; off unless LLMS_DS4_Q2S; ALT q2s. Built for the head; 18:2x benched the body at x0.717 of the shipped. */
 typedef struct { uint64_t abs, off; uint32_t k, n, rs; } q2s_entry;
 static q2s_entry q2s_table[64]; static int q2s_count = -1; static id<MTLBuffer> q2s_buf; static id<MTLComputePipelineState> q2s_ps; static uint64_t q2s_calls;
+static id<MTLComputePipelineState> q2s_ix_ps; static uint64_t q2s_short_calls, q2s_short_fallbacks;   /* llms DSP_SHORT_Q2S (apply_dsp_short_q2s.py) */
+static id<MTLComputePipelineState> q2s_k1_ps;   /* llms DSP_Q2 (apply_dsp_q2.py) */
 static int q2s_ready(void) {
     if (q2s_count >= 0) return q2s_count > 0;
     q2s_count = 0; const char *p = getenv("LLMS_DS4_Q2S"); if (!p || !*p || !g_device) return 0;
@@ -26648,8 +26750,64 @@ static int q2s_ready(void) {
     "    _Pragma(\"clang loop unroll(full)\") for (short c = 0; c < 2; ++c) _Pragma(\"clang loop unroll(full)\") for (short row = 0; row < 4; ++row) { const float tot = simd_sum(sumf[c][row]) + 0.0f;\n"
     "        if (tiisg == 0 && r0 + row < N) { uint bits = as_type<uint>(tot); if (a.RB && (bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u);\n"
     "            dst[(ulong)c * (ulong)N + r0 + row] = as_type<float>(a.RB ? (bits & 0xffff0000u) : bits); } }\n"
+    "}\n"
+    "kernel void llms_q2s_k1_ix(constant q2s_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]],\n"
+    "                           device const int * ids [[buffer(4)]], uint tg [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+    "    const int K = a.K, N = a.N, ng = K / 64; const int r0 = ((int)tg * 4 + (int)sgitg) * 4;\n"
+    "    device const uint * wq[4]; device const uchar * ws[4]; int rid[4];\n"
+    "    _Pragma(\"clang loop unroll(full)\") for (short row = 0; row < 4; ++row) { rid[row] = ids[min(r0 + row, N - 1)]; device const char * rp = src0 + (ulong)rid[row] * (ulong)a.RS; wq[row] = (device const uint *) rp; ws[row] = (device const uchar *) (rp + K / 4); }\n"
+    "    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };\n"
+    "    const short ix = tiisg / 4, il = tiisg % 4;\n"
+    "    for (int ig = ix; ig < ng; ig += 8) {\n"
+    "        device const float * y = x + ig * 64 + il * 16;\n"
+    "        const float4 x0 = *((device const float4 *) (y)), x1 = *((device const float4 *) (y + 4)), x2 = *((device const float4 *) (y + 8)), x3 = *((device const float4 *) (y + 12));\n"
+    "        const float4 sk = (x0 + x1) + (x2 + x3); const float nxs = -(1025.5f * sk.x + 257.5f * sk.y + 65.5f * sk.z + 17.5f * sk.w);\n"
+    "        _Pragma(\"clang loop unroll(full)\") for (short row = 0; row < 4; ++row) {\n"
+    "            const uint w = wq[row][ig * 4 + il], w2 = w >> 8; const float sc = (float) q2s_sdec(ws[row][ig * 2 + il / 2]);\n"
+    "            const half2 h0 = as_type<half2>((w & 0x00030003u) | 0x64006400u), h1 = as_type<half2>((w & 0x000C000Cu) | 0x5C005C00u);\n"
+    "            const half2 h2 = as_type<half2>((w & 0x00300030u) | 0x54005400u), h3 = as_type<half2>((w & 0x00C000C0u) | 0x4C004C00u);\n"
+    "            const half2 g0 = as_type<half2>((w2 & 0x00030003u) | 0x64006400u), g1 = as_type<half2>((w2 & 0x000C000Cu) | 0x5C005C00u);\n"
+    "            const half2 g2 = as_type<half2>((w2 & 0x00300030u) | 0x54005400u), g3 = as_type<half2>((w2 & 0x00C000C0u) | 0x4C004C00u);\n"
+    "            const float d = fma((float)g3.y, x3.w, fma((float)g2.y, x3.z, fma((float)g1.y, x3.y, fma((float)g0.y, x3.x,\n"
+    "                            fma((float)g3.x, x2.w, fma((float)g2.x, x2.z, fma((float)g1.x, x2.y, fma((float)g0.x, x2.x,\n"
+    "                            fma((float)h3.y, x1.w, fma((float)h2.y, x1.z, fma((float)h1.y, x1.y, fma((float)h0.y, x1.x,\n"
+    "                            fma((float)h3.x, x0.w, fma((float)h2.x, x0.z, fma((float)h1.x, x0.y, fma((float)h0.x, x0.x, nxs))))))))))))))));\n"
+    "            sumf[row] = fma(d, sc, sumf[row]);\n"
+    "        }\n"
+    "    }\n"
+    "    _Pragma(\"clang loop unroll(full)\") for (short row = 0; row < 4; ++row) { const float tot = simd_sum(sumf[row]); if (tiisg == 0 && r0 + row < N) dst[rid[row]] = tot; }\n"
+    "}\n"
+    "kernel void llms_q2s_k1_r4(constant q2s_args & a [[buffer(0)]], device const char * src0 [[buffer(1)]], device const float * x [[buffer(2)]], device float * dst [[buffer(3)]],\n"
+    "                           uint tg [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {\n"
+    "    const int K = a.K, N = a.N, ng = K / 64; const int r0 = ((int)tg * 4 + (int)sgitg) * 4;\n"
+    "    device const uint * wq[4]; device const uchar * ws[4];\n"
+    "    _Pragma(\"clang loop unroll(full)\") for (short row = 0; row < 4; ++row) { const int r = min(r0 + row, N - 1); device const char * rp = src0 + (ulong)r * (ulong)a.RS; wq[row] = (device const uint *) rp; ws[row] = (device const uchar *) (rp + K / 4); }\n"
+    "    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };\n"
+    "    const short ix = tiisg / 4, il = tiisg % 4;\n"
+    "    for (int ig = ix; ig < ng; ig += 8) {\n"
+    "        device const float * y = x + ig * 64 + il * 16;\n"
+    "        const float4 x0 = *((device const float4 *) (y)), x1 = *((device const float4 *) (y + 4)), x2 = *((device const float4 *) (y + 8)), x3 = *((device const float4 *) (y + 12));\n"
+    "        const float4 sk = (x0 + x1) + (x2 + x3); const float nxs = -(1025.5f * sk.x + 257.5f * sk.y + 65.5f * sk.z + 17.5f * sk.w);\n"
+    "        _Pragma(\"clang loop unroll(full)\") for (short row = 0; row < 4; ++row) {\n"
+    "            const uint w = wq[row][ig * 4 + il], w2 = w >> 8; const float sc = (float) q2s_sdec(ws[row][ig * 2 + il / 2]);\n"
+    "            const half2 h0 = as_type<half2>((w & 0x00030003u) | 0x64006400u), h1 = as_type<half2>((w & 0x000C000Cu) | 0x5C005C00u);\n"
+    "            const half2 h2 = as_type<half2>((w & 0x00300030u) | 0x54005400u), h3 = as_type<half2>((w & 0x00C000C0u) | 0x4C004C00u);\n"
+    "            const half2 g0 = as_type<half2>((w2 & 0x00030003u) | 0x64006400u), g1 = as_type<half2>((w2 & 0x000C000Cu) | 0x5C005C00u);\n"
+    "            const half2 g2 = as_type<half2>((w2 & 0x00300030u) | 0x54005400u), g3 = as_type<half2>((w2 & 0x00C000C0u) | 0x4C004C00u);\n"
+    "            const float d = fma((float)g3.y, x3.w, fma((float)g2.y, x3.z, fma((float)g1.y, x3.y, fma((float)g0.y, x3.x,\n"
+    "                            fma((float)g3.x, x2.w, fma((float)g2.x, x2.z, fma((float)g1.x, x2.y, fma((float)g0.x, x2.x,\n"
+    "                            fma((float)h3.y, x1.w, fma((float)h2.y, x1.z, fma((float)h1.y, x1.y, fma((float)h0.y, x1.x,\n"
+    "                            fma((float)h3.x, x0.w, fma((float)h2.x, x0.z, fma((float)h1.x, x0.y, fma((float)h0.x, x0.x, nxs))))))))))))))));\n"
+    "            sumf[row] = fma(d, sc, sumf[row]);\n"
+    "        }\n"
+    "    }\n"
+    "    _Pragma(\"clang loop unroll(full)\") for (short row = 0; row < 4; ++row) { const float tot = simd_sum(sumf[row]);\n"
+    "        if (tiisg == 0 && r0 + row < N) { uint bits = as_type<uint>(tot); if (a.RB && (bits & 0x7f800000u) != 0x7f800000u) bits += 0x7fffu + ((bits >> 16u) & 1u);\n"
+    "            dst[r0 + row] = as_type<float>(a.RB ? (bits & 0xffff0000u) : bits); } }\n"
     "}\n" options:[MTLCompileOptions new] error:&err] : nil;
     id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"llms_q2s_k2_r4"] : nil; q2s_ps = fn ? [g_device newComputePipelineStateWithFunction:fn error:&err] : nil;
+    { id<MTLFunction> fx = lib ? [lib newFunctionWithName:@"llms_q2s_k1_ix"] : nil; NSError *ex = nil; q2s_ix_ps = fx ? [g_device newComputePipelineStateWithFunction:fx error:&ex] : nil; }   /* llms DSP_SHORT_Q2S */
+    { id<MTLFunction> fr = lib ? [lib newFunctionWithName:@"llms_q2s_k1_r4"] : nil; NSError *er = nil; q2s_k1_ps = fr ? [g_device newComputePipelineStateWithFunction:fr error:&er] : nil; }   /* llms DSP_Q2 */
     if (!q2s_ps) { fprintf(stderr, "llms q2s: NOT enabled (kernel: %s)\n", err ? err.localizedDescription.UTF8String : "no buffer"); return 0; }
     fprintf(stderr, "llms: q2s (two-row dense matvecs of %d tensors on the 2-bit slot side file %s, %.1f MB%s; ALT q2s)\n", n, bin, (double)st.st_size / 1e6, locked ? ", locked" : ", NOT locked");
     atexit_b(^{ fprintf(stderr, "llms q2s: %llu two-row matvecs on the 2-bit side file\n", (unsigned long long)q2s_calls); });
@@ -26659,6 +26817,72 @@ static const q2s_entry *q2s_find(uint64_t abs, uint64_t k, uint64_t n) {
     if (!q2s_ready()) return NULL;
     for (int i = 0; i < q2s_count; i++) if (q2s_table[i].abs == abs) return q2s_table[i].k == k && q2s_table[i].n == n ? &q2s_table[i] : NULL;
     return NULL;
+}
+static int dsp_short_q2s_try(ds4_gpu_tensor *out, uint64_t weight_abs, uint32_t k, uint32_t n_out, const ds4_gpu_tensor *x, id<MTLBuffer> idb, uint32_t n_ids) {   /* llms DSP_SHORT_Q2S: 1 = served on the 2-bit rows */
+    static int sq = -1;
+    if (sq < 0) { const char *e = getenv("LLMS_DS4_DSP_SHORT_Q2S"); sq = e && *e && *e != '0';
+                  if (sq) { fprintf(stderr, "llms: dsp short q2s (the drafter's shortlist head on the Q2S head's 2-bit rows; ALT dspsq)\n");
+                            atexit_b(^{ fprintf(stderr, "llms dsp short q2s: %llu shortlist heads on the 2-bit rows, %llu fell back to the 4-bit rows\n", (unsigned long long)q2s_short_calls, (unsigned long long)q2s_short_fallbacks); }); } }
+    if (!sq || llms_alt_off("dspsq")) return 0;
+    const q2s_entry *q2 = q2s_find(weight_abs, k, n_out);
+    if (!q2 || !q2s_ix_ps || !idb) { q2s_short_fallbacks++; return 0; }
+    @autoreleasepool {
+        struct { int K, N, RS, RB; } qa = { (int)k, (int)n_ids, (int)q2->rs, 0 };
+        int owned = 0; id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) { q2s_short_fallbacks++; return 0; }
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:q2s_ix_ps]; [enc setBytes:&qa length:sizeof qa atIndex:0];
+        [enc setBuffer:q2s_buf offset:(NSUInteger)q2->off atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setBuffer:idb offset:0 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_ids + 15u) / 16u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "llms dsp short q2s head")) return 0;
+    }
+    q2s_short_calls++;
+    return 1;
+}
+typedef struct { uint64_t abs, off; uint32_t k, n, rs; } dspq2_entry;   /* llms DSP_Q2 */
+static dspq2_entry dspq2_table[64]; static int dspq2_count = -1; static id<MTLBuffer> dspq2_buf; static uint64_t dspq2_calls, dspq2_unlisted;
+static int dspq2_ready(void) {
+    if (dspq2_count >= 0) return dspq2_count > 0;
+    dspq2_count = 0; const char *p = getenv("LLMS_DS4_DSP_Q2"); if (!p || !*p || !g_device) return 0;
+    if (!q2s_ready() || !q2s_k1_ps) { fprintf(stderr, "llms dsp q2: NOT enabled (the Q2S library or its llms_q2s_k1_r4 kernel is missing; LLMS_DS4_Q2S must be set)\n"); return 0; }
+    FILE *f = fopen(p, "r"); char bin[1024] = {0}, line[512];
+    if (!f || !fgets(line, sizeof line, f) || sscanf(line, "Q2S %1023s", bin) != 1) { fprintf(stderr, "llms dsp q2: NOT enabled (%s: not a Q2S index)\n", p); if (f) fclose(f); return 0; }
+    int n = 0; while (n < 64 && fgets(line, sizeof line, f)) { unsigned long long a_, o_; unsigned k_, n_, r_;
+        if (sscanf(line, "%llu %llu %u %u %u", &a_, &o_, &k_, &n_, &r_) == 5) { dspq2_table[n] = (dspq2_entry){ a_, o_, k_, n_, r_ }; n++; } }
+    fclose(f);
+    const int fd = open(bin, O_RDONLY | O_CLOEXEC); struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) { fprintf(stderr, "llms dsp q2: NOT enabled (%s: open failed)\n", bin); if (fd >= 0) close(fd); return 0; }
+    for (int i = 0; i < n; i++) if (dspq2_table[i].off + (uint64_t)dspq2_table[i].n * dspq2_table[i].rs > (uint64_t)st.st_size || (dspq2_table[i].off & 15u) || (dspq2_table[i].k % 64u) ||
+                                   dspq2_table[i].rs < dspq2_table[i].k / 4u + dspq2_table[i].k / 32u) {
+        fprintf(stderr, "llms dsp q2: NOT enabled (entry %d outside %s, misaligned or K %% 64 != 0)\n", i, bin); close(fd); return 0; }
+    const size_t len = ((size_t)st.st_size + 16383u) & ~(size_t)16383u;
+    void *mp = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0); close(fd);
+    if (mp == MAP_FAILED) { fprintf(stderr, "llms dsp q2: NOT enabled (mmap)\n"); return 0; }
+    const int locked = mlock(mp, (size_t)st.st_size) == 0;
+    dspq2_buf = [g_device newBufferWithBytesNoCopy:mp length:len options:MTLResourceStorageModeShared deallocator:nil];
+    if (!dspq2_buf) { fprintf(stderr, "llms dsp q2: NOT enabled (buffer)\n"); return 0; }
+    fprintf(stderr, "llms: dsp q2 (the drafter's plain dense matvecs of %d tensors on 2-bit Q2S rows, %s, %.1f MB%s; ALT dspq2)\n", n, bin, (double)st.st_size / 1e6, locked ? ", locked" : ", NOT locked");
+    atexit_b(^{ fprintf(stderr, "llms dsp q2: %llu drafter matvecs on the 2-bit rows, %llu drafter one-row matvecs not listed (their 4-bit copies ran)\n", (unsigned long long)dspq2_calls, (unsigned long long)dspq2_unlisted); });
+    dspq2_count = n; return n > 0;
+}
+static int dsp_q2_try(uint64_t abs, uint64_t k, uint64_t n, id<MTLBuffer> xbuf, NSUInteger xoff, id<MTLBuffer> obuf, NSUInteger ooff, id<MTLCommandBuffer> cb, int owned, int rb) {   /* llms DSP_Q2: 1 = served */
+    if (!dspq2_ready() || llms_alt_off("dspq2") || (xoff & 15u)) return 0;
+    const dspq2_entry *q = NULL;
+    for (int i = 0; i < dspq2_count; i++) if (dspq2_table[i].abs == abs) { q = &dspq2_table[i]; break; }
+    if (!q || q->k != k || q->n != n) { dspq2_unlisted++; return 0; }
+    struct { int K, N, RS, RB; } qa = { (int)k, (int)n, (int)q->rs, rb ? 1 : 0 };
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:q2s_k1_ps]; [enc setBytes:&qa length:sizeof qa atIndex:0];
+    [enc setBuffer:dspq2_buf offset:(NSUInteger)q->off atIndex:1]; [enc setBuffer:xbuf offset:xoff atIndex:2]; [enc setBuffer:obuf offset:ooff atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 15u) / 16u, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    if (rb) t32_rounded = 1;
+    dspq2_calls++;
+    return ds4_gpu_finish_command_buffer(cb, owned, "llms dsp q2 matvec") ? 1 : -1;
 }
 int ds4_gpu_matmul_q8_0_legacy_tensor(
         ds4_gpu_tensor       *out,
@@ -26734,8 +26958,15 @@ int ds4_gpu_matmul_q8_0_legacy_tensor(
                             if ((ks_here_m > ks_here ? ks_here_m : ks_here) > 1) { const NSUInteger need = (NSUInteger)(ks_here_m > ks_here ? ks_here_m : ks_here) * 64u * (NSUInteger)out_dim * sizeof(float);   /* llms KSMAP_BIG (apply_ksmapbig.py): a KS_MAP S above the global one sizes the partials too */
                                         if (need > ks_bytes) { ks_part = [g_device newBufferWithLength:need options:MTLResourceStorageModePrivate]; ks_bytes = ks_part ? need : 0; if (!ks_part) { fprintf(stderr, "llms: q4g ks scratch failed (%lu bytes) -- off\n", (unsigned long)need); q4g_ksplit_slices = 0; } }
                                         if (ks_part) { [enc setBuffer:ks_part offset:0 atIndex:4]; [enc setBuffer:ks_cnt offset:0 atIndex:5]; } }
-                            for (uint64_t c0 = 0; c0 < n_tok; c0 += 64u) {
-                                const int S_pass = q4g_ksplit_slices ? ks_here_m : 0; struct { int K, R, C, rb, S; } ga = { (int)in_dim, (int)out_dim, (int)(n_tok - c0 < 64u ? n_tok - c0 : 64u), rb ? 1 : 0, S_pass };
+
+                            static int llms_remsplit = -1; static uint64_t llms_remsplit_n;   /* llms REMSPLIT (apply_remsplit.py) */
+                            if (llms_remsplit < 0) { const char *e = getenv("LLMS_DS4_Q4G_REMSPLIT"); llms_remsplit = e && *e && *e != '0';
+                                if (llms_remsplit) { fprintf(stderr, "llms: q4g remsplit (a 33-56-token last pass runs as 32 tokens plus a tail, not as 64 columns)\n");
+                                    atexit_b(^{ fprintf(stderr, "llms q4g remsplit: %llu passes split\n", (unsigned long long)llms_remsplit_n); }); } }
+                            for (uint64_t c0 = 0, llms_take = 0; c0 < n_tok; c0 += llms_take) {
+                                llms_take = n_tok - c0 < 64u ? n_tok - c0 : 64u;
+                                if (llms_remsplit && llms_take > 32u && llms_take <= 56u) { llms_take = 32u; llms_remsplit_n++; }
+                                const int S_pass = q4g_ksplit_slices ? ks_here_m : 0; struct { int K, R, C, rb, S; } ga = { (int)in_dim, (int)out_dim, (int)llms_take, rb ? 1 : 0, S_pass };
                                 const int nti = ga.C <= 8 ? 0 : ga.C <= 16 ? 1 : ga.C <= 24 ? 2 : ga.C <= 32 ? 3 : 4;   /* NT = 1 / 2 / 3 / 4 / 8 */
                                 const int ksa_alt_off = ksplit_atomic_on && llms_alt_off("ksa");   /* llms Q4G_KSA: the ALT contrast arm runs the original kernel */
                                 const int ksa_skip_wide = ksplit_atomic_on && ga.C > 32 && out_dim >= 4096u && !ks_map_hit;   /* ks_bench5: o_b / s_d do not gain from the split at C 64; llms KS_MAP: a named shape keeps its S */
@@ -27101,6 +27332,8 @@ int ds4_gpu_matmul_q8_0_legacy_tensor(
                 if (qe && (ds4_gpu_tensor_offset(x) & 15u) != 0) { dense4_unaligned++; qe = NULL; }
                 if (!qe && ragged_ao_marked(weight_offset)) { fprintf(stderr, "llms ragged ao: a one-token matvec of a ragged pair's out_b fell to the Q8_0 original\n"); abort(); }   /* llms RAGGED_AO */
                 if (qe && ragged_ao_marked(weight_offset)) ragged_ao_calls[3]++;
+                if (qe && dense4_bypass) { const int dq = dsp_q2_try(weight_offset, in_dim, out_dim, xbuf, ds4_gpu_tensor_offset(x), outbuf, ds4_gpu_tensor_offset(out), cb, owned, t32_round && mvb16_on(0) && !llms_alt_off("mvb"));   /* llms DSP_Q2 : off unless set */
+                                           if (dq) return dq > 0; }
                 if (qe) {
                     if ((uint64_t)qe->k != in_dim || (uint64_t)qe->n != out_dim) {
                         fprintf(stderr, "llms: q4l entry at %llu is %ux%u, the call %llux%llu\n", (unsigned long long)weight_offset, qe->k, qe->n,
@@ -42911,14 +43144,114 @@ static int ds4_gpu_encode_routed_gateup_swiglu(
                     routed_dc_hand.armed = 1; routed_dc_hand.w = weights; routed_dc_hand.w_off = weights_off; routed_dc_hand.wstride = act->weight_stride; routed_dc_hand.layer = gateup_mix_layer; } }
             if (!rdc_now) routed_dc_declined++;
         }
-        if (pair_list_count) {
+        int gdd_done = 0;   /* llms BS64_GDD (apply_bs64_gdd.py): a two-row identity call's pairs deduplicated on the GPU */
+        {
+            static int gdd_state = -1; static id<MTLComputePipelineState> gdd_build, gdd_k2[2]; static id<MTLBuffer> gdd_ring[16], gdd_stat; static unsigned gdd_cursor; static uint64_t gdd_calls, gdd_pairs; static id<MTLComputePipelineState> gdd_build2, gdd_k1s[2], gdd_k2d[2]; static id<MTLBuffer> gdd_sring[16];   /* llms BS64_GDD 3 */
+            if (gdd_state < 0) { const char *e = getenv("LLMS_DS4_BS64_GDD"); gdd_state = e && *e ? atoi(e) : 0; if (gdd_state < 0 || gdd_state > 9) gdd_state = 0; if (gdd_state == 9 && !has_kernel("kernel_llms_bs64_k12_p4_f32_ufrb_gdd")) { fprintf(stderr, "llms bs64 gdd 9: kernel_llms_bs64_k12_p4_f32_ufrb_gdd is not in DS4_METAL_MOE_SOURCE (make_moe_gdd5.py) -- off\n"); gdd_state = 0; } static id<MTLComputePipelineState> gdd_build_all; if (gdd_state >= 5) gdd_build_all = has_kernel("kernel_llms_bs64_gdd_build_all") ? ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_gdd_build_all") : nil; if (gdd_state >= 5 && !gdd_build_all) { fprintf(stderr, "llms bs64 gdd 5: kernel_llms_bs64_gdd_build_all is not in DS4_METAL_MOE_SOURCE (make_moe_gdd4.py) -- off\n"); gdd_state = 0; }   /* 4: value 3 with a barrier between its two dispatches (apply_bs64_gdd4.py) */
+                if (gdd_state >= 3) {   /* llms BS64_GDD 3 (apply_bs64_gdd3.py): singles on the one-row rb body, duplicates on the two-row body; 4 = with a barrier between */
+                    static const char *n3[5] = { "kernel_llms_bs64_gdd_build2", "kernel_llms_bs64_k1_p4_f32_ufrb_gdd", "kernel_llms_bs64_k1_p5_f32_ufrb_gdd", "kernel_llms_bs64_k2_p4_f32_ufrb_gdd2", "kernel_llms_bs64_k2_p5_f32_ufrb_gdd2" }; int have = 1; for (int q = 0; q < 5; q++) have = have && has_kernel(n3[q]);
+                    if (have) { gdd_build2 = ds4_gpu_get_pipeline_or_die(n3[0]); gdd_k1s[0] = ds4_gpu_get_pipeline_or_die(n3[1]); gdd_k1s[1] = ds4_gpu_get_pipeline_or_die(n3[2]); gdd_k2d[0] = ds4_gpu_get_pipeline_or_die(n3[3]); gdd_k2d[1] = ds4_gpu_get_pipeline_or_die(n3[4]);
+                        gdd_stat = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared]; if (gdd_stat) memset([gdd_stat contents], 0, 64); }
+                    if (!gdd_build2 || !gdd_k1s[0] || !gdd_k1s[1] || !gdd_k2d[0] || !gdd_k2d[1] || !gdd_stat) { fprintf(stderr, "llms bs64 gdd 3: the kernels are not in DS4_METAL_MOE_SOURCE (make_moe_gdd2.py) -- off\n"); gdd_state = 0; }
+                    else { fprintf(stderr, "llms: bs64 gdd 3 (a two-row decode call: singles on the one-row rb body, an expert shared by both rows on one two-row job; ALT gdd)\n");
+                           atexit_b(^{ const uint32_t *st = (const uint32_t *)[gdd_stat contents];
+                                       fprintf(stderr, "llms bs64 gdd: %llu calls, %llu pairs dispatched, %u duplicates read once, %u singles; class mismatch: %u shared pairs with two ids, %u singles with a partner, of %u shared pairs checked (make_moe_gdd6.py)\n", (unsigned long long)gdd_calls, (unsigned long long)gdd_pairs, st[0], st[1], st[2], st[3], st[4]); }); } }
+                else if (gdd_state && gdd_state < 3) { const char *k4 = gdd_state == 2 ? "kernel_llms_bs64_k2_p4_f32_ufrb_gdd" : "kernel_llms_bs64_k2_p4_f32_uf_gdd", *k5 = gdd_state == 2 ? "kernel_llms_bs64_k2_p5_f32_ufrb_gdd" : "kernel_llms_bs64_k2_p5_f32_uf_gdd";
+                    if (has_kernel("kernel_llms_bs64_gdd_build") && has_kernel(k4) && has_kernel(k5)) { gdd_build = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_gdd_build"); gdd_k2[0] = ds4_gpu_get_pipeline_or_die(k4); gdd_k2[1] = ds4_gpu_get_pipeline_or_die(k5);
+                        gdd_stat = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared]; if (gdd_stat) memset([gdd_stat contents], 0, 64); }
+                    if (!gdd_build || !gdd_k2[0] || !gdd_k2[1] || !gdd_stat) { fprintf(stderr, "llms bs64 gdd: the kernels are not in DS4_METAL_MOE_SOURCE (make_moe_gdd.py) -- off\n"); gdd_state = 0; }
+                    else { fprintf(stderr, "llms: bs64 gdd %d (a two-row decode call's routed gate / up pairs deduplicated on the GPU: a shared expert is read once; ALT gdd)\n", gdd_state);
+                           atexit_b(^{ const uint32_t *st = (const uint32_t *)[gdd_stat contents];
+                                       fprintf(stderr, "llms bs64 gdd: %llu calls, %llu pairs dispatched, %u duplicates read once, %u singles; class mismatch: %u shared pairs with two ids, %u singles with a partner, of %u shared pairs checked (make_moe_gdd6.py)\n", (unsigned long long)gdd_calls, (unsigned long long)gdd_pairs, st[0], st[1], st[2], st[3], st[4]); }); } } }
+            if (gdd_state && nolist_now && pair_list_count && args->nei1 == 2 && fold_now && !gf_now && !gf2p_now && !routed_dc_on() && (planes_now == 4 || planes_now == 5) && !llms_alt_off("gdd")) {
+                const unsigned gs = gdd_cursor++ % 16u; const NSUInteger need = (NSUInteger)pair_list_count * 8u;
+                if (!gdd_ring[gs] || gdd_ring[gs].length < need) gdd_ring[gs] = [g_device newBufferWithLength:(need > 512u ? need : 512u) options:MTLResourceStorageModePrivate];
+                id<MTLComputePipelineState> k2p = gdd_state >= 3 ? nil : gdd_k2[planes_now == 5 ? 1 : 0];
+                if (gdd_state >= 3) { const NSUInteger need1 = (NSUInteger)pair_list_count * 4u; const int pi = planes_now == 5 ? 1 : 0;
+                    if (!gdd_sring[gs] || gdd_sring[gs].length < need1) gdd_sring[gs] = [g_device newBufferWithLength:(need1 > 512u ? need1 : 512u) options:MTLResourceStorageModePrivate];
+                    if (gdd_state == 9 && gdd_ring[gs] && gdd_sring[gs]) {   /* apply_bs64_gdd9.py: singles (one-row body) and true pairs (two-row body) in ONE dispatch */
+                        static id<MTLComputePipelineState> g9[2]; if (!g9[0]) { g9[0] = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_k12_p4_f32_ufrb_gdd"); g9[1] = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_k12_p5_f32_ufrb_gdd"); }
+                        [enc setComputePipelineState:gdd_build2]; [enc setBuffer:gdd_ring[gs] offset:0 atIndex:10]; [enc setBuffer:gdd_stat offset:0 atIndex:19]; [enc setBuffer:gdd_sring[gs] offset:0 atIndex:20];
+                        [enc dispatchThreads:MTLSizeMake(pair_list_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(pair_list_count, 1, 1)];
+                        if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        [enc setComputePipelineState:g9[pi]];
+                        [enc setThreadgroupMemoryLength:32u * 4u * 5u * 4u + 32u * 2u * 4u atIndex:0];
+                        [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, pair_list_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)];
+                        gdd_done = 1; gdd_calls++; gdd_pairs += pair_list_count; gateup_side_single_pairs += pair_list_count;
+                    } else
+                    if (gdd_state == 5 && gdd_sring[gs]) {   /* apply_bs64_gdd5.py: the control -- the identity list written on the GPU, the guarded one-row kernel over it */
+                        static id<MTLComputePipelineState> gba; if (!gba) gba = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_gdd_build_all");
+                        [enc setComputePipelineState:gba]; [enc setBuffer:gdd_sring[gs] offset:0 atIndex:20];
+                        [enc dispatchThreads:MTLSizeMake(pair_list_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(pair_list_count, 1, 1)];
+                        if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        [enc setComputePipelineState:gdd_k1s[pi]]; [enc setBuffer:gdd_sring[gs] offset:0 atIndex:10];
+                        [enc setThreadgroupMemoryLength:32u * 2u * 5u * 4u + 32u * 1u * 4u atIndex:0];
+                        [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, pair_list_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)];
+                        gdd_done = 1; gdd_calls++; gdd_pairs += pair_list_count; gateup_side_single_pairs += pair_list_count;
+                    } else
+                    if (gdd_ring[gs] && gdd_sring[gs]) {
+                        [enc setComputePipelineState:gdd_build2]; [enc setBuffer:gdd_ring[gs] offset:0 atIndex:10]; [enc setBuffer:gdd_stat offset:0 atIndex:19]; [enc setBuffer:gdd_sring[gs] offset:0 atIndex:20];
+                        [enc dispatchThreads:MTLSizeMake(pair_list_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(pair_list_count, 1, 1)];
+                        if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        if (gdd_state == 6) {   /* apply_bs64_gdd6.py: the one-row pass over EVERY valid pair; the two-row kernel then overwrites the true pairs */
+                            static id<MTLComputePipelineState> gba6; if (!gba6) gba6 = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_gdd_build_all");
+                            [enc setComputePipelineState:gba6]; [enc dispatchThreads:MTLSizeMake(pair_list_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(pair_list_count, 1, 1)];
+                            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
+                        [enc setComputePipelineState:gdd_k1s[pi]]; [enc setBuffer:gdd_sring[gs] offset:0 atIndex:10];
+                        [enc setThreadgroupMemoryLength:32u * 2u * 5u * 4u + 32u * 1u * 4u atIndex:0];   /* the one-row fold body's */
+                        [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, pair_list_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)];
+                        if (gdd_state == 4 || gdd_state >= 6) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];   /* apply_bs64_gdd4.py: the two-row jobs after every one-row job */
+                        static id<MTLComputePipelineState> g7[2]; if (gdd_state >= 7 && !g7[0]) { g7[0] = ds4_gpu_get_pipeline_or_die(gdd_state == 8 ? "kernel_llms_bs64_k2_p4_f32_uf_gdd" : "kernel_llms_bs64_k2_p4_f32_ufrb_gdd"); g7[1] = ds4_gpu_get_pipeline_or_die(gdd_state == 8 ? "kernel_llms_bs64_k2_p5_f32_uf_gdd" : "kernel_llms_bs64_k2_p5_f32_ufrb_gdd"); }   /* 8: apply_bs64_gdd8.py, the shipped non-rb two-row body */   /* apply_bs64_gdd7.py: value 2's wrapper and grid for the pairs */
+                        [enc setComputePipelineState:(gdd_state >= 7 ? g7[pi] : gdd_k2d[pi])]; [enc setBuffer:gdd_ring[gs] offset:0 atIndex:10];
+                        [enc setThreadgroupMemoryLength:32u * 4u * 5u * 4u + 32u * 2u * 4u atIndex:0];   /* the two-row fold body's */
+                        [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, (gdd_state >= 7 ? (NSUInteger)pair_list_count : (NSUInteger)args->nei0)) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)];   /* row 0's slots hold every two-row entry */
+                        gdd_done = 1; gdd_calls++; gdd_pairs += pair_list_count; gateup_side_single_pairs += pair_list_count;
+                    } }
+                if (gdd_state < 3 && gdd_ring[gs] && k2p) {
+                    [enc setComputePipelineState:gdd_build]; [enc setBuffer:gdd_ring[gs] offset:0 atIndex:10]; [enc setBuffer:gdd_stat offset:0 atIndex:19];
+                    [enc dispatchThreads:MTLSizeMake(pair_list_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(pair_list_count, 1, 1)];
+                    if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    [enc setComputePipelineState:k2p];
+                    [enc setThreadgroupMemoryLength:32u * 4u * 5u * 4u + 32u * 2u * 4u atIndex:0];   /* the two-row fold body's: part[32][4][5] + fmid[2][32] */
+                    [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, pair_list_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)];
+                    gdd_done = 1; gdd_calls++; gdd_pairs += pair_list_count; gateup_side_single_pairs += pair_list_count;
+                }
+            }
+        }
+        {   /* llms BS64_GDDN (apply_bs64_gddn.py): a three- to eight-row identity call's pairs deduplicated on the GPU */
+            static int gn_state = -1; static id<MTLComputePipelineState> gn_build, gn_k2[2], gn_k2f[2];   /* gn_k2f: the fold body (apply_bs64_gddn2.py) */ static id<MTLBuffer> gn_ring[16], gn_stat; static unsigned gn_cursor; static uint64_t gn_calls, gn_pairs;
+            if (gn_state < 0) { const char *e = getenv("LLMS_DS4_BS64_GDDN"); gn_state = e && *e && *e != '0';
+                if (gn_state) {
+                    if (has_kernel("kernel_llms_bs64_gdd_buildn") && has_kernel("kernel_llms_bs64_k2_p4_f32_u_gdd") && has_kernel("kernel_llms_bs64_k2_p5_f32_u_gdd")) { gn_build = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_gdd_buildn");
+                        gn_k2[0] = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_k2_p4_f32_u_gdd"); gn_k2[1] = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_k2_p5_f32_u_gdd");
+                        if (has_kernel("kernel_llms_bs64_k2_p4_f32_uf_gdd") && has_kernel("kernel_llms_bs64_k2_p5_f32_uf_gdd")) { gn_k2f[0] = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_k2_p4_f32_uf_gdd"); gn_k2f[1] = ds4_gpu_get_pipeline_or_die("kernel_llms_bs64_k2_p5_f32_uf_gdd"); }
+                        gn_stat = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared]; if (gn_stat) memset([gn_stat contents], 0, 64); }
+                    if (!gn_build || !gn_k2[0] || !gn_k2[1] || !gn_stat) { fprintf(stderr, "llms bs64 gddn: the kernels are not in DS4_METAL_MOE_SOURCE (make_moe_gdd3.py) -- off\n"); gn_state = 0; }
+                    else { fprintf(stderr, "llms: bs64 gddn (a three- to eight-row decode call's routed gate / up pairs deduplicated on the GPU: an expert's holders paired into two-row jobs; ALT gddn)\n");
+                           atexit_b(^{ const uint32_t *st = (const uint32_t *)[gn_stat contents];
+                                       fprintf(stderr, "llms bs64 gddn: %llu calls, %llu pairs dispatched, %u two-row entries, %u singles\n", (unsigned long long)gn_calls, (unsigned long long)gn_pairs, st[2], st[3]); }); } } }
+            if (gn_state && !gdd_done && nolist_now && pair_list_count && args->nei1 >= 3 && args->nei1 <= 8 && !gf_now && !gf2p_now && !routed_dc_on() && (planes_now == 4 || planes_now == 5) && plane_pipelines[1] && (!fold_now || gn_k2f[planes_now == 5 ? 1 : 0]) && !llms_alt_off("gddn")) {
+                const unsigned gs = gn_cursor++ % 16u; const NSUInteger need = (NSUInteger)pair_list_count * 8u; id<MTLComputePipelineState> k2p = fold_now ? gn_k2f[planes_now == 5 ? 1 : 0] : gn_k2[planes_now == 5 ? 1 : 0];
+                if (!gn_ring[gs] || gn_ring[gs].length < need) gn_ring[gs] = [g_device newBufferWithLength:(need > 512u ? need : 512u) options:MTLResourceStorageModePrivate];
+                if (gn_ring[gs] && k2p) {
+                    [enc setComputePipelineState:gn_build]; [enc setBuffer:gn_ring[gs] offset:0 atIndex:10]; [enc setBuffer:gn_stat offset:0 atIndex:19];
+                    [enc dispatchThreads:MTLSizeMake(pair_list_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(pair_list_count, 1, 1)];
+                    if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    [enc setComputePipelineState:k2p];
+                    [enc setThreadgroupMemoryLength:32u * 4u * 5u * 4u + (fold_now ? 32u * 2u * 4u : 0u) atIndex:0];   /* the two-row body's part[32][4][5], + fmid[2][32] on the fold */
+                    [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, pair_list_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)];
+                    gdd_done = 1; gn_calls++; gn_pairs += pair_list_count; gateup_side_single_pairs += pair_list_count;
+                }
+            }
+        }
+        if (pair_list_count && !gdd_done) {
             static id<MTLComputePipelineState> bk1u; static int bk1u_tried;   /* llms REDU12 (apply_redu2.py): k1 on its twin */
             if (redu_mode() >= 2 && !bk1u_tried) { bk1u_tried = 1; char nmu[72]; snprintf(nmu, sizeof nmu, bs64_side_format ? "kernel_llms_bs64_k1%s_f32_u" : "kernel_llms_bs6c_k1%s_f32_u",
                                                  gateup_side_state < 0 ? "_x" : gateup_side_eight_planes ? "_p8" : ""); bk1u = ds4_gpu_get_pipeline_or_die(nmu); }
             const bool redu_k1_now = bk1u && redu_mode() >= 2 && !llms_alt_off("redu12");
             [enc setComputePipelineState:plane_pipelines[0] ? plane_pipelines[0] : (redu_k1_now ? bk1u : bs64_kernel_pipelines[0])]; [enc setBuffer:pair_list_buffer offset:pair_list_offset atIndex:10];
             [enc setThreadgroupMemoryLength:32u * 2u * 5u * 4u + (fold_now ? 32u * 1u * 4u : 0u) + (gf_now ? 32u * 1u * 4u : 0u) + (gf2p_now ? 144u : 0u) atIndex:0];   /* llms G32D_FOLD: + fmid[1][32]; GF_KEEP: + gsc[1][32] */
-            [enc dispatchThreadgroups:MTLSizeMake(72, 1, pair_list_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)]; gateup_side_single_pairs += pair_list_count;
+            [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, pair_list_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)]; gateup_side_single_pairs += pair_list_count;
         }
         if (two_row_entries_count) {
             static id<MTLComputePipelineState> bk2u; static int bk2u_tried;   /* llms REDU12 (apply_redu2.py): k2 on its twin */
@@ -42927,7 +43260,7 @@ static int ds4_gpu_encode_routed_gateup_swiglu(
             const bool redu_k2_now = bk2u && redu_mode() >= 2 && !llms_alt_off("redu12");
             [enc setComputePipelineState:plane_pipelines[1] ? plane_pipelines[1] : (redu_k2_now ? bk2u : bs64_kernel_pipelines[1])]; [enc setBuffer:two_row_entries_buffer offset:two_row_entries_offset atIndex:10];
             [enc setThreadgroupMemoryLength:32u * 4u * 5u * 4u + (fold_now ? 32u * 2u * 4u : 0u) + (gf_now ? 32u * 2u * 4u : 0u) + (gf2p_now ? 272u : 0u) atIndex:0];   /* llms G32D_FOLD: + fmid[2][32]; GF_KEEP: + gsc[2][32] */
-            [enc dispatchThreadgroups:MTLSizeMake(72, 1, two_row_entries_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)]; gateup_side_two_row_entries += two_row_entries_count;
+            [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, two_row_entries_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)]; gateup_side_two_row_entries += two_row_entries_count;
         }
         if (quad_entries_count) {
             if (!quad_entry_ring) { fprintf(stderr, "llms bs6c: no four-row ring\n"); ds4_gpu_end_compute_encoder(cb, enc); return 0; }
@@ -42937,7 +43270,7 @@ static int ds4_gpu_encode_routed_gateup_swiglu(
             const bool redu_k4_now = bk4u && redu_mode() && !llms_alt_off("redu");
             [enc setComputePipelineState:plane_pipelines[2] ? plane_pipelines[2] : (redu_k4_now ? bk4u : bs64_kernel_pipelines[2])]; [enc setBuffer:quad_entry_ring offset:quad_entries_offset atIndex:10];
             [enc setThreadgroupMemoryLength:32u * 8u * 5u * 4u + (fold_now ? 32u * 4u * 4u : 0u) + (gf_now ? 32u * 4u * 4u : 0u) + (gf2p_now ? 512u : 0u) atIndex:0];   /* llms G32D_FOLD: + fmid[4][32]; GF_KEEP: + gsc[4][32] */
-            [enc dispatchThreadgroups:MTLSizeMake(72, 1, quad_entries_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)]; gateup_side_four_row_entries += quad_entries_count;
+            [enc dispatchThreadgroups:MTLSizeMake(llms_routed_g(), 1, quad_entries_count) threadsPerThreadgroup:MTLSizeMake(32, 5, 1)]; gateup_side_four_row_entries += quad_entries_count;
         }
         {   /* llms ROUTEWIT (apply_rwit.py): per-layer distinct experts as dispatched on two-row calls -- an INSTRUMENT */
             static int rwit_state = -1; static uint64_t rwit_calls[40], rwit_single[40], rwit_two[40], rwit_quad[40];
@@ -43421,6 +43754,10 @@ static int g32d_tlsplit_ok(id<MTLCommandBuffer> cb) {
 }
 static int encode_down_from_side_file(id<MTLCommandBuffer> cb, const ds4_gpu_mul_mv_id_args *args, ds4_gpu_stream_expert_cache_entry * const *entries, uint32_t n_entries,
         id<MTLBuffer> addrs, id<MTLBuffer> src1, NSUInteger src1_off, id<MTLBuffer> dst, NSUInteger dst_off, id<MTLBuffer> ids, NSUInteger ids_off, id<MTLBuffer> overflow_down) {
+    ds4_gpu_mul_mv_id_args llms_rg_args; { const NSUInteger rg = llms_routed_g();
+        if (compact_nw_on() && rg == 72) { fprintf(stderr, "llms: COMPACT_NW -- a routed down outside LLMS_DS4_ROUTED_G (layer %d): a compact record cannot be read at full width; refusing\n", g_llms_routed_layer); exit(2); }
+        if (rg != 72) { llms_rg_args = *args; llms_rg_args.ne13 = (compact_nw_on() ? 2000 : 1000) + (int32_t)((rg + 7u) / 8u); args = &llms_rg_args;
+            static int llms_rg_seen; if (!llms_rg_seen) { llms_rg_seen = 1; fprintf(stderr, "llms routed g: first limited dispatch at layer %d (%u groups)\n", g_llms_routed_layer, (unsigned)rg); } } }   /* llms RG_WITNESS (apply_rg_witness.py) */   /* llms ROUTED_G: the down's super-block bound, read only by a *_rgv source */
     static id<MTLComputePipelineState> kx, kd, ks; static id<MTLBuffer> xp[8], xs[8], pr[8]; static unsigned staging_ring_cursor;
     static int grouped_down_state = -1; static id<MTLComputePipelineState> kg, kdg; static id<MTLBuffer> jb[8], ia[8];   /* llms G32D2: the grouped down */
     static id<MTLComputePipelineState> kdg2; static uint64_t g2calls;   /* llms G32D4: the K <= 2 grouped down for calls of <= 2 tokens */
@@ -43471,6 +43808,17 @@ static int encode_down_from_side_file(id<MTLCommandBuffer> cb, const ds4_gpu_mul
                             else { fprintf(stderr, "llms: g32d tg8 (the grouped down at 8 simdgroups = 256 rows a threadgroup; ALT g32tg8)\n");
                                    atexit_b(^{ fprintf(stderr, "llms g32d tg8: %llu calls\n", (unsigned long long)tg8calls); }); } } }
     const int tg8 = g32tg8_state && kxj8 && xj && !xj4 && !llms_alt_off("g32tg8");   /* llms G32D_TG8: the two-row path only; ALT 'g32tg8' */
+
+    static int sj_state = -1; static id<MTLComputePipelineState> ksj; static uint64_t sj_calls, sj_off;   /* llms G32D_SELFJOB (apply_selfjob.py) */
+    if (sj_state < 0) { const char *e = getenv("LLMS_DS4_G32D_SELFJOB"); sj_state = e && *e && *e != '0';
+        if (sj_state) { const char *b1 = getenv("LLMS_DS4_DOWN_FLOOR"), *b2 = getenv("LLMS_DS4_DOWN2"), *b3 = getenv("LLMS_DS4_G32SK");
+            if ((b1 && *b1 && *b1 != '0') || (b2 && *b2 && *b2 != '0') || (b3 && *b3 && *b3 != '0')) { fprintf(stderr, "llms g32d selfjob: refused -- DOWN_FLOOR / DOWN2 / G32SK is set\n"); sj_state = 0; }
+            else if (down_side_planes != 5 || !has_kernel("kernel_llms_g32d_downg_p5_f32_sj")) { fprintf(stderr, "llms g32d selfjob: the *_sj MoE source is not loaded (make_moe_selfjob.py) -- off\n"); sj_state = 0; }
+            else { ksj = ds4_gpu_get_pipeline_or_die("kernel_llms_g32d_downg_p5_f32_sj");
+                   fprintf(stderr, "llms: g32d selfjob (the grouped down rebuilds its jobs from the ids: no builder pass, a direct dispatch; ALT g32sj)\n");
+                   atexit_b(^{ fprintf(stderr, "llms g32d selfjob: %llu calls without the builder pass, %llu calls ALT-off\n", (unsigned long long)sj_calls, (unsigned long long)sj_off); }); } } }
+    int usesj = 0;   /* llms G32D_SELFJOB: only where the builder would run jobs only (the fold's planes, the two-row tg8 path, no K <= 2 kernel loaded) */
+    if (sj_state > 0 && ksj && tg8 && grouped_down_state && !kdg2 && fold_ready && g32fold_state == 1) { if (llms_alt_off("g32sj")) sj_off++; else { usesj = 1; sj_calls++; } }
     if (xj) {   /* the job buffers before the dispatch that fills them */
         const NSUInteger jbb0 = np * 10u * sizeof(int32_t);
         if (!jb[r] || jb[r].length < jbb0) jb[r] = [g_device newBufferWithLength:jbb0 options:MTLResourceStorageModePrivate];
@@ -43490,16 +43838,16 @@ static int encode_down_from_side_file(id<MTLCommandBuffer> cb, const ds4_gpu_mul
             const uint32_t pv0[4] = { 0u, pv[1], pv[2], pv[3] };
             [enc setBytes:(jo ? pv0 : pv) length:sizeof pv atIndex:3]; [enc setBuffer:ids offset:ids_off atIndex:4]; [enc setBuffer:jb[r] offset:0 atIndex:5];
             [enc setBuffer:ia[r] offset:0 atIndex:6]; [enc setBytes:&xa length:sizeof xa atIndex:7];
-            [enc dispatchThreads:MTLSizeMake(72, jo ? 1u : np + 1u, 1) threadsPerThreadgroup:MTLSizeMake(72, 1, 1)]; xjcalls++; if (jo) jo_calls++;
+            if (!usesj) { [enc dispatchThreads:MTLSizeMake(llms_routed_g(), jo ? 1u : np + 1u, 1) threadsPerThreadgroup:MTLSizeMake(72, 1, 1)]; xjcalls++; if (jo) jo_calls++; }   /* llms G32D_SELFJOB: no builder pass */
         }
     } else {
     [enc setComputePipelineState:kx];
     [enc setBuffer:src1 offset:src1_off atIndex:0]; [enc setBuffer:xp[r] offset:0 atIndex:1]; [enc setBuffer:xs[r] offset:0 atIndex:2];
     [enc setBytes:pv length:sizeof pv atIndex:3];
-    [enc dispatchThreads:MTLSizeMake(72, np, 1) threadsPerThreadgroup:MTLSizeMake(72, 1, 1)];
+    [enc dispatchThreads:MTLSizeMake(llms_routed_g(), np, 1) threadsPerThreadgroup:MTLSizeMake(72, 1, 1)];
     }
     { static int down_g32_xpdup_state = -1; if (down_g32_xpdup_state < 0) { const char *e = getenv("LLMS_DS4_DOWN_G32_XPDUP"); down_g32_xpdup_state = e && *e && *e != '0'; if (down_g32_xpdup_state) fprintf(stderr, "llms: g32d xpdup (the planes dispatch issued twice: its critical-path cost, the DUP method)\n"); }
-      if (down_g32_xpdup_state) { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; [enc dispatchThreads:MTLSizeMake(72, np, 1) threadsPerThreadgroup:MTLSizeMake(72, 1, 1)]; } }   /* llms G32D XPDUP */
+      if (down_g32_xpdup_state) { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; [enc dispatchThreads:MTLSizeMake(llms_routed_g(), np, 1) threadsPerThreadgroup:MTLSizeMake(72, 1, 1)]; } }   /* llms G32D XPDUP */
     if (fold_ready && !fold_used) g32fold_declined_calls++;   /* llms G32D_FOLD: another path -- its planes were recomputed */
     if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     const int tlsplit = g32d_tlsplit_ok(cb); if (tlsplit) { enc = ds4_gpu_compute_encoder(cb); g32d_tlsplit_calls++; }   /* llms G32D_TLSPLIT: the down in its own timed pass (its useResource calls follow) */
@@ -43556,10 +43904,33 @@ static int encode_down_from_side_file(id<MTLCommandBuffer> cb, const ds4_gpu_mul
                 else { fprintf(stderr, "llms: g32sk (the grouped down with K split over 4 simdgroups, 512 threads a threadgroup)\n");
                        atexit_b(^{ fprintf(stderr, "llms g32sk: %llu calls\n", (unsigned long long)skcalls); }); } } }
         const int usesk = !use2 && ksk && !llms_alt_off("g32sk"); if (usesk) skcalls++;   /* ALT 'g32sk': the shipped downg on that step */
-        [enc setComputePipelineState:usesk ? ksk : use2 ? kdg2 : kdg];
+
+        static int dfl_state = -1; static id<MTLComputePipelineState> kdgfl; static uint64_t dfl_calls, dfl_off;   /* llms DOWN_FLOOR (apply_down_floor.py): an INSTRUMENT, never shipped */
+        if (dfl_state < 0) { const char *e = getenv("LLMS_DS4_DOWN_FLOOR"); dfl_state = e && *e && *e != '0';
+            if (dfl_state) { const char *fe = getenv("LLMS_DS4_FORCE_IDS");
+                if (!fe || !*fe) { fprintf(stderr, "llms down floor: REFUSED -- an instrument with wrong outputs runs only in a forced session (LLMS_DS4_FORCE_IDS)\n"); dfl_state = 0; }
+                else if (down_side_planes != 5 || !has_kernel("kernel_llms_g32d_downg_p5_f32_floor")) { fprintf(stderr, "llms down floor: the *_dfl MoE source is not loaded (make_moe_dfl.py) -- off\n"); dfl_state = 0; }
+                else { kdgfl = ds4_gpu_get_pipeline_or_die("kernel_llms_g32d_downg_p5_f32_floor"); fprintf(stderr, "llms: down floor (INSTRUMENT: the decode routed down's arithmetic removed, outputs wrong by design; ALT dfloor)\n");
+                       atexit_b(^{ fprintf(stderr, "llms down floor: %llu calls on the floor body, %llu calls ALT-off\n", (unsigned long long)dfl_calls, (unsigned long long)dfl_off); }); } } }
+        const int usedfl = dfl_state > 0 && kdgfl && !usesk && !use2 && (llms_alt_off("dfloor") ? (dfl_off++, 0) : (dfl_calls++, 1));   /* llms DOWN_FLOOR */
+
+        static int d2_state = -1; static id<MTLComputePipelineState> kd2r; static uint64_t d2_calls, d2_off;   /* llms DOWN2 (apply_down2.py) */
+        if (d2_state < 0) { const char *e = getenv("LLMS_DS4_DOWN2"); d2_state = e && *e && *e != '0';
+            if (d2_state) { if (down_side_planes != 5 || !has_kernel("kernel_llms_g32d_downg_p5_f32_d2r")) { fprintf(stderr, "llms down2: the *_d2r MoE source is not loaded (make_moe_down2.py) -- off\n"); d2_state = 0; }
+                else { kd2r = ds4_gpu_get_pipeline_or_die("kernel_llms_g32d_downg_p5_f32_d2r"); fprintf(stderr, "llms: down2 (the decode routed down at two rows a lane, its decode hoisted; ALT down2)\n");
+                       atexit_b(^{ fprintf(stderr, "llms down2: %llu calls on the two-row body, %llu calls ALT-off\n", (unsigned long long)d2_calls, (unsigned long long)d2_off); }); } } }
+        const int used2 = !usedfl && d2_state > 0 && kd2r && tg8 && !usesk && !use2 && (llms_alt_off("down2") ? (d2_off++, 0) : (d2_calls++, 1));   /* llms DOWN2 */
+        if (usesj) {   /* llms G32D_SELFJOB: job tg.y rebuilt in the kernel from the ids; a direct dispatch over <= 12 jobs (threadgroups past the call's count exit) */
+            const struct { uint32_t np, nei0; uint64_t nbi1; uint32_t ne02, ne01; } sja = { (uint32_t)np, (uint32_t)args->nei0, (uint64_t)args->nbi1, (uint32_t)args->ne02, (uint32_t)args->ne01 };
+            [enc setComputePipelineState:ksj]; [enc setBytes:args length:sizeof(*args) atIndex:0]; [enc setBuffer:addrs offset:0 atIndex:1]; [enc setBuffer:ids offset:ids_off atIndex:2];
+            [enc setBuffer:XPb offset:0 atIndex:3]; [enc setBuffer:XSb offset:0 atIndex:4]; [enc setBuffer:pr[r] offset:0 atIndex:5]; [enc setBytes:&sja length:sizeof sja atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)args->ne01 + 255u) / 256u, 12, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        } else {
+        [enc setComputePipelineState:usedfl ? kdgfl : used2 ? kd2r : usesk ? ksk : use2 ? kdg2 : kdg];
         [enc setBytes:args length:sizeof(*args) atIndex:0]; [enc setBuffer:addrs offset:0 atIndex:1]; [enc setBuffer:jb[r] offset:0 atIndex:2];
         [enc setBuffer:XPb offset:0 atIndex:3]; [enc setBuffer:XSb offset:0 atIndex:4]; [enc setBuffer:pr[r] offset:0 atIndex:5];
-        [enc dispatchThreadgroupsWithIndirectBuffer:ia[r] indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(32, usesk ? 16 : (tg8 && !use2) ? 8 : 4, 1)];   /* llms G32SK; llms G32D_TG8 */
+        [enc dispatchThreadgroupsWithIndirectBuffer:ia[r] indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(32, used2 ? 4 : usesk ? 16 : (tg8 && !use2) ? 8 : 4, 1)];   /* llms DOWN2: (32, 4, 1) */   /* llms G32SK; llms G32D_TG8 */
+        }   /* llms G32D_SELFJOB */
     } else
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)args->ne01 + 127u) / 128u, (NSUInteger)args->nei1, 6) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
     if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -43844,6 +44215,10 @@ static int encode_g32d_tok(id<MTLCommandBuffer> cb, const ds4_gpu_mul_mv_id_args
                kd = ds4_gpu_get_pipeline_or_die(down_side_planes == 5 ? "kernel_llms_g32d_downg_p5_f32" : down_side_planes == 8 ? "kernel_llms_g32d_downg_p8_f32" : "kernel_llms_g32d_downg_p6_f32"); }
     if (!exit_report_registered) { exit_report_registered = 1; atexit_b(^{ fprintf(stderr, "llms g32d tok: %llu token-list down calls, %llu tokens\n", (unsigned long long)g32d_tok_calls, (unsigned long long)g32d_tok_tokens); }); }
     if (!cb || !kx || !kg || !kd || !ks || !args || !addrs || !src1 || !dst || !ids || !tokbuf || n_tok == 0 || args->ne00 != 2304 || args->ne01 != 5120 || args->ne0 != 5120 || args->nei0 != 6 || args->nei1 <= 0) {
+    ds4_gpu_mul_mv_id_args llms_rg_args; { const NSUInteger rg = llms_routed_g();
+        if (compact_nw_on() && rg == 72) { fprintf(stderr, "llms: COMPACT_NW -- a routed down outside LLMS_DS4_ROUTED_G (layer %d): a compact record cannot be read at full width; refusing\n", g_llms_routed_layer); exit(2); }
+        if (rg != 72) { llms_rg_args = *args; llms_rg_args.ne13 = (compact_nw_on() ? 2000 : 1000) + (int32_t)((rg + 7u) / 8u); args = &llms_rg_args;
+            static int llms_rg_seen; if (!llms_rg_seen) { llms_rg_seen = 1; fprintf(stderr, "llms routed g: first limited dispatch at layer %d (%u groups)\n", g_llms_routed_layer, (unsigned)rg); } } }   /* llms RG_WITNESS (apply_rg_witness.py) */   /* llms ROUTED_G: the down's super-block bound, read only by a *_rgv source */
         fprintf(stderr, "llms g32d tok: a kernel is missing or the call is not the V4.1 routed down\n"); return 0; }
     for (uint32_t i = 0; i < n_entries; i++) if (!entries[i] || !entries[i]->down_buffer) return 0;
     if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries, n_entries, 0)) return 0;
@@ -43860,7 +44235,7 @@ static int encode_g32d_tok(id<MTLCommandBuffer> cb, const ds4_gpu_mul_mv_id_args
     [enc setComputePipelineState:kx];
     [enc setBuffer:src1 offset:src1_off atIndex:0]; [enc setBuffer:xp[r] offset:0 atIndex:1]; [enc setBuffer:xs[r] offset:0 atIndex:2];
     [enc setBytes:pv length:sizeof pv atIndex:3]; [enc setBuffer:tokbuf offset:tok_off atIndex:4];
-    [enc dispatchThreads:MTLSizeMake(72, nl, 1) threadsPerThreadgroup:MTLSizeMake(72, 1, 1)];
+    [enc dispatchThreads:MTLSizeMake(llms_routed_g(), nl, 1) threadsPerThreadgroup:MTLSizeMake(72, 1, 1)];
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     [enc setComputePipelineState:kg];
     [enc setBytes:args length:sizeof(*args) atIndex:0]; [enc setBuffer:ids offset:ids_off atIndex:1]; [enc setBuffer:jb[r] offset:0 atIndex:2]; [enc setBuffer:ia[r] offset:0 atIndex:3];
@@ -52070,6 +52445,7 @@ static void route_damp_init(void) {
 static int apply_decode_route_row(uint32_t layer, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert,
                          uint32_t n_expert, const ds4_gpu_tensor *probs, const float *bias, uint32_t row) {   /* llms ONE_RPOL: the re-pick of one row (llms SP_ED: row r) */
     float pr[512], sc[512], w[8]; int32_t sel[8], ns[8];
+    int llms_ht_slot = -1; float llms_ht_mass = 0.0f, llms_ht_ginv = 1.0f;   /* llms ROUTE_HT (apply_route_ht.py) */
     if (route_damp_on < 0) route_damp_init();   /* llms ROUTE_DAMP */
     if (route_damp_on > 0 && layer == 0) route_damp_rows_seen++;
     const int damp_now = route_damp_on > 0 && layer < 40u && route_damp_rows_seen > route_damp_after;   /* llms ROUTE_DAMP */
@@ -52137,7 +52513,7 @@ static int apply_decode_route_row(uint32_t layer, const ds4_gpu_tensor *selected
                        if (decode_coroute_hard_state) { fprintf(stderr, "llms: decode coroute HARD from verify row %d (rows route only among earlier rows' final picks) -- FIDELITY DIAL\n", decode_coroute_hard_state);
                                   atexit_b(^{ fprintf(stderr, "llms decode coroute hard: %llu rows, %llu picks moved, %llu rows with fewer than six allowed\n",
                                                       (unsigned long long)decode_coroute_hard_rows, (unsigned long long)decode_coroute_hard_moved, (unsigned long long)decode_coroute_hard_short); }); } }
-        if (!cg_r_ && decode_coroute_hard_state && row >= (uint32_t)decode_coroute_hard_state && row < 8u && n_expert <= 8u && n_total_expert <= 512u && !llms_alt_off("dcrh")) {
+        if (!cg_r_ && decode_coroute_hard_state && !llms_dcrh_hold_flag && row >= (uint32_t)decode_coroute_hard_state && row < 8u && n_expert <= 8u && n_total_expert <= 512u && !llms_alt_off("dcrh")) {   /* llms DCRH_SAFE: held off for a grammar-depth / copy verify */
             int32_t prev[64]; const uint32_t np = row * n_expert;
             if (ds4_gpu_tensor_read(selected, 0, prev, (uint64_t)np * sizeof(int32_t))) {
                 uint8_t *allow = hard_coroute_allowed; memset(allow, 0, n_total_expert); uint32_t na = 0;
@@ -52166,6 +52542,7 @@ static int apply_decode_route_row(uint32_t layer, const ds4_gpu_tensor *selected
                          if (otl_k) { fprintf(stderr, "llms: one-token top-%d in layers >= %d -- FIDELITY DIAL\n", otl_k, otl_l); } }
         int kk = cg_t_ ? 0 : decode_route_topk_state; if (!cg_t_ && otl_k && (int)layer >= otl_l && (!kk || otl_k < kk)) kk = otl_k;
         if (gtopk_step_cap && (int)layer >= gtopk_min_layer() && (int)layer < gtopk_max_layer() && (!kk || (int)gtopk_step_cap < kk) && !llms_alt_off("gtopk")) { kk = (int)gtopk_step_cap; gtopk_rows++; }   /* llms GTOPK; GTOPK_LMIN */
+        if (row == 0u && gtopk_row0_cap && !cg_t_ && (int)layer >= gtopk_min_layer() && (int)layer < gtopk_max_layer() && (!kk || (int)gtopk_row0_cap < kk) && !llms_alt_off("gtopk")) { kk = (int)gtopk_row0_cap; gtopk_row0_rows++; }   /* llms GTOPK_ROW0: the gate's cap, first row only */
         static int topk_hi_layer = -1; static uint64_t topk_hi_calls;   /* llms TOPK_HI (apply_topk_hi.py): layers >= H keep all their picks (no top-k, GTOPK or CUM cut) */
 
         if (topk_hi_layer < 0) { const char *e = getenv("LLMS_DS4_DECODE_ROUTE_TOPK_HI"); topk_hi_layer = e && *e ? atoi(e) : 0; if (topk_hi_layer < 1) topk_hi_layer = 0;
@@ -52173,6 +52550,36 @@ static int apply_decode_route_row(uint32_t layer, const ds4_gpu_tensor *selected
                                               atexit_b(^{ fprintf(stderr, "llms decode route topk_hi: %llu layer-steps exempt\n", (unsigned long long)topk_hi_calls); }); } }
         const int topk_hi_now = topk_hi_layer && (int)layer >= topk_hi_layer && !llms_alt_off("tkhi");
         if (topk_hi_now) { kk = 0; topk_hi_calls++; }
+        {   /* llms ROUTE_HT: the unbiased cut in place of the deterministic top-k */
+            static int ht_k = -1; static float ht_ginv = 1.0f; static uint64_t ht_rows, ht_tail_rows, ht_rng = 0x9E3779B97F4A7C15ull;
+            if (ht_k < 0) { const char *e = getenv("LLMS_DS4_DECODE_ROUTE_HT"); ht_k = e && *e ? atoi(e) : 0; if (ht_k < 1 || ht_k > 5) ht_k = 0;
+                if (ht_k) { const char *g = getenv("LLMS_DS4_ROUTE_GAIN"); const float gv = g && *g ? (float)atof(g) : 1.0f; ht_ginv = gv >= 0.5f && gv <= 2.0f ? 1.0f / gv : 1.0f;
+                    fprintf(stderr, "llms: decode route HT %d (the first %d picks kept; ONE resident pick after them, sampled by router probability, carries the resident tail's whole probability; its row's weights x %.4f, the routed gain undone) -- FIDELITY DIAL\n", ht_k, ht_k - 1, (double)ht_ginv);
+                    atexit_b(^{ fprintf(stderr, "llms decode route ht: %llu rows, %llu with a sampled tail pick\n", (unsigned long long)ht_rows, (unsigned long long)ht_tail_rows); }); } }
+            static int ht_keepcap = -1;   /* llms ROUTE_HT_KEEPCAP (apply_route_ht_keepcap.py): HT acts only where the row's keep is at least K */
+            if (ht_keepcap < 0) { const char *ke = getenv("LLMS_DS4_DECODE_ROUTE_HT_KEEPCAP"); ht_keepcap = ke && *ke && *ke != '0'; if (ht_keepcap) fprintf(stderr, "llms: decode route HT keepcap (a smaller deterministic keep -- the thinking cap -- stands; HT acts only where the keep is at least K)\n"); }
+            if (ht_k && !cg_t_ && !topk_hi_now && n_expert <= 8u && !llms_alt_off("ht") && !(ht_keepcap && kk > 0 && kk < ht_k)) {
+                int tail[8]; uint32_t nt = 0, head = 0; float tm = 0.0f;
+                for (uint32_t i = 0; i < n_expert; i++) { if (ns[i] < 0) continue; if (head < (uint32_t)(ht_k - 1)) { head++; continue; }
+                    const int resd = (int)((resident_bits[layer][ns[i] >> 6] >> (ns[i] & 63u)) & 1ull) || lookahead_in_flight(layer, ns[i]);
+                    if (resd) { tail[nt++] = (int)i; tm += pr[ns[i]]; } else ns[i] = -1; }
+                ht_rows++;
+                if (nt > 0 && tm > 0.0f) {
+                    static int ht_crn = -1; static float ht_u01[64];   /* llms ROUTE_HT_CRN (apply_route_ht_crn.py): one uniform per layer call, shared by its rows */
+                    if (ht_crn < 0) { const char *ce = getenv("LLMS_DS4_DECODE_ROUTE_HT_CRN"); ht_crn = ce && *ce && *ce != '0' ? (atoi(ce) == 2 ? 2 : 1) : 0;   /* llms ROUTE_HT_CRN2: 2 = the canonical order */ if (ht_crn) fprintf(stderr, "llms: decode route HT crn (row 0 of a layer call draws the uniform, its other rows reuse it: unbiased per row, the rows' tail picks coupled)\n"); }
+                    float u01;
+                    if (!ht_crn || row == 0u || layer >= 64u) { ht_rng ^= ht_rng << 13; ht_rng ^= ht_rng >> 7; ht_rng ^= ht_rng << 17; u01 = (float)((double)(ht_rng >> 11) * (1.0 / 9007199254740992.0)); if (layer < 64u) ht_u01[layer] = u01; }
+                    else u01 = ht_u01[layer];
+                    const float u = u01 * tm;
+                    if (ht_crn == 2) for (uint32_t a2 = 1; a2 < nt; a2++) { const int x2 = tail[a2]; uint32_t b2 = a2; while (b2 > 0 && ns[tail[b2 - 1]] > ns[x2]) { tail[b2] = tail[b2 - 1]; b2--; } tail[b2] = x2; }   /* llms ROUTE_HT_CRN2: the tail by expert index */
+                    float run = 0.0f; int pick = tail[nt - 1];
+                    for (uint32_t t = 0; t < nt; t++) { run += pr[ns[tail[t]]]; if (u < run) { pick = tail[t]; break; } }
+                    for (uint32_t t = 0; t < nt; t++) if (tail[t] != pick) ns[tail[t]] = -1;
+                    llms_ht_slot = pick; llms_ht_mass = tm; llms_ht_ginv = ht_ginv; ht_tail_rows++;
+                }
+                kk = 0;
+            }
+        }
         if (kk && n_expert <= 8u && !llms_alt_off("otk")) for (uint32_t i = (uint32_t)kk; i < n_expert; i++) if (ns[i] >= 0) { ns[i] = -1; otk_drops++; }   /* ALT otk */
         {   /* llms ONE_CUM (2026-10-16): after top-k, keep the shortest prefix whose probability reaches c of the kept mass (>= 2 experts) */
             static float decode_route_cum_value = -1.0f; static uint64_t decode_route_cum_drops;
@@ -52180,13 +52587,20 @@ static int apply_decode_route_row(uint32_t layer, const ds4_gpu_tensor *selected
                               if (decode_route_cum_value > 0.0f) { fprintf(stderr, "llms: one-token cumulative-mass keep %.2f -- FIDELITY DIAL\n", (double)decode_route_cum_value);
                                                 atexit_b(^{ fprintf(stderr, "llms decode route cum: %llu slots dropped\n", (unsigned long long)decode_route_cum_drops); }); } }
             if (!cg_t_ && decode_route_cum_value > 0.0f && n_expert <= 8u && !topk_hi_now) {   /* llms TOPK_HI: no CUM cut in the exempt layers */
-                float tot = 0.0f; for (uint32_t i = 0; i < n_expert; i++) if (ns[i] >= 0) tot += pr[ns[i]];
+                static int ht_cumfix = -1; static uint64_t ht_cumfix_seen, ht_cumfix_del;   /* llms ROUTE_HT_CUMFIX (apply_ht_cumfix.py): 1 = the cut sees the sampled pick at the mass it carries; 2 = count only */
+                if (ht_cumfix < 0) { const char *fe = getenv("LLMS_DS4_DECODE_ROUTE_HT_CUMFIX"); ht_cumfix = fe && *fe ? atoi(fe) : 0; if (ht_cumfix != 1 && ht_cumfix != 2) ht_cumfix = 0;
+                    if (ht_cumfix) { fprintf(stderr, "llms: decode route HT cumfix %d (%s) -- FIDELITY DIAL\n", ht_cumfix, ht_cumfix == 1 ? "the cumulative cut sees the sampled pick at the tail mass it carries; a pick it still deletes leaves an ordinary two-expert row" : "count only: the shipped cut, with a counter of sampled picks it deletes");
+                        atexit_b(^{ fprintf(stderr, "llms decode route ht cumfix: %llu sampled rows at the cumulative cut, %llu sampled picks deleted by it\n", (unsigned long long)ht_cumfix_seen, (unsigned long long)ht_cumfix_del); }); } }
+                if (ht_cumfix && llms_ht_slot >= 0) ht_cumfix_seen++;
+                #define LLMS_CUMP(i_) ((ht_cumfix == 1 && (int)(i_) == llms_ht_slot) ? llms_ht_mass : pr[ns[i_]])
+                float tot = 0.0f; for (uint32_t i = 0; i < n_expert; i++) if (ns[i] >= 0) tot += LLMS_CUMP(i);
                 float run = 0.0f; uint32_t kept = 0;
                 for (uint32_t i = 0; i < n_expert; i++) {
                     if (ns[i] < 0) continue;
-                    if (kept >= 2u && run >= decode_route_cum_value * tot) { ns[i] = -1; decode_route_cum_drops++; continue; }
-                    run += pr[ns[i]]; kept++;
+                    if (kept >= 2u && run >= decode_route_cum_value * tot) { if (ht_cumfix && (int)i == llms_ht_slot) { ht_cumfix_del++; if (ht_cumfix == 1) llms_ht_slot = -1; } ns[i] = -1; decode_route_cum_drops++; continue; }
+                    run += LLMS_CUMP(i); kept++;
                 }
+                #undef LLMS_CUMP
             }
         }
     }
@@ -52283,6 +52697,50 @@ static int apply_decode_route_row(uint32_t layer, const ds4_gpu_tensor *selected
         float ws0 = 0.0f; for (uint32_t j = 0; j < n_expert; j++) { resc_sel[row][j] = sel[j]; ws0 += w[j]; }
         resc_ws[row] = ws0; memcpy(resc_pr[row], pr, (size_t)n_total_expert * sizeof(float)); resc_row_call[row] = resc_call;
     }
+    uint8_t cosw_mark[8] = {0}; static int cosw_out;   /* apply_coswap3.py: slots the swap filled from outside the row's six; SUB_DROP spares them */
+    {   /* llms COSWAP (apply_coswap.py): LLMS_DS4_DECODE_COSWAP=tau[:n] -- after every cut, a later row's weakest unshared pick moves onto an expert an earlier row keeps when this row's router gives it >= tau x the replaced pick's probability; the pick count is held */
+        static float cosw_tau = -1.0f; static int cosw_n = 1; static uint64_t cosw_rows, cosw_cand, cosw_swaps;
+        if (cosw_tau < 0.0f) { const char *e = getenv("LLMS_DS4_DECODE_COSWAP"); cosw_tau = e && *e ? (float)atof(e) : 0.0f; if (!(cosw_tau > 0.0f) || cosw_tau > 4.0f) cosw_tau = 0.0f;
+            if (cosw_tau > 0.0f) { const char *c = strchr(e, ':'); cosw_n = c ? atoi(c + 1) : 1; if (cosw_n < 1 || cosw_n > 6) cosw_n = 1; { const char *c2 = c ? strchr(c + 1, ':') : NULL; cosw_out = c2 && atoi(c2 + 1) == 1; if (cosw_out) fprintf(stderr, "llms: decode coswap OUT (the swap may take an earlier row's kept expert outside this row's six; SUB_DROP spares it)\n"); }
+                fprintf(stderr, "llms: decode coswap %.3f:%d (after the cuts, a later row's weakest unshared pick moves onto an earlier row's kept expert at >= %.3f x its probability; up to %d a row) -- FIDELITY DIAL\n", (double)cosw_tau, cosw_n, (double)cosw_tau, cosw_n);
+                atexit_b(^{ fprintf(stderr, "llms decode coswap: %llu later rows, %llu candidates, %llu swaps\n", (unsigned long long)cosw_rows, (unsigned long long)cosw_cand, (unsigned long long)cosw_swaps); }); } }
+        if (cosw_tau > 0.0f && row > 0u && row < 8u && n_expert <= 8u && n_total_expert <= 512u && !llms_alt_off("cosw")) {
+            int32_t cprev[64]; float cpw[64]; const uint32_t cnp = row * n_expert;
+            if (ds4_gpu_tensor_read(selected, 0, cprev, (uint64_t)cnp * sizeof(int32_t)) && ds4_gpu_tensor_read(weights, 0, cpw, (uint64_t)cnp * sizeof(float))) {
+                cosw_rows++;
+                for (int it = 0; it < cosw_n; it++) {
+                    int wi = -1, be = -1;
+                    for (uint32_t i = 0; i < n_expert; i++) { if (ns[i] < 0 || (uint32_t)ns[i] >= n_total_expert) continue; int sh = 0; for (uint32_t q = 0; q < cnp; q++) if (cprev[q] == ns[i] && cpw[q] > 0.0f) { sh = 1; break; }
+                        if (!sh && (wi < 0 || pr[ns[i]] < pr[ns[wi]])) wi = (int)i; }
+                    if (wi < 0) break;
+                    for (uint32_t q = 0; q < cnp; q++) { const int32_t e2 = cprev[q]; if (e2 < 0 || (uint32_t)e2 >= n_total_expert || !(cpw[q] > 0.0f)) continue; int in = 0, own = 0; for (uint32_t i = 0; i < n_expert; i++) { if (ns[i] == e2) in = 1; if (sel[i] == e2) own = 1; }
+                        if (!in && (own || cosw_out) && (be < 0 || pr[e2] > pr[be])) be = e2; }   /* apply_coswap2.py: only an expert of this row's own six, unless apply_coswap3.py's third field is 1 */
+                    if (be < 0) break;
+                    cosw_cand++;
+                    if (!(pr[be] >= cosw_tau * pr[ns[wi]])) break;
+                    ns[wi] = be; cosw_swaps++; { int own2 = 0; for (uint32_t i = 0; i < n_expert; i++) if (sel[i] == be) own2 = 1; if (!own2 && wi < 8) cosw_mark[wi] = 1; }
+                }
+            }
+        }
+    }
+    {   /* llms COADD (apply_coswap2.py): LLMS_DS4_DECODE_COADD=tau -- a later row takes back an expert of its own six that the cuts dropped when an earlier row keeps it (no weight read is added: the pair is shared) and its probability is >= tau x the row's weakest kept pick's */
+        static float coadd_tau = -1.0f; static uint64_t coadd_rows, coadd_cand, coadd_added;
+        if (coadd_tau < 0.0f) { const char *e = getenv("LLMS_DS4_DECODE_COADD"); coadd_tau = e && *e ? (float)atof(e) : 0.0f; if (!(coadd_tau > 0.0f) || coadd_tau > 4.0f) coadd_tau = 0.0f;
+            if (coadd_tau > 0.0f) { fprintf(stderr, "llms: decode coadd %.3f (a later row takes back a cut pick of its own six that an earlier row keeps, at >= %.3f x its weakest kept pick's probability) -- FIDELITY DIAL\n", (double)coadd_tau, (double)coadd_tau);
+                atexit_b(^{ fprintf(stderr, "llms decode coadd: %llu later rows, %llu candidates, %llu picks added\n", (unsigned long long)coadd_rows, (unsigned long long)coadd_cand, (unsigned long long)coadd_added); }); } }
+        if (coadd_tau > 0.0f && row > 0u && row < 8u && n_expert <= 8u && n_total_expert <= 512u && !llms_alt_off("coadd")) {
+            int32_t aprev[64]; float apw[64]; const uint32_t anp = row * n_expert;
+            if (ds4_gpu_tensor_read(selected, 0, aprev, (uint64_t)anp * sizeof(int32_t)) && ds4_gpu_tensor_read(weights, 0, apw, (uint64_t)anp * sizeof(float))) {
+                coadd_rows++; float pmin = -1.0f; for (uint32_t i = 0; i < n_expert; i++) if (ns[i] >= 0 && (uint32_t)ns[i] < n_total_expert && (pmin < 0.0f || pr[ns[i]] < pmin)) pmin = pr[ns[i]];
+                if (pmin >= 0.0f) for (uint32_t j = 0; j < n_expert; j++) { const int32_t e2 = sel[j]; if (e2 < 0 || (uint32_t)e2 >= n_total_expert) continue;
+                    int in = 0, sh = 0, fs = -1; for (uint32_t i = 0; i < n_expert; i++) { if (ns[i] == e2) in = 1; if (ns[i] < 0 && fs < 0) fs = (int)i; }
+                    if (in || fs < 0) continue;
+                    for (uint32_t q = 0; q < anp; q++) if (aprev[q] == e2 && apw[q] > 0.0f) { sh = 1; break; }
+                    if (!sh) continue;
+                    coadd_cand++; if (pr[e2] >= coadd_tau * pmin) { ns[fs] = e2; coadd_added++; } }
+            }
+        }
+    }
     uint32_t same = 0;
     for (uint32_t i = 0; i < n_expert; i++) for (uint32_t j = 0; j < n_expert; j++) if (ns[i] == sel[j]) { same++; break; }
     if (decode_route_check_mode) { if (same != n_expert) decode_check_mismatches++; return 1; }
@@ -52290,13 +52748,14 @@ static int apply_decode_route_row(uint32_t layer, const ds4_gpu_tensor *selected
 
     { static int sub_drop = -1; static uint64_t sub_dropped, sub_kept_last; if (sub_drop < 0) { const char *e = getenv("LLMS_DS4_SUB_DROP"); sub_drop = e && *e && *e != '0';   /* llms SUB_DROP */
         if (sub_drop) { fprintf(stderr, "llms: sub drop (the decode cut's resident substitutes are dropped, not computed; ALT sdrop)\n"); atexit_b(^{ fprintf(stderr, "llms sub drop: %llu substitutes dropped, %llu rows kept their heaviest (no original left)\n", (unsigned long long)sub_dropped, (unsigned long long)sub_kept_last); }); } }
-      if (sub_drop && !llms_alt_off("sdrop")) { int32_t was[8]; uint32_t live = 0; for (uint32_t i = 0; i < n_expert && i < 8u; i++) { was[i] = ns[i]; if (ns[i] < 0) continue; int orig = 0; for (uint32_t j = 0; j < n_expert; j++) orig |= ns[i] == sel[j]; if (!orig) { ns[i] = -1; sub_dropped++; } else live++; }
+      if (sub_drop && !llms_alt_off("sdrop")) { int32_t was[8]; uint32_t live = 0; for (uint32_t i = 0; i < n_expert && i < 8u; i++) { was[i] = ns[i]; if (ns[i] < 0) continue; int orig = 0; for (uint32_t j = 0; j < n_expert; j++) orig |= ns[i] == sel[j]; if (!orig && !(i < 8u && cosw_mark[i])) { ns[i] = -1; sub_dropped++; } else live++; }
         if (!live) { int best = -1; for (uint32_t i = 0; i < n_expert && i < 8u; i++) if (was[i] >= 0 && (best < 0 || pr[was[i]] > pr[was[best]])) best = (int)i; if (best >= 0) { ns[best] = was[best]; sub_dropped--; sub_kept_last++; } } } }   /* llms SUB_DROP v2: never leave a row without a routed expert (MISS_SPLIT's 10:4x lesson) */
     float ws = 0.0f, ps = 0.0f;
     for (uint32_t i = 0; i < n_expert; i++) { ws += w[i]; ps += ns[i] >= 0 ? pr[ns[i]] : 0.0f; }
     if (!llms_alt_off("w0")) { ps = 0.0f; for (uint32_t i = 0; i < n_expert; i++) ps += sel[i] >= 0 ? pr[sel[i]] : 0.0f; }   /* llms ROUTE_W0: over the router's original six */
     for (uint32_t i = 0; i < n_expert; i++) w[i] = (ps > 0.0f && ns[i] >= 0) ? pr[ns[i]] / ps * ws : 0.0f;
-    if (route_wnorm_on() && !llms_alt_off("w0") && !llms_alt_off("wn")) {   /* llms ROUTE_WNORM: site 1, the per-row cut */
+    if (llms_ht_slot >= 0 && ns[llms_ht_slot] >= 0 && ps > 0.0f) { w[llms_ht_slot] = llms_ht_mass / ps * ws; for (uint32_t i = 0; i < n_expert; i++) if (ns[i] >= 0) w[i] *= llms_ht_ginv; }   /* llms ROUTE_HT */
+    if (llms_ht_slot < 0 && route_wnorm_on() && !llms_alt_off("w0") && !llms_alt_off("wn")) {   /* llms ROUTE_WNORM: site 1, the per-row cut; llms ROUTE_HT: not on a sampled row */
         float s6 = 0.0f, sk = 0.0f; for (uint32_t i = 0; i < n_expert; i++) { if (sel[i] >= 0) s6 += pr[sel[i]] * pr[sel[i]]; if (ns[i] >= 0) sk += pr[ns[i]] * pr[ns[i]]; }
         if (sk > 0.0f && s6 > sk && isfinite(s6)) { const float c = sqrtf(s6 / sk); for (uint32_t i = 0; i < n_expert; i++) if (ns[i] >= 0) w[i] *= c; wnorm_cut_rows++; wnorm_cut_sum += c; }
     }
@@ -52686,6 +53145,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_tokens,
         bool                   *mid_is_f16,
         bool                    force_resident) {
+    g_llms_routed_layer = (int)layer_index;   /* llms ROUTED_G by layer */
     overlay_hook_depth++;
     if (overlay_hook_depth == 1 && ruq2_on() && layer_index == ruq2_layer && n_tokens >= 1u && n_tokens <= 3u && n_expert == 6u && expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u) {   /* llms RUQ2 */
         const int rr = ruq2_routed(out, x, selected, weights, n_tokens); overlay_hook_depth--; if (mid_is_f16) *mid_is_f16 = false; return rr; }
@@ -55380,6 +55840,7 @@ typedef struct {
     __unsafe_unretained id<MTLBuffer> ga, ua, da;
     const ds4_gpu_tensor *probs, *wts; const float *bias; uint64_t v1, v2;
     int ela;   /* llms ED_LA5: this step computes the look-ahead and prefetches on it */
+    int napok;   /* llms EDF_NAP_ALT (apply_edfnap_alt.py): this request may nap (not ALT-off 'edfnap'; decided at encode) */
     int wfe;   /* llms EDF_WFE_ALT: this request's wait sleeps in WFE (decided at encode: LLMS_DS4_EDF_WFE and not ALT-off 'wfe') */
     int altoff;   /* llms EDF_TIME_C: the ALT name in LLMS_DS4_EDF_TIME_ALT was off when this request was encoded */
     int msk;   /* llms ED_SKIP: this request may drop small cold picks (decided at encode: LLMS_DS4_ED_SKIP and not ALT-off 'msk') */
@@ -56436,15 +56897,22 @@ static void *expert_server_thread(void *arg) { pthread_setname_np("llms.edf");  
         }
         const uint32_t want = (uint32_t)q.v1; uint64_t spins = 0;
 
+
         static int edf_nap_state = -1; static float nap_f = 0.0f, nap_zone = 0.30f; static double nap_ema[64]; static uint64_t nap_n, nap_late, nap_skip; static double nap_us;   /* llms EDF_NAP */
         if (edf_nap_state < 0) { const char *e = getenv("LLMS_DS4_EDF_NAP"); nap_f = e ? (float)atof(e) : 0.0f; edf_nap_state = nap_f > 0.0f && nap_f < 1.0f;
                        const char *z = getenv("LLMS_DS4_EDF_NAP_ZONE"); if (z && *z) nap_zone = (float)atof(z);
+                       if (edf_nap_state && keepbusy_thermal_state < 0) {   /* llms EDF_NAP_READER (apply_nap_reader.py): the zone reader for the nap, without the keep-busy filler */
+                           const char *rd = getenv("LLMS_DS4_EDF_NAP_READER");
+                           if (rd && *rd && *rd != '0') { pthread_t rt; pthread_attr_t ra; pthread_attr_init(&ra); pthread_attr_setdetachstate(&ra, PTHREAD_CREATE_DETACHED);
+                               if (pthread_create(&rt, &ra, thermal_thread, NULL) == 0) { keepbusy_thermal_state = 1; fprintf(stderr, "llms: edf nap reader (the thermal-zone reader started for the nap: IOReport PZRSDNCY at 1 Hz)\n"); }
+                               else fprintf(stderr, "llms: edf nap reader -- no thread; the nap stays inert\n");
+                               pthread_attr_destroy(&ra); } }
                        if (edf_nap_state) { fprintf(stderr, "llms: edf nap %.2f of the layer's expected wait when the thermal zone >= %.2f\n", (double)nap_f, (double)nap_zone);
                                   atexit_b(^{ fprintf(stderr, "llms edf nap: %llu naps (%.1f ms asleep), %llu late (the post landed during the nap), %llu skipped (zone or short wait)\n",
                                                       (unsigned long long)nap_n, nap_us / 1000.0, (unsigned long long)nap_late, (unsigned long long)nap_skip); }); } }
         const uint32_t nap_l = q.layer < 64u ? q.layer : 63u; const uint64_t nap_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int nap_did = 0;
         if (edf_nap_state) {
-            if (thermal_zone >= nap_zone && nap_ema[nap_l] > 150.0 && __atomic_load_n((const uint32_t *)box, __ATOMIC_ACQUIRE) != want) {
+            if (q.napok && thermal_zone >= nap_zone && nap_ema[nap_l] > 150.0 && __atomic_load_n((const uint32_t *)box, __ATOMIC_ACQUIRE) != want) {
                 const double s = (double)nap_f * nap_ema[nap_l]; struct timespec ts = { 0, (long)(s * 1000.0) };
                 nanosleep(&ts, NULL); nap_n++; nap_us += s; nap_did = 1;
                 if (__atomic_load_n((const uint32_t *)box, __ATOMIC_ACQUIRE) == want) { nap_late++; nap_ema[nap_l] *= 0.9; nap_did = 2; }
@@ -57457,6 +57925,7 @@ static int defer_event_driven(const void *model_map, uint64_t model_size, uint32
         rq->ela = lookahead_top_m > 0 && !llms_alt_off("elc") && !llms_alt_off("elp");   /* llms ED_LA5: decided at encode time */
         rq->elc_norm = request_rows_count > 1u ? request_rows_tensor : NULL; rq->elc_rows = request_rows_count > 1u ? request_rows_count : 0u; request_rows_count = 0; request_rows_tensor = NULL;   /* llms KROW_LA */
         { static int we = -1; if (we < 0) we = getenv("LLMS_DS4_EDF_WFE") != NULL; rq->wfe = we && !llms_alt_off("wfe"); }   /* llms EDF_WFE_ALT */
+        rq->napok = !llms_alt_off("edfnap");   /* llms EDF_NAP_ALT */
         rq->msk = cold_skip_theta() > 0.0f && !llms_alt_off("msk");   /* llms ED_SKIP */
         rq->lag_step = lag_step_armed; rq->lag_on = lag_step_armed && (int)layer >= lag_first_layer && (int)layer <= lag_last_layer && !llms_alt_off("lag");   /* llms LAG; v2: ALT 'lag' (per-step pricing) */
         rq->lag_src = lag_step_armed ? lag_source_now : -1;   /* v3: the main thread armed a source only when it lagged something */
@@ -67243,8 +67712,8 @@ int ds4_gpu_llms_dsp_moe_bank_bs64(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds
         if (ok && g32d_addr && g32d_codes && g32d_xp && g32d_xs && n_used <= 6u && out_dim == 5120u && mid_dim == 2304u) {   /* llms DSP_G32D: planes, then the per-pair G32 down */
             static id<MTLComputePipelineState> gx, gd; static uint64_t g32d_calls;
             if (!gx) gx = ds4_gpu_get_pipeline_or_die("kernel_llms_g32d_xplanes");
-            if (!gd) { gd = ds4_gpu_get_pipeline_or_die(g16d_active ? "kernel_llms_g32d_down1_p5_g32bank_f32" : "kernel_llms_g32d_down1_p5_f32");
-                if (gd && g16d_active) fprintf(stderr,"llms g16 mtp: original G32 bank consumer selected (target down remains G16)\n"); }
+            if (!gd) { gd = ds4_gpu_get_pipeline_or_die((g16d_active || g8f_direct) ? "kernel_llms_g32d_down1_p5_g32bank_f32" : "kernel_llms_g32d_down1_p5_f32");   /* llms G8_FILE */
+                if (gd && (g16d_active || g8f_direct)) fprintf(stderr,"llms g16 mtp: original G32 bank consumer selected (target down remains G16)\n"); }
             if (!gx || !gd) { fprintf(stderr, "llms dsp g32d: a pipeline is missing (DS4_METAL_MOE_SOURCE must carry the g32d kernels)\n"); return 0; }
             if (!g32d_calls++) atexit_b(^{ fprintf(stderr, "llms dsp g32d: %llu drafter bank MoE calls on the G32 down\n", (unsigned long long)g32d_calls); });
             id<MTLBuffer> gxp = ds4_gpu_tensor_buffer(g32d_xp), gxs = ds4_gpu_tensor_buffer(g32d_xs), gad = ds4_gpu_tensor_buffer(g32d_addr), gco = ds4_gpu_tensor_buffer(g32d_codes);

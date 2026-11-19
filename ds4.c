@@ -1262,6 +1262,28 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
 #define DS4_HC_EPS                    (g_ds4_shape.hc_eps)
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
+static float g_llms_route_gain = 1.0f;   /* llms ROUTE_GAIN (apply_route_gain.py) */
+static float g_llms_route_gain_fac[64] = { [0 ... 63] = 1.0f }; static int g_llms_route_il;   /* llms ROUTE_GAIN_L (apply_route_gain_l.py): a factor a layer over the uniform gain; g_llms_route_il is set by ds41_route_batch's callers */
+#define DS4_EWS_L(il_) (DS4_EXPERT_WEIGHT_SCALE * g_llms_route_gain_fac[(unsigned)(il_) & 63u])
+static void llms_route_gain_apply(void) {   /* llms ROUTE_GAIN: LLMS_DS4_ROUTE_GAIN=g multiplies the routed experts' weight scale by g once, after the config validation (which compares the file's scale with the shape's); the routed branch is linear in the route weights, so this is one gain on every layer's routed output. The drafter's router calls divide it back out. OFF unless set: an INSTRUMENT until its KL screen reads. */
+    static int done; if (done) return; done = 1;
+    const char *rg = getenv("LLMS_DS4_ROUTE_GAIN"); if (!rg || !*rg) return;
+    const float g = strtof(rg, NULL);
+    if (!(g >= 0.5f && g <= 2.0f)) { fprintf(stderr, "llms: LLMS_DS4_ROUTE_GAIN=%s is outside [0.5, 2] -- refused\n", rg); exit(78); }
+    const float s0 = g_ds4_shape.expert_weight_scale; g_llms_route_gain = g; g_ds4_shape.expert_weight_scale = s0 * g;
+    fprintf(stderr, "llms: route gain %.4f (the routed experts' weight scale %.4f -> %.4f in every layer; the drafter's stays %.4f) -- FIDELITY DIAL\n", (double)g, (double)s0, (double)g_ds4_shape.expert_weight_scale, (double)s0);
+    { const char *gl = getenv("LLMS_DS4_ROUTE_GAIN_L"); float ga = 0.0f, gb = 0.0f;   /* llms ROUTE_GAIN_L: "a:b" = the gain at layer 0 and at layer 39, linear between */
+      if (gl && *gl) { if (sscanf(gl, "%f:%f", &ga, &gb) != 2 || !(ga >= 0.5f && ga <= 2.0f && gb >= 0.5f && gb <= 2.0f)) { fprintf(stderr, "llms: LLMS_DS4_ROUTE_GAIN_L=%s not understood (a:b, each in [0.5, 2]) -- refused\n", gl); exit(78); }
+        for (int L = 0; L < 64; L++) { const float t = (float)(L < 39 ? L : 39) / 39.0f; g_llms_route_gain_fac[L] = (ga + (gb - ga) * t) / g; }
+        fprintf(stderr, "llms: route gain by layer %.4f at layer 0 -> %.4f at layer 39 (factors %.4f .. %.4f over the uniform %.4f) -- FIDELITY DIAL\n", (double)ga, (double)gb, (double)g_llms_route_gain_fac[0], (double)g_llms_route_gain_fac[39], (double)g); } }
+    { const char *gs = getenv("LLMS_DS4_ROUTE_GAIN_LAYERS");   /* llms ROUTE_GAIN_LAYERS (apply_route_gain_layers.py): "a-b:g[,c-d:h]" = the gain g on layers a..b, the uniform gain elsewhere -- trained routed layers keep the official norm and want ~1.0 where the shipped codec wants 1.11 */
+      if (gs && *gs) { char buf[512]; snprintf(buf, sizeof buf, "%s", gs); int n = 0;
+        for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) { int a = -1, b = -1; float gg = 0.0f;
+          if (sscanf(tok, "%d-%d:%f", &a, &b, &gg) != 3 || a < 0 || b < a || b > 63 || !(gg >= 0.5f && gg <= 2.0f)) { fprintf(stderr, "llms: LLMS_DS4_ROUTE_GAIN_LAYERS=%s not understood (a-b:g[,c-d:h], g in [0.5, 2]) -- refused\n", gs); exit(78); }
+          for (int L = a; L <= b; L++) g_llms_route_gain_fac[L] = gg / g;
+          n += b - a + 1; }
+        fprintf(stderr, "llms: route gain by layer range %s (%d layers set; the uniform %.4f elsewhere) -- FIDELITY DIAL\n", gs, n, (double)g); } }
+}
 #define DS4_SWIGLU_CLAMP_EXP          (g_ds4_shape.swiglu_clamp_exp)
 #define DS4_ROPE_FREQ_BASE            (g_ds4_shape.rope_freq_base)
 #define DS4_ROPE_SCALE_FACTOR         (g_ds4_shape.rope_scale_factor)
@@ -3353,24 +3375,34 @@ static void ds4m1_pack_open(ds4_model *m, const char *path) {
     if (fd >= 0) close(fd);
     free(buf);
     uint64_t redirected = 0;
+    char keyed_done[24][96]; int n_keyed_done = 0;   /* ds4m1 pack: names a keyed entry resolved; a plain entry of the same name is the older engines' and is skipped */
+    for (int pass = 0; pass < 2; pass++) {
     ds4_cursor vc = cursor_at(m, envs.data_pos);
     for (uint64_t k = 0; k < envs.len; k++) {
         ds4_str s; char kv[1200], val[PATH_MAX];
         if (!cursor_string(&vc, &s) || s.len == 0 || s.len >= sizeof kv) ds4_die("malformed ds4m1.env entry");
         memcpy(kv, s.ptr, (size_t)s.len); kv[s.len] = 0;
         char *eq = strchr(kv, '='); if (!eq || eq == kv) ds4_die("malformed ds4m1.env entry");
-        *eq = 0; const char *v = eq + 1, *cur = getenv(kv);
+        *eq = 0; const char *v = eq + 1;
+        char *cl = strchr(kv, ':'); if (cl) *cl = 0;   /* ds4m1 pack: NAME:BASENAME applies only to a program whose default of NAME is that file */
+        if ((cl != NULL) != (pass == 0)) continue;   /* pass 0: keyed entries; pass 1: plain entries */
+        if (!cl) { int dup = 0; for (int d = 0; d < n_keyed_done; d++) if (!strcmp(keyed_done[d], kv)) dup = 1; if (dup) continue; }
+        const char *cur = getenv(kv);
         const int forced = v[0] == '!'; if (forced) v++;   /* ds4m1 pack: '!' sets a variable the program has no default for */
         const int pack_file = !strncmp(v, "@pack/", 6);
         if (pack_file) snprintf(val, sizeof val, "%s/%s", packdir, v + 6);
         else if (!strncmp(v, "@cache/", 7)) snprintf(val, sizeof val, "%s/%s", cache, v + 7);
         else ds4_die("malformed ds4m1.env value");
-        if (pack_file && access(val, R_OK) != 0) {
+        if (pack_file && !cl && access(val, R_OK) != 0) {   /* a keyed file is checked below, only for the program that reads it */
             fprintf(stderr, "ds4: this model pack needs %s beside %s; download every file of the pack into one directory\n", v + 6, mp);
             exit(2);
         }
         if (!forced && (!cur || !*cur || !strcmp(cur, "0"))) continue;   /* this program does not use that part */
+        if (cl) { const char *bn = strrchr(cur ? cur : "", '/'); bn = bn ? bn + 1 : (cur ? cur : ""); if (strcmp(bn, cl + 1)) continue; }   /* another program's file */
+        if (cl && pack_file && access(val, R_OK) != 0) { fprintf(stderr, "ds4: this program needs %s beside %s (a file of the model pack)\n", v + 6, mp); exit(2); }
+        if (cl && n_keyed_done < 24) snprintf(keyed_done[n_keyed_done++], sizeof keyed_done[0], "%s", kv);
         setenv(kv, val, 1); redirected++;
+    }
     }
     if (lo != UINT64_MAX && lo < m->size) {   /* the parts follow the weights: unmap them, as the Engram unmap does */
         const long page = sysconf(_SC_PAGESIZE);
@@ -3701,8 +3733,13 @@ static void model_summary(const ds4_model *m) {
         model_get_u32(m, "deepseek41.index_n_heads", &indexer_heads);
         model_get_u32(m, "deepseek41.index_head_dim", &indexer_head_dim);
         model_get_u32(m, "deepseek41.index_topk", &indexer_top_k);
+
+
         { const char *e = getenv("LLMS_DS4_INDEX_TOPK"); const long k = e && *e ? atol(e) : 0;   /* llms INDEX_TOPK (apply_ds4_fidelity_dials.py): a FIDELITY DIAL */
-          if (k > 0 && (uint32_t)k < indexer_top_k) { fprintf(stderr, "llms: INDEX_TOPK %ld -- FIDELITY DIAL: the sparse attention's top-k lowered from %u; NOT the model\n", k, indexer_top_k); indexer_top_k = (uint32_t)k; } }
+          if (k > 0 && (uint32_t)k < indexer_top_k) { fprintf(stderr, "llms: INDEX_TOPK %ld -- FIDELITY DIAL: the sparse attention's top-k lowered from %u; NOT the model\n", k, indexer_top_k); indexer_top_k = (uint32_t)k; }
+          else if (k > 0 && (uint32_t)k > indexer_top_k) { const char *u_ = getenv("LLMS_DS4_INDEX_TOPK_UP"); if (u_ && *u_ && *u_ != '0' && k <= 1024 && !((unsigned long)k & ((unsigned long)k - 1ul))) {   /* llms INDEX_TOPK_UP (apply_index_topk_up.py) */
+              fprintf(stderr, "llms: INDEX_TOPK %ld -- FIDELITY DIAL: the sparse attention's top-k RAISED above the file's %u (INDEX_TOPK_UP; beyond the trained width); NOT the model\n", k, indexer_top_k); indexer_top_k = (uint32_t)k; }
+            else fprintf(stderr, "llms: INDEX_TOPK %ld above the file's %u IGNORED (set LLMS_DS4_INDEX_TOPK_UP=1 for a power of two <= 1024)\n", k, indexer_top_k); } }
         model_get_u32(m, "deepseek41.n_routed_experts", &n_expert);
         model_get_u32(m, "deepseek41.num_experts_per_tok", &n_expert_used);
     }
@@ -5628,6 +5665,14 @@ static DS4_MAYBE_UNUSED bool streaming_layer_gate_down_expert_bytes(
     return *gate_expert_bytes != 0 && *down_expert_bytes != 0;
 }
 
+static uint64_t llms_plan_slot_bytes(uint64_t per_expert_bytes) {   /* llms COMPACT_PLAN (apply_compact_plan.py): with LLMS_DS4_COMPACT_NW set, the cache planner counts a slot at its real slab size (LLMS_DS4_EXPERT_CACHE_SLOT_BYTES), not the GGUF's full-width bytes -- compactgate attempt 3 planned 3,572 of 9,142 compact slots at 9.49 MiB each. Off unless COMPACT_NW is set. */
+    static int st = -1; static uint64_t sb = 0;
+    if (st < 0) {
+        const char *c = getenv("LLMS_DS4_COMPACT_NW"), *b = getenv("LLMS_DS4_EXPERT_CACHE_SLOT_BYTES"); st = 0;
+        if (c && *c && *c != '0' && b && *b) { sb = strtoull(b, NULL, 10); if (sb) { st = 1; fprintf(stderr, "llms compact plan: the cache planner counts a slot at %llu B (COMPACT_PLAN)\n", (unsigned long long)sb); } }
+    }
+    return (st == 1 && sb && sb < per_expert_bytes) ? sb : per_expert_bytes;
+}
 static bool ds4_streaming_routed_expert_bytes(
         const ds4_weights *weights,
         uint64_t          *per_expert_bytes_out) {
@@ -5720,6 +5765,7 @@ static bool ds4_streaming_prefill_headroom_bytes(
     if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
         return false;
     }
+    per_expert_bytes = llms_plan_slot_bytes(per_expert_bytes);   /* llms COMPACT_PLAN: the prefill reserve in real slot bytes */
     const uint64_t layer_bytes =
         per_expert_bytes * (uint64_t)DS4_N_EXPERT;
     if (reserve_layers != 0 &&
@@ -5760,6 +5806,7 @@ static uint32_t ds4_streaming_cache_experts_for_byte_budget(
         !ds4_streaming_routed_expert_bytes(weights, &per_expert_bytes)) {
         return 0;
     }
+    per_expert_bytes = llms_plan_slot_bytes(per_expert_bytes);   /* llms COMPACT_PLAN */
     if (per_expert_bytes_out) *per_expert_bytes_out = per_expert_bytes;
     return ds4_ssd_cache_experts_for_byte_budget(bytes, per_expert_bytes);
 }
@@ -7465,7 +7512,10 @@ static void config_validate_deepseek41_model(const ds4_model *m) {
         if (t->abs_offset < m->size) ds4_die("Engram table is still mapped");
     }
     { const char *e = getenv("LLMS_DS4_INDEX_TOPK"); const long k = e && *e ? atol(e) : 0;   /* llms INDEX_TOPK2 (apply_ds4_index_topk2.py): a FIDELITY DIAL, after the metadata checks */
-      if (k > 0 && (uint32_t)k < g_ds4_shape.n_indexer_top_k) { fprintf(stderr, "llms: INDEX_TOPK %ld -- FIDELITY DIAL: the sparse attention's top-k lowered from %u; NOT the model\n", k, g_ds4_shape.n_indexer_top_k); g_ds4_shape.n_indexer_top_k = (uint32_t)k; } }
+      if (k > 0 && (uint32_t)k < g_ds4_shape.n_indexer_top_k) { fprintf(stderr, "llms: INDEX_TOPK %ld -- FIDELITY DIAL: the sparse attention's top-k lowered from %u; NOT the model\n", k, g_ds4_shape.n_indexer_top_k); g_ds4_shape.n_indexer_top_k = (uint32_t)k; }
+      else if (k > 0 && (uint32_t)k > g_ds4_shape.n_indexer_top_k) { const char *u_ = getenv("LLMS_DS4_INDEX_TOPK_UP"); if (u_ && *u_ && *u_ != '0' && k <= 1024 && !((unsigned long)k & ((unsigned long)k - 1ul))) {   /* llms INDEX_TOPK_UP (apply_index_topk_up.py) */
+              fprintf(stderr, "llms: INDEX_TOPK %ld -- FIDELITY DIAL: the sparse attention's top-k RAISED above the file's %u (INDEX_TOPK_UP; beyond the trained width); NOT the model\n", k, g_ds4_shape.n_indexer_top_k); g_ds4_shape.n_indexer_top_k = (uint32_t)k; }
+            else fprintf(stderr, "llms: INDEX_TOPK %ld above the file's %u IGNORED (set LLMS_DS4_INDEX_TOPK_UP=1 for a power of two <= 1024)\n", k, g_ds4_shape.n_indexer_top_k); } }
 }
 
 static void config_read_qwen4_u64_array(
@@ -41627,7 +41677,90 @@ typedef struct {
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
+    /* LLMS_DS4_HEAD_FEATURE: capture-only state, never shared scratch. */
+    ds4_gpu_tensor *hf_current, *hf_rows, *hf_before;
+    uint32_t hf_position, hf_start, hf_count, hf_written, hf_capacity, hf_before_position;
+    uint64_t hf_serial;
+    bool hf_valid, hf_before_valid, hf_recording;
 } ds41_gpu_graph;
+
+/* PROPOSAL ONLY: LLMS_DS4_HEAD_FEATURE=1. Off by default, no model consumer.
+ * This captures the head input actually produced under the current arithmetic.
+ * Missing features after payload/other state restore remain explicitly missing.
+ */
+static int hf_on(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("LLMS_DS4_HEAD_FEATURE");
+        enabled = e && !strcmp(e, "1");
+        if (enabled) fprintf(stderr, "llms head feature: retained producer rows (experimental capture primitive)\n");
+    }
+    return enabled;
+}
+static bool hf_ensure(ds41_gpu_graph *g, uint32_t rows) {
+    if (!hf_on()) return true;
+    const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    if (!g->hf_current) g->hf_current = ds4_gpu_tensor_alloc(bytes);
+    if (!g->hf_before) g->hf_before = ds4_gpu_tensor_alloc(bytes);
+    if (rows > g->hf_capacity) {
+        ds4_gpu_tensor *next = ds4_gpu_tensor_alloc((uint64_t)rows * bytes);
+        if (!next) return false;
+        ds4_gpu_tensor_free(g->hf_rows); g->hf_rows = next; g->hf_capacity = rows;
+    }
+    return g->hf_current && g->hf_before && g->hf_rows;
+}
+/* Called inside the existing verify command batch, before any producer runs. */
+static bool hf_begin_verify(ds41_gpu_graph *g, uint32_t count) {
+    if (!hf_on()) return true;
+    if (!hf_ensure(g, count)) return false;
+    g->hf_before_valid = g->hf_valid && g->hf_position + 1u == g->pos;
+    g->hf_before_position = g->hf_position;
+    if (g->hf_before_valid && !ds4_gpu_tensor_copy(g->hf_before, 0, g->hf_current, 0,
+            (uint64_t)DS4_N_EMBD * sizeof(float))) return false;
+    g->hf_start = g->pos; g->hf_count = count; g->hf_written = 0; g->hf_recording = true;
+    return true;
+}
+/* Producer call: no host read, no additional command-buffer wait. */
+static bool hf_produce(ds41_gpu_graph *g, const ds4_gpu_tensor *norm, uint32_t pos) {
+    if (!hf_on()) return true;
+    const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    if (!hf_ensure(g, 1u)) return false;
+    g->hf_valid = false;
+    if (!ds4_gpu_tensor_copy(g->hf_current, 0, norm, 0, bytes)) return false;
+    if (g->hf_recording) {
+        if (g->hf_written >= g->hf_count || pos != g->hf_start + g->hf_written) return false;
+        if (!ds4_gpu_tensor_copy(g->hf_rows, (uint64_t)g->hf_written * bytes, norm, 0, bytes)) return false;
+        g->hf_written++;
+    }
+    g->hf_position = pos; g->hf_serial++; g->hf_valid = true;
+    return true;
+}
+static uint64_t llms_hf_sel[3];   /* llms HF_COUNT: only touched when LLMS_DS4_HEAD_FEATURE=1 (hf_select returns before it otherwise) */
+static void llms_hf_sel_print(void) { fprintf(stderr, "llms head feature select: %llu selects with rows kept, %llu kept fewer rows than written, %llu copied the wrong row (WRONGROW)\n", (unsigned long long)llms_hf_sel[0], (unsigned long long)llms_hf_sel[1], (unsigned long long)llms_hf_sel[2]); }
+/* Called with an open command batch, after the native retained position is set. */
+static bool hf_select(ds41_gpu_graph *g, uint32_t keep) {
+    if (!hf_on()) return true;
+    const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    g->hf_valid = false;
+    if (!keep) {
+        if (!g->hf_before_valid) return true;
+        if (g->hf_before_position + 1u != g->pos) return false;
+        if (!ds4_gpu_tensor_copy(g->hf_current, 0, g->hf_before, 0, bytes)) return false;
+        g->hf_position = g->hf_before_position;
+    } else {
+        if (keep > g->hf_written || g->hf_written != g->hf_count || g->hf_start + keep != g->pos) return false;
+        uint32_t row = keep - 1u;
+        const char *wrong = getenv("LLMS_DS4_HEAD_FEATURE_WRONGROW");
+        if (wrong && !strcmp(wrong, "1")) row = g->hf_written - 1u; /* Deliberately wrong tensor, correct tag: numerical canary. */
+        llms_hf_sel[0]++; llms_hf_sel[1] += keep < g->hf_written; llms_hf_sel[2] += row != keep - 1u;   /* llms HF_COUNT selects, partial keeps, wrong rows copied -- the canary's execution counter */
+        if (llms_hf_sel[0] == 1) atexit(llms_hf_sel_print);
+        if (!ds4_gpu_tensor_copy(g->hf_current, 0, g->hf_rows, (uint64_t)row * bytes, bytes)) return false;
+        g->hf_position = g->hf_start + keep - 1u;
+    }
+    g->hf_serial++; g->hf_valid = true;
+    return true;
+}
+
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
                             uint64_t count, void *out, size_t bytes) {
@@ -41665,6 +41798,8 @@ static bool ds41_index_bf16_on(void) { return !(ds4_gpu_v41_off() & DS4_GPU_V41_
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+    ds4_gpu_tensor_free(g->hf_current); ds4_gpu_tensor_free(g->hf_rows); ds4_gpu_tensor_free(g->hf_before);
+    g->hf_current = g->hf_rows = g->hf_before = NULL; g->hf_capacity = 0;
     if (g == workspace_owner) workspace_owner = NULL;
     if (g->workspace_shared) {   /* llms SHARE_WS: these belong to the owner */
 #define DS41_UNSHARE(name, count) g->batch.name = NULL;
@@ -41793,6 +41928,8 @@ static uint64_t sessions_bytes(uint32_t ctx, uint32_t sessions) {
 }
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
+    g->hf_valid = g->hf_before_valid = g->hf_recording = false;
+    g->hf_count = g->hf_written = 0;
     g->pos = 0;
     g->valid = true;
     ds4_engram_history_reset(&g->history);
@@ -42189,6 +42326,7 @@ static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
 }
 
 int ds4_gpu_llms_head_rescore(ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, uint32_t rows, uint32_t vocab, uint32_t dim, const void *model_map, uint64_t model_size, uint64_t head_offset, uint32_t k);   /* llms HEAD_RS */
+static int llms_low_power_mode(void);   /* llms ANE_ROUND_LPM: defined with M100's switch below */
 static bool head_rescore(ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, uint32_t rows, const ds4_model *m, const ds4_weights *w) {   /* llms HEAD_RS: after the head's logits */
     const int k = ({
         /* llms HEAD_RS (apply_head_rs.py): the candidates per row rescored from the Q8_0 head, 0 = off */
@@ -43285,7 +43423,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (!router_matmul_ok ||
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EWS_L(il), 0, 0, true, false,
             g->route_logits)) return false;
     print_layer_stage(g, "router", il);
     {   /* llms LLMS_DS4_ROUTE_DUMP */
@@ -43325,7 +43463,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             if (!ds41_matmul(lookahead_log_logits, m, ln->ffn_gate_inp, g->norm, false) ||
                 !ds4_gpu_router_select_tensor(lookahead_log_selected, lookahead_log_weights, lookahead_log_probs,
                     m->map, m->size, ln->ffn_exp_probs_b->abs_offset, 0, 0, token,
-                    DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+                    DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EWS_L(il), 0, 0, true, false,
                     lookahead_log_logits)) return false;
             lookahead_log_pending = 1;
             if (ed_lookahead_m > 0) {   /* llms ED_LA: the next layer's table and bias for the ED server's prefetch */
@@ -43525,10 +43663,11 @@ static bool ds41_graph_encode_logits(ds41_gpu_graph *g, const ds4_model *m, cons
 }
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
-                             const ds4_weights *w, float *logits) {
+                             const ds4_weights *w, float *logits, uint32_t feature_position) {
     if (!g->valid || !logits || (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands())) return false;   /* llms BOUNDARY: an open batch (HEAD_MERGE) takes the head */
     bool ok = ds41_hc_sum(g->x, g->residual, g->pre, false) &&
               ds41_norm(g->norm, g->x, m, w->output_norm) &&
+              hf_produce(g, g->norm, feature_position) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1) &&
               (g->tp_logits_half || head_rescore(g->logits, g->norm, 1, m, w));   /* llms HEAD_RS */
@@ -43539,19 +43678,109 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
 
 /* llms LLMS_DS4_PREFILL_SCORE (2026-10-07): logits of one prefill row, as ds41_graph_logits does for the last row */
 static FILE *prefill_score_file; static int prefill_score_state = -1; static float *prefill_score_logits;
+static FILE *prefill_flp_file, *prefill_flp_full; static int prefill_flp_state = -1, prefill_flp_k = 64; static uint64_t prefill_flp_hash, prefill_flp_rows; static int64_t prefill_flp_next;   /* llms PREFILL_SCORE_FLP */
+static int psr_head_rs;   /* llms PREFILL_SCORE_ROWS2 (apply_prefill_score_rows2.py): set only by the rows scorer -- its rows take the shipped head (head_rescore included) */
+static bool psr_row_logits(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, ds4_gpu_tensor *residual, ds4_gpu_tensor *pre, float *out) {   /* llms PREFILL_SCORE_ROWS2: ds41_graph_logits' operations on one row's own state */
+    if (!ds4_gpu_begin_commands()) return false;
+    bool ok = ds41_hc_sum(g->x, residual, pre, false) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+              ds41_output_projection(g, g->logits, m, w, g->norm, 1) && (g->tp_logits_half || head_rescore(g->logits, g->norm, 1, m, w));
+    if (!ds4_gpu_end_commands()) ok = false;
+    return ok && ds4_gpu_tensor_read(g->logits, 0, out, (uint64_t)DS4_N_VOCAB * sizeof(float));
+}
+/* llms PREFILL_SCORE_INTERVAL: optional absolute half-open row interval. */
+static bool prefill_score_interval(uint32_t pos, uint32_t count,
+                                  uint32_t *first, uint32_t *end) {
+    static int state;
+    static uint32_t lo, hi;
+    if (state == 0) {
+        const char *spec = getenv("LLMS_DS4_PREFILL_SCORE_INTERVAL");
+        if (!spec) {
+            state = 1;
+        } else if (getenv("LLMS_DS4_PREFILL_SCORE_FLP")) {
+            state = -1;
+            fprintf(stderr, "llms: prefill score interval conflicts with the full-prefix FLP receipt\n");
+        } else {
+            const char *p = spec;
+            uint32_t bounds[2] = {0, 0};
+            for (int part = 0; part < 2; ++part) {
+                if (*p < '0' || *p > '9') break;
+                bool overflow = false;
+                do {
+                    uint32_t digit = (uint32_t)(*p++ - '0');
+                    if (bounds[part] > (UINT32_MAX - digit) / 10u) {
+                        overflow = true;
+                        break;
+                    }
+                    bounds[part] = bounds[part] * 10u + digit;
+                } while (*p >= '0' && *p <= '9');
+                if (overflow) break;
+                if (part == 0 && *p == ':') {
+                    ++p;
+                } else if (part == 1 && *p == '\0' && bounds[0] < bounds[1]) {
+                    lo = bounds[0];
+                    hi = bounds[1];
+                    state = 2;
+                } else {
+                    break;
+                }
+            }
+            if (state == 0) {
+                state = -1;
+                fprintf(stderr, "llms: invalid prefill score interval (expected lo:hi)\n");
+            }
+        }
+    }
+    if (state < 0) return false;
+    *first = *end = 0;
+    if (state == 1) {
+        *end = count;
+    } else if (hi > pos) {
+        *first = lo > pos ? lo - pos : 0;
+        *end = hi - pos < count ? hi - pos : count;
+        if (*first > *end) *first = *end;
+    }
+    return true;
+}
+
 static bool score_prefill_row(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                              ds4_gpu_tensor *residual, ds4_gpu_tensor *pre, uint32_t pos, int target) {
+                              ds4_gpu_tensor *residual, ds4_gpu_tensor *pre, uint32_t pos, int target, int token_at_pos) {
     if (!ds4_gpu_begin_commands()) return false;
     bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, residual, pre, DS4_N_EMBD, DS4_N_HC) &&
               ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->logits, m, w, g->norm, 1);
     if (!ds4_gpu_end_commands()) ok = false;
-    if (!ok || !ds4_gpu_tensor_read(g->logits, 0, prefill_score_logits, (uint64_t)DS4_N_VOCAB * sizeof(float))) return false;
+    if (psr_head_rs) { if (!ok || !psr_row_logits(g, m, w, residual, pre, prefill_score_logits)) return false; }   /* llms PREFILL_SCORE_ROWS2: the shipped head (the coarse pass above is recomputed) */
+    else if (!ok || !ds4_gpu_tensor_read(g->logits, 0, prefill_score_logits, (uint64_t)DS4_N_VOCAB * sizeof(float))) return false;
     float mx = prefill_score_logits[0]; int am = 0;
     for (int i = 1; i < DS4_N_VOCAB; i++) if (prefill_score_logits[i] > mx) { mx = prefill_score_logits[i]; am = i; }
     double s = 0.0;
     for (int i = 0; i < DS4_N_VOCAB; i++) s += exp((double)prefill_score_logits[i] - mx);
     fprintf(prefill_score_file, "%u %d %.9f %d\n", pos, target, (double)prefill_score_logits[target] - mx - log(s), am);
+    {   /* llms PREFILL_SCORE_FLP (apply_prefill_flp.py): the same row in FORCE_LPDUMP's format, label pos + 1 */
+        if (prefill_flp_state < 0) { prefill_flp_state = 0; const char *p = getenv("LLMS_DS4_PREFILL_SCORE_FLP");
+            if (p && *p) { prefill_flp_file = fopen(p, "w"); prefill_flp_state = prefill_flp_file != NULL; prefill_flp_hash = 1469598103934665603ull; prefill_flp_next = 0;
+                const char *k = getenv("LLMS_DS4_PREFILL_SCORE_FLP_K"); if (k && atoi(k) > 0) prefill_flp_k = atoi(k) > 256 ? 256 : atoi(k);
+                const char *fu = getenv("LLMS_DS4_PREFILL_SCORE_FLP_FULL");
+                if (prefill_flp_state && fu && *fu && *fu != '0') { char fp[1100]; snprintf(fp, sizeof fp, "%s.full", p); prefill_flp_full = fopen(fp, "wb"); }
+                if (prefill_flp_state) { fprintf(stderr, "llms: prefill score flp -> %s (top %d%s; label = row + 1, FORCE_LPDUMP's format)\n", p, prefill_flp_k, prefill_flp_full ? ", full sidecar" : "");
+                    atexit_b(^{ fprintf(stderr, "llms prefill score flp: %llu rows\n", (unsigned long long)prefill_flp_rows); fclose(prefill_flp_file); if (prefill_flp_full) fclose(prefill_flp_full); }); } } }
+        if (prefill_flp_state == 1) {
+            if ((int64_t)pos == prefill_flp_next) { prefill_flp_hash ^= (uint64_t)(uint32_t)token_at_pos; prefill_flp_hash *= 1099511628211ull; prefill_flp_next = (int64_t)pos + 1; }
+            else prefill_flp_next = -1;   /* out of order: the hash is incomplete from here */
+            const uint32_t label = pos + 1u; const uint64_t ph = prefill_flp_next < 0 ? 0ull : (prefill_flp_hash ? prefill_flp_hash : 1ull);
+            const double lse = (double)mx + log(s); const int K = prefill_flp_k; int ids[256]; float lg[256];
+            for (int j = 0; j < K; j++) { ids[j] = -1; lg[j] = -INFINITY; }
+            for (int v = 0; v < DS4_N_VOCAB; v++) { const float x = prefill_score_logits[v]; if (!isfinite(x)) continue;
+                if (x > lg[K - 1]) { int j = K - 1; while (j > 0 && x > lg[j - 1]) { lg[j] = lg[j - 1]; ids[j] = ids[j - 1]; j--; } lg[j] = x; ids[j] = v; } }
+            fprintf(prefill_flp_file, "H %u %016llx %u -1\n%u %d %.9f\nK %u", label, (unsigned long long)ph, label, label, target, (double)prefill_score_logits[target] - lse, label);
+            for (int j = 0; j < K && ids[j] >= 0; j++) fprintf(prefill_flp_file, " %d %.6f", ids[j], (double)lg[j] - lse);
+            fputc('\n', prefill_flp_file);
+            if (prefill_flp_full) { const uint32_t V = (uint32_t)DS4_N_VOCAB, dt = 32u; static float *row; if (!row) row = malloc((size_t)V * sizeof(float));
+                if (row) { for (uint32_t v = 0; v < V; v++) { const float x = prefill_score_logits[v]; row[v] = isfinite(x) ? (float)((double)x - lse) : -INFINITY; }
+                    fwrite(&label, 4, 1, prefill_flp_full); fwrite(&ph, 8, 1, prefill_flp_full); fwrite(&V, 4, 1, prefill_flp_full); fwrite(&dt, 4, 1, prefill_flp_full); fwrite(row, sizeof(float), V, prefill_flp_full); } }
+            prefill_flp_rows++;
+        }
+    }
     return true;
 }
 
@@ -43681,6 +43910,16 @@ static int g_dskip_verify;   /* llms DSKIP_VERIFY: 1 while the verify-rows funct
 static float g_dskip_conf_t = -1.0f; static int g_dskip_conf_open = 1;   /* llms TWOSPEED: LLMS_DS4_DEC_SKIP_CONF=theta -- DEC_SKIP only on a verify whose draft pick probability is >= theta; closed outside a verify */
 static void dskip_conf_update(float p) { if (g_dskip_conf_t < 0.0f) { const char *e = getenv("LLMS_DS4_DEC_SKIP_CONF"); g_dskip_conf_t = e && *e ? (float)atof(e) : 0.0f; if (g_dskip_conf_t > 0.0f) fprintf(stderr, "llms: DEC_SKIP_CONF %.3f\n", (double)g_dskip_conf_t); } g_dskip_conf_open = g_dskip_conf_t <= 0.0f || p >= g_dskip_conf_t; }
 static int dskip_think_gate(void) { static int v = -1; if (v < 0) { const char *e = getenv("LLMS_DS4_DEC_SKIP_THINK"); v = e && *e && *e != '0'; if (v) fprintf(stderr, "llms: DEC_SKIP_THINK (the skip acts only on decode rows inside an open thinking, never on a short prefill)\n"); } return v; }
+static uint64_t g_dskip_half_n[2];   /* llms DSKIP_SPLIT (apply_dskip_split.py): layer passes skipped, attention half [0] and FFN half [1] */
+
+static uint64_t dskip_half_mask(int ffn) {   /* llms DSKIP_SPLIT: LLMS_DS4_DEC_SKIP_ATTN / _FFN, one half of a layer not computed in the rows path */
+    static int st[2] = {-1, -1}; static uint64_t m[2];
+    if (st[ffn] < 0) { const char *e = getenv(ffn ? "LLMS_DS4_DEC_SKIP_FFN" : "LLMS_DS4_DEC_SKIP_ATTN"); m[ffn] = e && *e ? strtoull(e, NULL, 16) : 0ull; st[ffn] = m[ffn] != 0ull;
+        if (st[ffn]) { const int f_ = ffn; fprintf(stderr, "llms: DEC_SKIP_%s %llx -- those layers' %s NOT computed in the rows path (output zero, the HC mixing kept)\n", f_ ? "FFN" : "ATTN", (unsigned long long)m[ffn], f_ ? "FFN (routed and shared)" : "attention");
+            atexit_b(^{ fprintf(stderr, "llms dec skip %s: %llu layer passes skipped\n", f_ ? "ffn" : "attn", (unsigned long long)g_dskip_half_n[f_]); }); } }
+    return m[ffn];
+}
+static int dskip_half_on(uint32_t il, int ffn) { const uint64_t mm = dskip_half_mask(ffn); return mm && il < 64u && ((mm >> il) & 1ull) && !ds4_gpu_llms_alt_off("dskip"); }
 static int dskip_on(uint32_t il) {   /* a masked layer's attention and FFN not computed in the rows path; ALT dskip */
     if (g_dskip_state < 0) { const char *e = getenv("LLMS_DS4_DEC_SKIP"); g_dskip_mask = e && *e ? strtoull(e, NULL, 16) : 0ull; g_dskip_state = g_dskip_mask != 0ull;
         if (g_dskip_state) { fprintf(stderr, "llms: DEC_SKIP %llx -- those layers' attention and FFN NOT computed in the rows path (outputs zero, the HC mixing kept; ALT dskip)\n", (unsigned long long)g_dskip_mask);
@@ -44333,7 +44572,7 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
         b->selected, b->route_weights, b->route_probs, m->map, m->size,
         l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
         b->route_logits, g->prefill_tokens, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-        DS4_EXPERT_WEIGHT_SCALE, count);
+        DS4_EWS_L(g_llms_route_il), count);
     /* The ordinary 384-expert selector already has the right scoring and
      * normalization. Split only where the text/visual selection bias changes. */
     for (uint32_t first = 0; first < count;) {
@@ -44353,7 +44592,7 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
         }
         if (ok) ok = ds4_gpu_router_select_batch_tensor(views[0], views[1], views[2],
             m->map, m->size, bias->abs_offset, 0, 0, 0, 0, true, false, views[3], views[4],
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, end - first);
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EWS_L(g_llms_route_il), end - first);
         for (unsigned i = 0; i < 5; i++) ds4_gpu_tensor_free(views[i]);
         if (!ok) return false;
         first = end;
@@ -44713,7 +44952,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const bool ane_skip_shared = !ane_refusal && ane_shared_mode == 5;   /* llms ANE_SKIP */
 
     {   static int ane_shexp_round_state = -1; static uint32_t armin;   /* llms ANE_ROUND */
-        if (ane_shexp_round_state < 0) { const char *e = getenv("LLMS_DS4_ANE_SHEXP_ROUND"); armin = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 0u; ane_shexp_round_state = armin > 0;
+        if (ane_shexp_round_state < 0) { const char *e = getenv("LLMS_DS4_ANE_SHEXP_ROUND"); armin = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 0u; { const char *lp = e ? strstr(e, "lpm") : NULL; if (lp && llms_low_power_mode()) { armin = (uint32_t)atoi(lp + 3); fprintf(stderr, "llms: ane round %s -- Low Power Mode: %u rows (llms ANE_ROUND_LPM)\n", e, armin); } } ane_shexp_round_state = armin > 0;
                       if (ane_shexp_round_state) { fprintf(stderr, "llms: ane round (an append of fewer than %u rows keeps its shared expert on the GPU; ALT aneround)\n", armin);
                                 atexit_b(^{ fprintf(stderr, "llms ane round: %llu calls kept on the GPU in appends under %u rows\n", (unsigned long long)ane_round_kept, armin); }); } }
         if (ane_shexp_round_state && !ane_refusal && llms_append_rows < armin && !ds4_gpu_llms_alt_off("aneround")) { ane_refusal = 4; if (il == 0) ane_round_kept++; } }
@@ -44777,6 +45016,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         postload_prefetch_armed = 1; ds4_gpu_llms_set_postload(after_expert_loads, NULL);   /* llms PLAG: through the chained callback */
     }
     if (streaming_rows_step && g->streaming) ds4_gpu_llms_set_route_layer((int)il);   /* llms CACHE_ROUTE: session-batch decode only */
+    g_llms_route_il = (int)il;   /* llms ROUTE_GAIN_L */
     if (!ds41_route_batch(g, m, l, count)) { fprintf(stderr, "llms moe_batch fail: route_batch layer %u\n", il); return false; }
     static int sp_ed8 = -1; if (sp_ed8 < 0) { const char *e = getenv("LLMS_DS4_SP_ED8"); sp_ed8 = e && *e && *e != '0'; if (sp_ed8) fprintf(stderr, "llms: sp ed8 (5..8-row short-prefill / verify calls through the ED listener too)\n"); }   /* llms SP_ED8 (apply_sped8.py) */
     const bool short_prefill_ed_now = short_prefill_active && g->streaming && count <= (sp_ed8 ? 8u : 4u) && !shared_owner && g->tp_world != 2 && !ds4_gpu_llms_alt_off("sped");
@@ -45029,7 +45269,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_q8inner(ds41_gpu_graph *g, const ds
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     const uint64_t engram_failures_before = __atomic_load_n(&engram_read_failures, __ATOMIC_RELAXED);   /* llms EAS_FIX */
-    if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (ok && logits) ok = ds41_graph_logits(g, m, w, logits, g->pos);
     if (ledger_layer_on()) ds4_gpu_llms_set_ledger_tag(2, 2, 42);   /* llms LEDGER_LAYER: after the head: readback, sampling, accept */
     if (ok && engram_async_now && logits && __atomic_load_n(&engram_read_failures, __ATOMIC_RELAXED) != engram_failures_before) ok = false;   /* llms EAS_FIX: the block's read or upload failed */
     if (step_timing) { part_end = now_sec(); step_part_ms[7] += (part_end - part_start) * 1e3; step_part_ms[8] += (part_end - step_start) * 1e3; step_timing_steps++;
@@ -45748,9 +45988,11 @@ static bool ds41_graph_prefill_sweep_tlimpl(ds41_gpu_graph *g, const ds4_model *
             })) {   /* llms LLMS_DS4_PREFILL_SCORE */
                 /* the output head / norm are static decode tensors, mapped by ds4 only after the sweep: map them now (same call) */
                 if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
-                for (uint32_t t = 0; ok && t < count; t++) {
+                uint32_t first = 0, end = 0;
+                if (ok) ok = prefill_score_interval(start, count, &first, &end);
+                for (uint32_t t = first; ok && t < end; t++) {
                     if (off + t + 1u >= total_count) continue;
-                    ok = score_prefill_row(g, m, w, g->rows_view[t].residual, g->rows_view[t].ffn_split, start + t, tokens[off + t + 1u]);
+                    ok = score_prefill_row(g, m, w, g->rows_view[t].residual, g->rows_view[t].ffn_split, start + t, tokens[off + t + 1u], tokens[off + t]);   /* llms PREFILL_SCORE_FLP: the row's own token, for the prefix hash */
                 }
                 fflush(prefill_score_file);
                 /* restore this layer's prefill mapping (the seed below reads its expert ranges; 'model range 151.45 GiB not covered') */
@@ -45849,6 +46091,7 @@ static bool ds41_cuda_row_batch_supported(const ds41_gpu_graph *g, const ds4_wei
 }
 
 static unsigned long long short_prefill_calls, short_prefill_rows;   /* llms SHORT_PREFILL */
+static int a2r_base0_on(void);   /* llms A2R_BASE0 banner (apply_a2r_base0_banner.py): defined at the ring snapshot */
 static ds4_gpu_tensor *selection_dump_buffer; static uint32_t selection_dump_records[64][3], selection_dump_count; static FILE *selection_dump_file; static int selection_dump_state = -1;   /* llms SEL_DUMP (apply_sel_dump.py): an instrument */
 static void report_short_prefill(void) { fprintf(stderr, "llms short prefill: %llu calls, %llu rows\n", short_prefill_calls, short_prefill_rows); }
 static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weights *w,
@@ -45863,6 +46106,7 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
             (sp_maxpos <= 0 || (long)g->pos + (long)remaining <= sp_maxpos)) {
             static int sp_rows = -1;   /* llms SP_ROWS: rows per short-prefill step (an instrument: the k-row step's cost; 0 = the runtime cap) */
             if (sp_rows < 0) { const char *e = getenv("LLMS_DS4_SP_ROWS"); sp_rows = e && *e ? atoi(e) : 0; if (sp_rows > 0) fprintf(stderr, "llms: short prefill steps of %d rows\n", sp_rows); }
+            (void)a2r_base0_on();   /* llms A2R_BASE0 banner: the switch read (and its banner / counter armed) at the first short-prefill step of every run */
             if (llms_decoded_since_sp) llms_append_rows = remaining;   /* llms ANE_ROUND: a new append's total (the callee clears the flag) */
             uint32_t cap = ds4_gpu_llms_rows_max_public(); if (sp_rows >= 2 && (uint32_t)sp_rows < cap) cap = (uint32_t)sp_rows;
             uint32_t n = remaining < cap ? remaining : cap;
@@ -46237,7 +46481,7 @@ static bool pipeline_stage1(ds41_gpu_graph *g, ds41_gpu_graph *gk, ds41_prefill_
     if (ok && bao && covcap_state != 0) ok = covcap_layer(&gk->batch, il, h);   /* llms COVCAP */
     ok = ok && (price_skip_on(16) || (ds4_gpu_dsv41_quantize(ak->block, DS4_N_EMBD, h, DS4_V41_BF16) && ds41_after_attention_at(ak, model, l, h, il)));
     ds41_prefill_row *b = &gk->batch;
-    ok = ok && (price_skip_on(32) || (ds41_matmul_batch(b->route_logits, model, l->ffn_gate_inp, b->norm, h, false) && (ds4_gpu_llms_set_route_layer((int)il), ds41_route_batch(gk, model, l, h)))) &&
+    ok = ok && (price_skip_on(32) || (ds41_matmul_batch(b->route_logits, model, l->ffn_gate_inp, b->norm, h, false) && (ds4_gpu_llms_set_route_layer((int)il), g_llms_route_il = (int)il, ds41_route_batch(gk, model, l, h)))) &&
         (price_skip_on(64) || (router_first_mode() && async_mode() == 1) || (shared_skip_layer = il, shared_expert_batch(b, model, l, h)));   /* llms ANE_FIX: per step */   /* llms SHEXP_PAIR: the shared expert through one function (pair or the three dispatches) */
     if (ok && price_dup_on(64)) ok =   /* llms PRICE_DUP: the shared expert again */
         ds41_matmul_batch(b->shared_gate, model, l->ffn_gate_shexp, b->norm, h, true) &&
@@ -46306,6 +46550,12 @@ static float g_prefill_route_bl2[64]; static int g_prefill_route_have_bl2;   /* 
 static uint64_t g_prefill_route_calls, g_prefill_route_rows, g_prefill_route_subs, g_prefill_route_drops, g_prefill_route_ties;
 static void report_prefill_route(void) { fprintf(stderr, "llms prefill route: %llu layer calls, %llu rows rewritten, %llu slots substituted, %llu slots dropped, %llu tie rows left to the GPU\n",
     (unsigned long long)g_prefill_route_calls, (unsigned long long)g_prefill_route_rows, (unsigned long long)g_prefill_route_subs, (unsigned long long)g_prefill_route_drops, (unsigned long long)g_prefill_route_ties); }
+static int llms_low_power_mode(void) {   /* llms LPM_APPEND_TOPK (apply_lpm_topk.py, ): 1 when '/usr/bin/pmset -g' reports 'lowpowermode 1'; read once a process (popen, ~11 ms) */
+    static int v = -1;
+    if (v < 0) { v = 0; FILE *f = popen("/usr/bin/pmset -g 2>/dev/null", "r"); char lb[256];
+        while (f && fgets(lb, sizeof lb, f)) { const char *q = strstr(lb, "lowpowermode"); if (q && atoi(q + 12) == 1) v = 1; }
+        if (f) pclose(f); }
+    return v; }
 static int prefill_route_on(void) {
     if (g_prefill_route_on < -1) {
         const char *e = getenv("LLMS_DS4_PREFILL_ROUTE"); g_prefill_route_on = !e || !*e || *e == '0' ? 0 : !strcmp(e, "canary") ? -1 : 1;
@@ -46346,7 +46596,10 @@ static int prefill_route_on(void) {
 
 
 
-            if ((s = getenv("LLMS_DS4_PREFILL_ROUTE_TOPK")) && *s) { g_prefill_route_topk = atoi(s); if (g_prefill_route_topk < 1 || g_prefill_route_topk > 6) g_prefill_route_topk = 6; }
+            if ((s = getenv("LLMS_DS4_PREFILL_ROUTE_TOPK")) && *s) { g_prefill_route_topk = atoi(s); if (g_prefill_route_topk < 1 || g_prefill_route_topk > 6) g_prefill_route_topk = 6;
+
+                const char *lp = strstr(s, "lpm");   /* llms LPM_APPEND_TOPK: the value 'KlpmJ' = top-K, and top-J while the Mac is in Low Power Mode; a plain 'K' is unchanged, so an explicit plain value wins */
+                if (lp) { const int lk = atoi(lp + 3); if (lk >= 1 && lk <= 6 && llms_low_power_mode()) { g_prefill_route_topk = lk; fprintf(stderr, "llms: low power mode on -- appends at top-%d by default (LLMS_DS4_PREFILL_ROUTE_TOPK=%s)\n", lk, s); } } }
             if (g_prefill_route_topk < 6) fprintf(stderr, "llms: RPOL2 top-%d in layers %llx -- FIDELITY DIAL\n", g_prefill_route_topk, (unsigned long long)g_prefill_route_mask);
             fprintf(stderr, g_prefill_route_on < 0 ? "llms: RPOL -- CANARY: every row's first two route weights swapped\n" :
                     "llms: RPOL beta %.3f coherent %d layers %llx -- %s\n", g_prefill_route_beta, g_prefill_route_coh, (unsigned long long)g_prefill_route_mask,
@@ -46508,6 +46761,54 @@ static void rpol_fast_coroute(uint32_t h, const float *probs, const float *bias,
         if (same) break;   /* a fixed point: the next pass has the same inputs */
     }
 }
+
+/* llms RPOL_PRUNE (apply_rpol_prune.py): LLMS_DS4_RPOL_PRUNE=1 -- the co-route passes scan the call's union and each row's base top-6; '=check' runs the original beside it on a copy and counts mismatching sixes. Off unless set. */
+static int rpol_prune_state = -1; static uint64_t rpol_prune_calls, rpol_prune_mism, rpol_prune_cand, rpol_prune_rowpass, rpol_prune_rows_checked;
+static int rpol_prune_mode(void) {
+    if (rpol_prune_state < 0) { const char *e = getenv("LLMS_DS4_RPOL_PRUNE"); rpol_prune_state = !e || !*e || *e == '0' ? 0 : (!strcmp(e, "check") ? 2 : 1);
+        if (rpol_prune_state) { fprintf(stderr, "llms: rpol prune %s (the co-route passes scan the union and each row's base six)\n", rpol_prune_state == 2 ? "CHECK" : "on");
+            atexit_b(^{ fprintf(stderr, "llms rpol prune: %llu calls, %llu row-passes, mean candidates a row-pass %.1f; check: %llu rows compared, %llu mismatching sixes\n",
+                (unsigned long long)rpol_prune_calls, (unsigned long long)rpol_prune_rowpass, rpol_prune_rowpass ? (double)rpol_prune_cand / (double)rpol_prune_rowpass : 0.0,
+                (unsigned long long)rpol_prune_rows_checked, (unsigned long long)rpol_prune_mism); }); } }
+    return rpol_prune_state;
+}
+static void rpol_prune_coroute(uint32_t h, const float *probs, const float *bias, const uint8_t *loaded, float cr_bl, int32_t *pol) {
+    static int cnt[512]; static int32_t nw[1024 * 6], base6[1024 * 6]; static float cterm[512], bterm[512]; static int ulist[512], cand[512 + 8];
+    const float beta = coroute_beta; const float bk[4] = { beta * (float)0, beta * (float)1, beta * (float)2, beta * (float)3 };
+    for (int e = 0; e < (int)DS4_N_EXPERT; e++) bterm[e] = loaded[e] ? cr_bl : 0.0f;
+    float sc[512];
+    for (uint32_t r = 0; r < h; r++) {   /* the base six: the pass score of an expert no row's six holds (cterm 0) */
+        const float *p = probs + (uint64_t)r * DS4_N_EXPERT;
+        for (int e = 0; e < (int)DS4_N_EXPERT; e++) sc[e] = p[e] + bias[e] + 0.0f + bterm[e];
+        rpf_top6(sc, base6 + r * 6);
+    }
+    rpol_prune_calls++;
+    for (int pass = 0; pass < 3; pass++) {
+        memset(cnt, 0, sizeof cnt);
+        for (uint64_t i = 0; i < (uint64_t)h * 6u; i++) if (pol[i] >= 0) cnt[pol[i]]++;
+        int nu = 0; for (int e = 0; e < (int)DS4_N_EXPERT; e++) { cterm[e] = bk[cnt[e] > 3 ? 3 : cnt[e]]; if (cnt[e] > 0) ulist[nu++] = e; }
+        for (uint32_t r = 0; r < h; r++) {
+            const float *p = probs + (uint64_t)r * DS4_N_EXPERT;
+            int b6[6], nb = 0; for (int k = 0; k < 6; k++) if (base6[r * 6 + k] >= 0) b6[nb++] = base6[r * 6 + k];
+            for (int a = 1; a < nb; a++) { int x = b6[a], j = a; while (j > 0 && b6[j - 1] > x) { b6[j] = b6[j - 1]; j--; } b6[j] = x; }
+            int nc = 0, iu = 0, ib = 0;
+            while (iu < nu || ib < nb) { int x; if (ib >= nb || (iu < nu && ulist[iu] < b6[ib])) x = ulist[iu++]; else if (iu >= nu || b6[ib] < ulist[iu]) x = b6[ib++]; else { x = ulist[iu++]; ib++; } cand[nc++] = x; }
+            rpol_prune_cand += (uint64_t)nc; rpol_prune_rowpass++;
+            float v[6]; int32_t *out = nw + r * 6; for (int k = 0; k < 6; k++) { v[k] = -1e30f; out[k] = -1; }
+            for (int c = 0; c < nc; c++) {
+                const int e = cand[c]; float x = p[e] + bias[e] + cterm[e] + bterm[e];
+                int own = 0; for (int j = 0; j < 6; j++) own += pol[r * 6 + j] == e;
+                if (own) { int o = cnt[e]; for (int j = 0; j < 6; j++) o -= pol[r * 6 + j] == e; x = p[e] + bias[e] + bk[o > 3 ? 3 : (o < 0 ? 0 : o)] + bterm[e]; }
+                if (!(x > v[5])) continue;
+                int k = 5; while (k > 0 && x > v[k - 1]) { v[k] = v[k - 1]; out[k] = out[k - 1]; k--; }
+                v[k] = x; out[k] = e;
+            }
+        }
+        const int same = !memcmp(pol, nw, (size_t)h * 6u * sizeof(int32_t));
+        memcpy(pol, nw, (size_t)h * 6u * sizeof(int32_t));
+        if (same) break;
+    }
+}
 /* llms RPOL_PROF (apply_rpol_prof.py): an instrument -- apply_prefill_route's CPU time by stage */
 static double rpp_ms[10], rpp_t; static uint64_t rpp_calls; static int rpp_on = -1;
 static void rpp_mark(int k) {
@@ -46551,13 +46852,20 @@ static bool apply_prefill_route(const ds4_model *model, const ds4_layer_weights 
     rpp_mark(1);   /* llms RPOL_PROF */
     rpol_fast_coh(il, h, route_probs_host, bias, exact_router_six, policy_six, loaded_flags);   /* llms RPOL_FAST */
     rpp_mark(2);   /* llms RPOL_PROF */
+
     {   /* llms COROUTE: Jacobi passes on nw; the counts include every row's current set; a row's own membership is subtracted */
         static int cr_cnt[512];   /* the final sets' statistics */
         {   static int cr_env = -1;   /* llms DIAL_ENV: LLMS_DS4_COROUTE=BETA, read once */
-            if (cr_env < 0) { const char *e = getenv("LLMS_DS4_COROUTE"); cr_env = e && *e ? 1 : 0; if (cr_env && coroute_beta == 0.0f) ds4_llms_coroute_set(strtof(e, NULL)); } }
+            if (cr_env < 0) { const char *e = getenv("LLMS_DS4_COROUTE"); cr_env = e && *e ? 1 : 0; if (cr_env && coroute_beta == 0.0f) { const char *lp = strstr(e, "lpm"); float bv = strtof(e, NULL); if (lp && llms_low_power_mode()) { bv = strtof(lp + 3, NULL); fprintf(stderr, "llms: coroute %s -- Low Power Mode: beta %g (llms COROUTE_LPM)\n", e, (double)bv); } ds4_llms_coroute_set(bv); } } }
         if (coroute_beta > 0.0f && !ds4_gpu_llms_alt_off("coroute")) {   /* llms DIAL_ENV: ALT 'coroute' */
             const float cr_bl = g_prefill_route_have_bl ? (il < 64 ? ((g_prefill_route_have_bl2 && ds4_gpu_llms_alt_off("rpb")) ? g_prefill_route_bl2[il] : g_prefill_route_bl[il]) : 0.0f) : il < 64 ? g_prefill_route_beta : 0.0f;   /* the layer's resident bonus, as in the pass loop */
-            rpol_fast_coroute(h, route_probs_host, bias, loaded_flags, cr_bl, policy_six);   /* llms RPOL_FAST */
+            {   const int pm = rpol_prune_mode();   /* llms RPOL_PRUNE */
+                if (pm == 1) rpol_prune_coroute(h, route_probs_host, bias, loaded_flags, cr_bl, policy_six);
+                else if (pm == 2) { static int32_t ref6[1024 * 6]; memcpy(ref6, policy_six, (size_t)h * 6u * sizeof(int32_t));
+                    rpol_fast_coroute(h, route_probs_host, bias, loaded_flags, cr_bl, ref6); rpol_prune_coroute(h, route_probs_host, bias, loaded_flags, cr_bl, policy_six);
+                    for (uint32_t r = 0; r < h; r++) { rpol_prune_rows_checked++; if (memcmp(ref6 + r * 6, policy_six + r * 6, 6u * sizeof(int32_t))) rpol_prune_mism++; }
+                    memcpy(policy_six, ref6, (size_t)h * 6u * sizeof(int32_t)); }   /* check keeps the ORIGINAL result: the run is the ship's */
+                else rpol_fast_coroute(h, route_probs_host, bias, loaded_flags, cr_bl, policy_six);   /* llms RPOL_FAST */ }
         }
         {   /* statistics of the final sets (also with the dial off: the baseline) */
             memset(cr_cnt, 0, sizeof cr_cnt); int distinct = 0;
@@ -46565,6 +46873,96 @@ static bool apply_prefill_route(const ds4_model *model, const ds4_layer_weights 
             coroute_calls++; coroute_distinct_experts += (uint64_t)distinct; coroute_rows += h;
             for (uint64_t i = 0; i < n6; i++) if (policy_six[i] >= 0) { coroute_pairs++; if (cr_cnt[policy_six[i]] >= 4) coroute_pairs_in_4row_experts++; if (cr_cnt[policy_six[i]] >= 6) coroute_pairs_in_6row_experts++; }
             for (uint32_t r = 0; r < h; r++) { int same = 1; for (int k = 0; k < 6 && same; k++) { int f = 0; for (int j = 0; j < 6; j++) f |= policy_six[r * 6 + k] == exact_router_six[r * 6 + j]; same = f; } coroute_rows_changed += !same; }
+        }
+    }
+    {   /* llms PFROUTE_DUMP LLMS_DS4_PFROUTE_DUMP=<file> -- an INSTRUMENT: for every prefill layer call of 32+ rows, before the cap, int32 [0x50465244, layer, rows, experts], the rows' native router probabilities (rows x experts f32), the layer's bias (experts f32) and the rows' six policy picks (rows x 6 int32): the cap's own inputs, for the per-row read of its selection rule (rowbound.py). Off unless set. */
+        static FILE *pfd_file; static int pfd_state = -1; static uint64_t pfd_calls;
+        if (pfd_state < 0) { const char *e = getenv("LLMS_DS4_PFROUTE_DUMP"); pfd_state = 0; if (e && *e && strcmp(e, "0")) { pfd_file = fopen(e, "wb"); pfd_state = pfd_file != NULL; if (pfd_state) { fprintf(stderr, "llms: pfroute dump -> %s (instrument)\n", e); atexit_b(^{ fprintf(stderr, "llms pfroute dump: %llu layer calls written\n", (unsigned long long)pfd_calls); fclose(pfd_file); }); } } }
+        if (pfd_state == 1 && h >= 32u) { const int32_t hdr[4] = { 0x50465244, (int32_t)il, (int32_t)h, (int32_t)DS4_N_EXPERT }; fwrite(hdr, 4, 4, pfd_file); fwrite(route_probs_host, sizeof(float), (size_t)h * DS4_N_EXPERT, pfd_file);
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) { const float bv = (float)bias[e]; fwrite(&bv, 4, 1, pfd_file); }
+            for (uint32_t r = 0; r < h * 6u; r++) { const int32_t pv = (int32_t)policy_six[r]; fwrite(&pv, 4, 1, pfd_file); } pfd_calls++; }
+    }
+    {   /* llms PFCAP (apply_pfcap.py): LLMS_DS4_COROUTE_CAP=D -- a prefill layer call keeps at most D distinct experts across its rows' six (the D most used after the co-route, ties by summed native score); a pick outside them becomes the row's best allowed expert not already in its six. Off unless set; ALT 'pfcap'. FIDELITY DIAL */
+        static int pfcap_d = -1; static uint64_t pfcap_calls, pfcap_subs, pfcap_seen;
+        if (pfcap_d < 0) { const char *e = getenv("LLMS_DS4_COROUTE_CAP"); pfcap_d = e && *e ? atoi(e) : 0; { const char *lp = e ? strstr(e, "lpm") : NULL; if (lp && llms_low_power_mode()) { pfcap_d = atoi(lp + 3); fprintf(stderr, "llms: coroute cap %s -- Low Power Mode: %d (llms PFCAP_LPM)\n", e, pfcap_d); } } if (pfcap_d < 0 || pfcap_d > 512) pfcap_d = 0;
+            if (pfcap_d) { fprintf(stderr, "llms: coroute cap %d (a prefill layer call keeps at most %d distinct experts across its rows' six) -- FIDELITY DIAL\n", pfcap_d, pfcap_d);
+                atexit_b(^{ fprintf(stderr, "llms coroute cap: %llu layer calls seen, %llu capped, %llu picks substituted\n", (unsigned long long)pfcap_seen, (unsigned long long)pfcap_calls, (unsigned long long)pfcap_subs); }); } }
+        if (pfcap_d > 0 && il < 64 && !ds4_gpu_llms_alt_off("pfcap")) {
+            static int pc_cnt[512]; static float pc_sum[512]; static uint8_t pc_ok[512]; static int pc_list[512];
+            static float pc_m2[512]; static int pc_mass = -1;   /* llms PFCAP_MASS (apply_pfcap_mass.py) */
+            if (pc_mass < 0) { const char *me = getenv("LLMS_DS4_COROUTE_CAP_MASS"); pc_mass = me && *me && *me != '0'; if (pc_mass) fprintf(stderr, "llms: coroute cap mass (the cap keeps the experts by the native top-2 mass they carry)\n"); }
+            memset(pc_cnt, 0, sizeof pc_cnt); memset(pc_sum, 0, sizeof pc_sum); memset(pc_ok, 0, sizeof pc_ok);
+            if (pc_mass) { memset(pc_m2, 0, sizeof pc_m2);
+                for (uint32_t r = 0; r < h; r++) { const float *pp = route_probs_host + (uint64_t)r * DS4_N_EXPERT; int b1 = -1, b2 = -1; float v1 = -1e30f, v2 = -1e30f;
+                    for (int k = 0; k < 6; k++) { const int e = policy_six[r * 6 + k]; if (e < 0 || e >= (int)DS4_N_EXPERT) continue; const float v = pp[e] + bias[e];
+                        if (v > v1) { v2 = v1; b2 = b1; v1 = v; b1 = e; } else if (v > v2) { v2 = v; b2 = e; } }
+                    if (b1 >= 0) pc_m2[b1] += v1; if (b2 >= 0) pc_m2[b2] += v2; } }
+            int distinct = 0; pfcap_seen++;
+            for (uint32_t r = 0; r < h; r++) for (int k = 0; k < 6; k++) { const int e = policy_six[r * 6 + k]; if (e < 0 || e >= (int)DS4_N_EXPERT) continue;
+                if (pc_cnt[e]++ == 0) distinct++; pc_sum[e] += route_probs_host[(uint64_t)r * DS4_N_EXPERT + e] + bias[e]; }
+            if (distinct > pfcap_d) {
+                int nl = 0; pfcap_calls++;
+                static int pc_quad = -1; static float *pq_G; static float pq_b[512], pq_c[512]; static uint64_t pq_calls;   /* llms PFCAP_QUAD (apply_pfcap_quad.py): LLMS_DS4_COROUTE_CAP_QUAD=1 -- the kept set by the rows' squared lost mass (the b / G corner form, integer forward selection). Off unless set. FIDELITY DIAL */
+                if (pc_quad < 0) { const char *qe = getenv("LLMS_DS4_COROUTE_CAP_QUAD"); pc_quad = qe && *qe && *qe != '0' && DS4_N_EXPERT <= 512u ? (atoi(qe) == 2 ? 2 : 1) : 0;
+                    if (pc_quad) { pq_G = calloc((size_t)512 * 512, sizeof(float)); if (!pq_G) pc_quad = 0; }
+                    if (pc_quad) { fprintf(stderr, "llms: coroute cap quad %d (1: the cap keeps the experts by the rows' squared lost mass, the b / G corner form; 2: backward deletion by each expert's share of the rows' kept mass)\n", pc_quad); atexit_b(^{ fprintf(stderr, "llms coroute cap quad: %llu capped layer calls selected by the corner form\n", (unsigned long long)pq_calls); }); } }
+                if (pc_quad) { pq_calls++; memset(pq_b, 0, sizeof pq_b); memset(pq_c, 0, sizeof pq_c); memset(pq_G, 0, (size_t)512 * 512 * sizeof(float));
+                    for (uint32_t r = 0; r < h; r++) { const float *pp = route_probs_host + (uint64_t)r * DS4_N_EXPERT; int b1 = -1, b2 = -1; float v1 = -1e30f, v2 = -1e30f;
+                        for (int k = 0; k < 6; k++) { const int e = policy_six[r * 6 + k]; if (e < 0 || e >= (int)DS4_N_EXPERT) continue; const float v = pp[e] + bias[e];
+                            if (v > v1) { v2 = v1; b2 = b1; v1 = v; b1 = e; } else if (v > v2) { v2 = v; b2 = e; } }
+                        if (b1 < 0) continue;
+                        const float a1 = v1 > 1e-9f ? v1 : 1e-9f, a2 = b2 >= 0 ? (v2 > 1e-9f ? v2 : 1e-9f) : 0.0f, s1 = a1 / (a1 + a2), s2 = a2 / (a1 + a2);
+                        pq_b[b1] += s1; pq_G[b1 * 512 + b1] += s1 * s1;
+                        if (b2 >= 0) { pq_b[b2] += s2; pq_G[b2 * 512 + b2] += s2 * s2; pq_G[b1 * 512 + b2] += s1 * s2; pq_G[b2 * 512 + b1] += s1 * s2; } }
+                    for (int t = 0; t < pfcap_d; t++) { int best = -1; float bg = -1e30f;
+                        for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (pc_cnt[e] > 0 && !pc_ok[e]) { const float g = 2.0f * pq_b[e] - 2.0f * pq_c[e] - pq_G[e * 512 + e]; if (best < 0 || g > bg || (g == bg && pc_cnt[e] > pc_cnt[best])) { bg = g; best = e; } }
+                        if (best < 0) break;
+                        pc_ok[best] = 1; pc_list[nl++] = best; for (int e = 0; e < (int)DS4_N_EXPERT; e++) pq_c[e] += pq_G[e * 512 + best]; } }
+                if (pc_quad == 2 && h <= 1024u) {   /* value 2 (rowbound.py's LEV): backward deletion by the log potential's derivative -- an expert's score is the sum over rows of the SHARE of the row's kept top-2 mass it carries (1 for a row it alone supports); delete the smallest, recompute, stop at D. Replaces value 1's choice. */
+                    static int16_t lr1[1024], lr2[1024]; static float ls1[1024], ls2[1024], lev[512]; static uint8_t al[512]; int na = 0;
+                    memset(pc_ok, 0, sizeof pc_ok); nl = 0;
+                    for (int e = 0; e < (int)DS4_N_EXPERT; e++) { al[e] = pc_cnt[e] > 0; na += al[e]; }
+                    for (uint32_t r = 0; r < h; r++) { const float *pp = route_probs_host + (uint64_t)r * DS4_N_EXPERT; int b1 = -1, b2 = -1; float v1 = -1e30f, v2 = -1e30f;
+                        for (int k = 0; k < 6; k++) { const int e = policy_six[r * 6 + k]; if (e < 0 || e >= (int)DS4_N_EXPERT) continue; const float v = pp[e] + bias[e];
+                            if (v > v1) { v2 = v1; b2 = b1; v1 = v; b1 = e; } else if (v > v2) { v2 = v; b2 = e; } }
+                        const float a1 = v1 > 1e-9f ? v1 : 1e-9f, a2 = b2 >= 0 ? (v2 > 1e-9f ? v2 : 1e-9f) : 0.0f;
+                        lr1[r] = (int16_t)b1; lr2[r] = (int16_t)b2; ls1[r] = b1 >= 0 ? a1 / (a1 + a2) : 0.0f; ls2[r] = b1 >= 0 ? a2 / (a1 + a2) : 0.0f; }
+                    while (na > pfcap_d) { memset(lev, 0, sizeof lev);
+                        for (uint32_t r = 0; r < h; r++) { const int b1 = lr1[r], b2 = lr2[r]; const int x1 = b1 >= 0 && al[b1], x2 = b2 >= 0 && al[b2];
+                            if (x1 && x2) { lev[b1] += ls1[r]; lev[b2] += ls2[r]; } else if (x1) lev[b1] += 1.0f; else if (x2) lev[b2] += 1.0f; }
+                        int worst = -1; for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (al[e] && (worst < 0 || lev[e] < lev[worst] || (lev[e] == lev[worst] && pq_b[e] < pq_b[worst]))) worst = e;
+                        if (worst < 0) break;
+                        al[worst] = 0; na--; }
+                    for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (al[e]) { pc_ok[e] = 1; pc_list[nl++] = e; } }
+                for (int t = (pc_quad ? pfcap_d : 0); t < pfcap_d; t++) { int best = -1;
+                    for (int e = 0; e < (int)DS4_N_EXPERT; e++) if (pc_cnt[e] > 0 && !pc_ok[e] && (best < 0 || (pc_mass ? (pc_m2[e] > pc_m2[best] || (pc_m2[e] == pc_m2[best] && pc_cnt[e] > pc_cnt[best]))
+                        : (pc_cnt[e] > pc_cnt[best] || (pc_cnt[e] == pc_cnt[best] && pc_sum[e] > pc_sum[best]))))) best = e;
+                    if (best < 0) break; pc_ok[best] = 1; pc_list[nl++] = best; }
+                for (uint32_t r = 0; r < h; r++) {
+                    const float *p = route_probs_host + (uint64_t)r * DS4_N_EXPERT; int32_t *six = policy_six + r * 6;
+                    int top1 = -1; { static int k1 = -1; static uint64_t k1_kept; if (k1 < 0) { const char *ke = getenv("LLMS_DS4_COROUTE_CAP_KEEP1"); k1 = ke && *ke && *ke != '0';   /* llms PFCAP_KEEP1 (apply_pfcap_keep1.py) */
+                            if (k1) { fprintf(stderr, "llms: coroute cap keep1 (a row's highest-native-score pick among its six is never substituted)\n"); atexit_b(^{ fprintf(stderr, "llms coroute cap keep1: %llu picks protected\n", (unsigned long long)k1_kept); }); } }
+                        if (k1) { float tv = -1e30f; for (int k = 0; k < 6; k++) { const int e = six[k]; if (e < 0 || e >= (int)DS4_N_EXPERT) continue; const float v = p[e] + bias[e]; if (v > tv) { tv = v; top1 = e; } }
+                                  if (top1 >= 0 && !pc_ok[top1]) k1_kept++; } }
+                    for (int k = 0; k < 6; k++) { const int e = six[k]; if (e < 0 || e >= (int)DS4_N_EXPERT || pc_ok[e] || e == top1) continue;
+                        int best = -1; float bv = -1e30f;
+                        for (int t = 0; t < nl; t++) { const int a = pc_list[t]; if (six[0] == a || six[1] == a || six[2] == a || six[3] == a || six[4] == a || six[5] == a) continue;
+                            const float v = p[a] + bias[a]; if (v > bv) { bv = v; best = a; } }
+                        six[k] = best; pfcap_subs++; } }
+
+                {   static int rp = -1; static uint64_t rp_rows, rp_changed;   /* llms PFCAP_REPICK (apply_pfcap_repick.py) */
+                    if (rp < 0) { const char *re = getenv("LLMS_DS4_COROUTE_CAP_REPICK"); const char *ke = getenv("LLMS_DS4_COROUTE_CAP_KEEP1"); rp = re && *re && *re != '0' && !(ke && *ke && *ke != '0');
+                        if (rp) { fprintf(stderr, "llms: coroute cap repick (a capped row's six is its native best within the kept set)\n");
+                            atexit_b(^{ fprintf(stderr, "llms coroute cap repick: %llu rows re-picked, %llu picks changed\n", (unsigned long long)rp_rows, (unsigned long long)rp_changed); }); } }
+                    if (rp && nl >= 6) {
+                        for (uint32_t r = 0; r < h; r++) {
+                            const float *p = route_probs_host + (uint64_t)r * DS4_N_EXPERT; int32_t *six = policy_six + r * 6; float v[6]; int32_t o[6];
+                            for (int k = 0; k < 6; k++) { v[k] = -1e30f; o[k] = -1; }
+                            for (int e = 0; e < (int)DS4_N_EXPERT; e++) { if (!pc_ok[e]) continue; const float x = p[e] + bias[e]; if (!(x > v[5])) continue;
+                                int k = 5; while (k > 0 && x > v[k - 1]) { v[k] = v[k - 1]; o[k] = o[k - 1]; k--; } v[k] = x; o[k] = e; }
+                            int ch = 0; for (int k = 0; k < 6; k++) { int f = 0; for (int j = 0; j < 6; j++) f |= six[j] == o[k]; ch += !f; }
+                            if (ch) { memcpy(six, o, sizeof o); rp_changed += (uint64_t)ch; } rp_rows++; } } }
+            }
         }
     }
     rpp_mark(3);   /* llms RPOL_PROF */
@@ -46576,6 +46974,12 @@ static bool apply_prefill_route(const ds4_model *model, const ds4_layer_weights 
         int sub = 0; for (int k = 0; k < 6; k++) { int f = 0; for (int j = 0; j < 6; j++) f |= policy_six[r * 6 + k] == gpu_selected_experts[r * 6 + j]; sub += !f; }
         if (sub) { row_rewritten[r] = 1; g_prefill_route_subs += (uint64_t)sub; }
     }
+    static int8_t pfht_slot[1024]; static float pfht_mass[1024]; static int pfht_live, pfht_kv = -1, pfht_gainkeep; static float pfht_ginv = 1.0f; static uint64_t pfht_rows, pfht_tail_rows, pfht_lost, pfht_rng = 0xD1B54A32D192ED03ull, pfht_share_30, pfht_share_50; static double pfht_share_sum;   /* llms PREFILL_ROUTE_HT (apply_pfht.py) */
+    pfht_live = 0;
+    if (pfht_kv < 0) { const char *e = getenv("LLMS_DS4_PREFILL_ROUTE_HT"); pfht_kv = e && *e ? atoi(e) : 0; if (pfht_kv < 2 || pfht_kv > 5) pfht_kv = 0;
+        if (pfht_kv) { const char *gk = getenv("LLMS_DS4_PREFILL_ROUTE_HT_GAINKEEP"); pfht_gainkeep = gk && *gk && *gk != '0'; const char *g = getenv("LLMS_DS4_ROUTE_GAIN"); const float gv = g && *g ? (float)atof(g) : 1.0f; pfht_ginv = !pfht_gainkeep && gv >= 0.5f && gv <= 2.0f ? 1.0f / gv : 1.0f;
+            fprintf(stderr, "llms: prefill route HT %d (the first %d picks kept; ONE resident pick after them, sampled by router probability, carries the resident tail's whole probability; its row's weights x %.4f) -- FIDELITY DIAL\n", pfht_kv, pfht_kv - 1, (double)pfht_ginv);
+            atexit_b(^{ fprintf(stderr, "llms prefill route ht: %llu rows, %llu with a sampled tail pick, %llu whose sampled pick a later policy stage removed; the sampled pick's share of the row's weight: mean %.4f, above 0.3 on %llu rows, above 0.5 on %llu\n", (unsigned long long)pfht_rows, (unsigned long long)pfht_tail_rows, (unsigned long long)pfht_lost, pfht_tail_rows ? pfht_share_sum / (double)pfht_tail_rows : 0.0, (unsigned long long)pfht_share_30, (unsigned long long)pfht_share_50); }); } }
     if (rpol_topk_at(il) < 6 && il < 64 && ((g_prefill_route_mask >> il) & 1ull) && !ds4_gpu_llms_alt_off("rptk")) {   /* llms RPOL2: per-layer top-k by selection score; llms RPOL_ALT: ALT rptk */
         prefill_fill_ready = h <= 1024u;
         for (uint32_t r = 0; r < h; r++) {
@@ -46583,10 +46987,48 @@ static bool apply_prefill_route(const ds4_model *model, const ds4_layer_weights 
             for (int k = 0; k < 6; k++) { const int e = policy_six[r * 6 + k]; v[k] = e >= 0 ? route_probs_host[(uint64_t)r * DS4_N_EXPERT + e] + bias[e] : -1e30f; o[k] = k; }
             for (int i = 1; i < 6; i++) { const int x = o[i]; int j = i; while (j > 0 && v[o[j - 1]] < v[x]) { o[j] = o[j - 1]; j--; } o[j] = x; }
             for (int k = 0; k < 6; k++) { prefill_fill_original_six[r * 6 + k] = policy_six[r * 6 + k]; prefill_fill_slot_of_rank[r * 6 + k] = (uint8_t)o[k]; }   /* llms PFILL: before the drop */
+            if (pfht_kv && h <= 1024u) {   /* llms PREFILL_ROUTE_HT: the unbiased cut in place of the top-k drop */
+                int tail[6], nt = 0; float tm = 0.0f; pfht_live = 1; pfht_slot[r] = -1; pfht_rows++;
+                for (int k = pfht_kv - 1; k < 6; k++) { const int e = policy_six[r * 6 + o[k]]; if (e < 0) continue;
+                    if (e < 512 && resident_flags[e]) { tail[nt++] = o[k]; tm += route_probs_host[(uint64_t)r * DS4_N_EXPERT + e]; } else { policy_six[r * 6 + o[k]] = -1; dropped_picks_per_row[r]++; g_prefill_route_drops++; } }
+                if (nt > 0 && tm > 0.0f) {
+                    static int pfht_seq = -1; static float pfht_u0, pfht_uprev;   /* llms PREFILL_ROUTE_HT_SEQ (apply_pfht_seq.py) */
+                    if (pfht_seq < 0) { const char *se = getenv("LLMS_DS4_PREFILL_ROUTE_HT_SEQ"); pfht_seq = se && *se ? atoi(se) : 0; if (pfht_seq < 0 || pfht_seq > 2) pfht_seq = 0;
+                        if (pfht_seq) fprintf(stderr, "llms: prefill route HT seq %d (1: an odd row takes 1 - u of the row before it; 2: u_r = frac(u_0 + 0.618034 r) inside a layer call)\n", pfht_seq); }
+                    float u01;
+                    if (pfht_seq == 1 && (r & 1u)) u01 = 1.0f - pfht_uprev;
+                    else if (pfht_seq == 2 && r > 0u) { u01 = pfht_u0 + 0.61803398875f * (float)r; u01 -= (float)(int)u01; }
+                    else { pfht_rng ^= pfht_rng << 13; pfht_rng ^= pfht_rng >> 7; pfht_rng ^= pfht_rng << 17; u01 = (float)((pfht_rng >> 40) & 0xFFFFFFull) / 16777216.0f; if (r == 0u) pfht_u0 = u01; }
+                    pfht_uprev = u01; const float u = u01 * tm; float run = 0.0f; int pick = tail[nt - 1];
+                    for (int q = 0; q < nt; q++) { run += route_probs_host[(uint64_t)r * DS4_N_EXPERT + policy_six[r * 6 + tail[q]]]; if (u < run) { pick = tail[q]; break; } }
+                    for (int q = 0; q < nt; q++) if (tail[q] != pick) { policy_six[r * 6 + tail[q]] = -1; dropped_picks_per_row[r]++; g_prefill_route_drops++; }
+                    pfht_slot[r] = (int8_t)pick; pfht_mass[r] = tm; pfht_tail_rows++;
+                    { float hm = 0.0f; for (int k = 0; k < pfht_kv - 1; k++) { const int e = policy_six[r * 6 + o[k]]; if (e >= 0) hm += route_probs_host[(uint64_t)r * DS4_N_EXPERT + e]; } const float sh = tm / (hm + tm); pfht_share_sum += (double)sh; pfht_share_30 += sh > 0.3f; pfht_share_50 += sh > 0.5f; }   /* llms PREFILL_ROUTE_HT share counter (apply_pfht_share.py) */
+                }
+                row_rewritten[r] = 1;
+            } else
             for (int k = rpol_topk_at(il); k < 6; k++) if (policy_six[r * 6 + o[k]] >= 0) { policy_six[r * 6 + o[k]] = -1; dropped_picks_per_row[r]++; g_prefill_route_drops++; row_rewritten[r] = 1; }
         }
     }
     rpp_mark(4);   /* llms RPOL_PROF */
+    {   /* llms PFCAP_STATS (apply_pfcap.py): LLMS_DS4_PFCAP_STATS=1 -- an INSTRUMENT: after the top-k drop, the distinct experts a prefill layer call's picks use and the rows-an-expert histogram, printed at exit */
+        static int ps_on = -1; static uint64_t ps_calls, ps_rows, ps_pairs, ps_distinct, ps_hist[6];
+        static double ps_n2 = 0.0, ps_lost = 0.0; static uint64_t ps_t1lost, ps_t1rows; static int ps_lost_reg;   /* llms PFCAP_LOST (apply_pfcap_lost.py) */
+        if (!ps_lost_reg && getenv("LLMS_DS4_PFCAP_STATS")) { ps_lost_reg = 1; atexit_b(^{ fprintf(stderr, "llms pfcap lost: native top-2 mass lost %.3f of %.3f (fraction %.5f), native top-1 replaced in %llu of %llu rows\n", ps_lost, ps_n2, ps_n2 > 0 ? ps_lost / ps_n2 : 0.0, (unsigned long long)ps_t1lost, (unsigned long long)ps_t1rows); }); }
+        if (ps_on < 0) { const char *e = getenv("LLMS_DS4_PFCAP_STATS"); ps_on = e && *e && *e != '0';
+            if (ps_on) atexit_b(^{ fprintf(stderr, "llms pfcap stats: %llu layer calls, %llu rows, %llu picks, distinct experts a call %.2f, picks a row %.3f; experts by rows 1 %llu / 2 %llu / 3 %llu / 4-7 %llu / 8-15 %llu / 16+ %llu\n",
+                (unsigned long long)ps_calls, (unsigned long long)ps_rows, (unsigned long long)ps_pairs, ps_calls ? (double)ps_distinct / (double)ps_calls : 0.0, ps_rows ? (double)ps_pairs / (double)ps_rows : 0.0,
+                (unsigned long long)ps_hist[0], (unsigned long long)ps_hist[1], (unsigned long long)ps_hist[2], (unsigned long long)ps_hist[3], (unsigned long long)ps_hist[4], (unsigned long long)ps_hist[5]); }); }
+        if (ps_on && il < 64) {
+            static int ps_cnt[512]; memset(ps_cnt, 0, sizeof ps_cnt); ps_calls++; ps_rows += h;
+            for (uint64_t i = 0; i < n6; i++) { const int e = policy_six[i]; if (e < 0 || e >= (int)DS4_N_EXPERT) continue; ps_pairs++; if (ps_cnt[e]++ == 0) ps_distinct++; }
+            for (int e = 0; e < (int)DS4_N_EXPERT; e++) { const int c = ps_cnt[e]; if (!c) continue; ps_hist[c == 1 ? 0 : c == 2 ? 1 : c == 3 ? 2 : c < 8 ? 3 : c < 16 ? 4 : 5]++; }
+            for (uint32_t r = 0; r < h; r++) { const float *pp = route_probs_host + (uint64_t)r * DS4_N_EXPERT; int b1 = -1, b2 = -1; float v1 = -1e30f, v2 = -1e30f;   /* llms PFCAP_LOST */
+                for (int k = 0; k < 6; k++) { const int e = exact_router_six[r * 6 + k]; if (e < 0 || e >= (int)DS4_N_EXPERT) continue; const float v = pp[e] + bias[e]; if (v > v1) { v2 = v1; b2 = b1; v1 = v; b1 = e; } else if (v > v2) { v2 = v; b2 = e; } }
+                int in1 = 0, in2 = 0; for (int k = 0; k < 6; k++) { const int e = policy_six[r * 6 + k]; in1 |= e == b1; in2 |= e == b2; }
+                if (b1 >= 0) { ps_n2 += pp[b1]; if (!in1) { ps_lost += pp[b1]; ps_t1lost++; } ps_t1rows++; } if (b2 >= 0) { ps_n2 += pp[b2]; if (!in2) ps_lost += pp[b2]; } }
+        }
+    }
 
     static int plag_renorm = -1; if (plag_renorm < 0) { const char *e = getenv("LLMS_DS4_PLAG_RENORM"); plag_renorm = e && *e ? atoi(e) : 0; if (plag_renorm < 0 || plag_renorm > 2) plag_renorm = 0; if (plag_renorm) fprintf(stderr, plag_renorm == 2 ? "llms: plag renorm 2 (PLAG rows take PWNORM's norm-matched divisor)\n" : "llms: plag renorm (every PLAG row divides by its survivors' sum)\n"); }   /* llms PLAG_RENORM 2: the mode */   /* llms PLAG_RENORM */
 
@@ -46639,7 +47081,7 @@ static bool apply_prefill_route(const ds4_model *model, const ds4_layer_weights 
             if (sp_tail_row[r]) continue;   /* llms SP_TAIL: a tail row lags nothing */
             for (int k = 0; k < 6; k++) {
                 const int e = policy_six[r * 6 + k]; if (e < 0 || resident_flags[e]) continue;
-                ls[r * 6 + lag_pick_counts[r]] = e; lw[r * 6 + lag_pick_counts[r]] = route_probs_host[(uint64_t)r * DS4_N_EXPERT + e] / sf * DS4_EXPERT_WEIGHT_SCALE; lag_pick_counts[r]++; tot++;
+                ls[r * 6 + lag_pick_counts[r]] = e; lw[r * 6 + lag_pick_counts[r]] = route_probs_host[(uint64_t)r * DS4_N_EXPERT + e] / sf * DS4_EWS_L(il); lag_pick_counts[r]++; tot++;
                 policy_six[r * 6 + k] = -1;
                 if (e < 512 && !seen[e] && nid < 64u) { seen[e] = 1; prefill_lag_ids[il][nid++] = e; }
             }
@@ -46750,7 +47192,14 @@ static bool apply_prefill_route(const ds4_model *model, const ds4_layer_weights 
         if (plag_renorm == 2 && plag_row[r] && prefill_norm_match_row[r]) { static uint64_t npw; if (!npw++) atexit_b(^{ fprintf(stderr, "llms plag renorm 2: %llu PLAG rows took PWNORM's divisor\n", (unsigned long long)npw); }); }   /* llms PLAG_RENORM 2 counter */
         if ((r < 128u || plag_s256) && plag_row[r] && !plag_renorm) s = plag_s[r];   /* llms PLAG_RENORM: off -> the full sum */   /* llms PLAG_DROP: the dropped share is lost, not spread */   /* llms PLAG_S256: rows >= 128 too */
         else if (prefill_norm_match_row[r]) s = prefill_norm_match_divisor[r];   /* llms PWNORM: (p / sum six) x sqrt(sum six p^2 / sum kept p^2) */
-        for (int k = 0; k < 6; k++) { gpu_selected_experts[r * 6 + k] = policy_six[r * 6 + k]; route_weights_host[r * 6 + k] = policy_six[r * 6 + k] >= 0 && s > 0.0f ? route_probs_host[(uint64_t)r * DS4_N_EXPERT + policy_six[r * 6 + k]] / s * DS4_EXPERT_WEIGHT_SCALE : 0.0f; }
+        if (pfht_live && r < 1024u && pfht_slot[r] >= 0) {   /* llms PREFILL_ROUTE_HT: kept picks at p / S, the sampled pick at the tail's mass / S, S = the kept sum + the tail's mass */
+            const int hs = pfht_slot[r];
+            if (policy_six[r * 6 + hs] < 0) pfht_lost++;
+            else { float hsum = 0.0f; for (int k = 0; k < 6; k++) if (policy_six[r * 6 + k] >= 0) hsum += k == hs ? pfht_mass[r] : route_probs_host[(uint64_t)r * DS4_N_EXPERT + policy_six[r * 6 + k]];
+                for (int k = 0; k < 6; k++) { gpu_selected_experts[r * 6 + k] = policy_six[r * 6 + k]; route_weights_host[r * 6 + k] = policy_six[r * 6 + k] >= 0 && hsum > 0.0f ? (k == hs ? pfht_mass[r] : route_probs_host[(uint64_t)r * DS4_N_EXPERT + policy_six[r * 6 + k]]) / hsum * DS4_EWS_L(il) * pfht_ginv : 0.0f; }
+                continue; }
+        }
+        for (int k = 0; k < 6; k++) { gpu_selected_experts[r * 6 + k] = policy_six[r * 6 + k]; route_weights_host[r * 6 + k] = policy_six[r * 6 + k] >= 0 && s > 0.0f ? route_probs_host[(uint64_t)r * DS4_N_EXPERT + policy_six[r * 6 + k]] / s * DS4_EWS_L(il) : 0.0f; }
     }
     rpp_mark(8);   /* llms RPOL_PROF */
     if (!any) return true;
@@ -46840,7 +47289,7 @@ static bool replay_route_selection(const ds4_model *model, const ds4_layer_weigh
         if (same && nl == nt) { memcpy(sel + r * 6, gpu_selected_experts + r * 6, 6 * sizeof(int32_t)); continue; }   /* the live arrays stay */
         any = 1; route_replay_flips++;
         float sum = 0.0f; for (int k = 0; k < 6; k++) if (sel[r * 6 + k] >= 0) sum += route_probs_host[(uint64_t)r * DS4_N_EXPERT + (uint64_t)sel[r * 6 + k]];
-        for (int k = 0; k < 6; k++) route_weights_host[r * 6 + k] = sel[r * 6 + k] >= 0 && sum > 0.0f ? route_probs_host[(uint64_t)r * DS4_N_EXPERT + (uint64_t)sel[r * 6 + k]] / sum * DS4_EXPERT_WEIGHT_SCALE : 0.0f;
+        for (int k = 0; k < 6; k++) route_weights_host[r * 6 + k] = sel[r * 6 + k] >= 0 && sum > 0.0f ? route_probs_host[(uint64_t)r * DS4_N_EXPERT + (uint64_t)sel[r * 6 + k]] / sum * DS4_EWS_L(il) : 0.0f;
     }
     route_replay_written++;
     if (!any) return true;
@@ -47288,6 +47737,11 @@ static bool llms_sp_attn_eligible(const ds41_gpu_graph *g,
 /* llms ATT2_RING: the batched rows attention reads the layer's raw window straight from its ring (rows [0, previous)) and the step's new rows from batch.kv (rows [previous, previous + n)): the snapshot (<= 2 copies) and the append copy go; the same float rows in the same order, bit-identical. Only while LLMS_TAIL defers the window writes, for one chunk (<= 16 rows) and previous >= 1; anything else, or a refused call, takes the copies. Adopted; the switch removed 10-27 (ALT a2r). */
 /* llms SP_CTX: ring_attention_try, ring_attention_layer moved to struct sp_ctx */
 int ds4_gpu_llms_att2_ring_set(const ds4_gpu_tensor *newkv, uint32_t prev);
+
+static unsigned long long a2r_base0_restored;   /* llms A2R_BASE0: piece-B ring snapshots the switch restored */
+static int a2r_base0_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("LLMS_DS4_A2R_BASE0"); v = e && *e && *e != '0';
+    if (v) { fprintf(stderr, "llms: a2r base0 (a short-prefill step's piece B takes its own ring snapshot: the in-place ring read runs at base 0 only)\n");
+             atexit_b(^{ fprintf(stderr, "llms a2r base0: %llu piece-B snapshots restored\n", a2r_base0_restored); }); } } return v; }   /* llms A2R_BASE0 (apply_a2r_base0.py) */
 static bool copy_ring_snapshot(ds41_gpu_graph *g, const ds41_gpu_graph *session, uint32_t il, uint32_t start, uint32_t previous) {   /* llms ATT2_RING: the snapshot exactly as llms_sp_attn_snapshot takes it */
     const uint32_t slot = (start - previous) % 128u;
     const uint32_t first = previous < 128u - slot ? previous : 128u - slot;
@@ -47654,6 +48108,60 @@ static bool dims_zero_apply(ds4_gpu_tensor *t, uint32_t rows, uint32_t streams) 
     dims_zero_calls++;
     return ds4_gpu_llms_zero_lanes(t, rows, streams, 5120u, dims_zero_lanes, dims_zero_n, dims_zero_version) != 0;
 }
+/* llms LOOPSTEER_ADD (apply_loopsteer_add.py): LLMS_DS4_LOOPSTEER_ADD=FILE:SITE:SCALE -- x -= SCALE * v_l on every row of the attention (SITE att) or FFN (SITE ffn) block of every layer in the session-batch step; FILE = 40 x 5120 f32 (a zero row leaves that layer alone); off unless set. */
+enum { LADD_R = 64u };
+static int ladd_state = -1, ladd_site; static ds4_gpu_tensor *ladd_rep; static unsigned long long ladd_rows;
+static uint32_t ladd_from; static int ladd_from_state = -1; static unsigned long long ladd_gated;   /* llms LOOPSTEER_FROM (apply_loopsteer_from.py) */
+static bool loopsteer_add_apply(uint32_t il, int which, ds4_gpu_tensor *t, uint32_t rows, const uint32_t *pos, int count) {
+    if (ladd_from_state < 0) { ladd_from_state = 0; const char *e = getenv("LLMS_DS4_LOOPSTEER_FROM"); if (e && *e) { ladd_from = (uint32_t)strtoul(e, NULL, 10); ladd_from_state = 1;
+        fprintf(stderr, "llms: loopsteer from %u (the addition acts only on rows at position >= %u)\n", ladd_from, ladd_from);
+        atexit_b(^{ fprintf(stderr, "llms loopsteer from: %llu rows below the gate left alone\n", ladd_gated); }); } }
+    if (ladd_state < 0) { ladd_state = 0; const char *e = getenv("LLMS_DS4_LOOPSTEER_ADD");
+        if (e && *e) { static char path[1024], site[8]; float sc = 0.0f; const char *c1 = strchr(e, ':');
+            if (c1 && (size_t)(c1 - e) < sizeof path && sscanf(c1 + 1, "%7[a-z]:%f", site, &sc) == 2 && (!strcmp(site, "att") || !strcmp(site, "ffn")) && sc != 0.0f) {
+                memcpy(path, e, (size_t)(c1 - e)); path[c1 - e] = 0; ladd_site = !strcmp(site, "ffn");
+                const size_t n = (size_t)40u * 5120u; float *v = malloc(n * sizeof(float)), *rep = malloc((size_t)40u * LADD_R * 5120u * sizeof(float)); FILE *fp = fopen(path, "rb");
+                if (v && rep && fp && fread(v, sizeof(float), n, fp) == n) {
+                    int fin = 1; for (size_t i = 0; i < n; i++) if (!isfinite(v[i])) fin = 0;
+                    if (fin) { for (uint32_t l = 0; l < 40u; l++) for (uint32_t r = 0; r < LADD_R; r++) for (uint32_t k = 0; k < 5120u; k++) rep[((size_t)l * LADD_R + r) * 5120u + k] = -sc * v[(size_t)l * 5120u + k];
+                        ladd_rep = ds4_gpu_tensor_alloc((uint64_t)40u * LADD_R * 5120u * sizeof(float));
+                        if (ladd_rep && ds4_gpu_tensor_write(ladd_rep, 0, rep, (uint64_t)40u * LADD_R * 5120u * sizeof(float))) ladd_state = 1; } }
+                if (fp) fclose(fp); free(v); free(rep);
+                if (ladd_state == 1) { fprintf(stderr, "llms: loopsteer add %s (the %s block of every layer, x -= %.3f v_l; the session-batch step only)\n", path, ladd_site ? "FFN" : "attention", (double)sc);
+                    atexit_b(^{ fprintf(stderr, "llms loopsteer add: %llu rows shifted\n", ladd_rows); }); } }
+            if (ladd_state != 1) fprintf(stderr, "llms: loopsteer add '%s' NOT enabled (FILE:att|ffn:SCALE, a finite 40 x 5120 f32 file)\n", e); } }
+    if (ladd_state != 1 || which != ladd_site || il >= 40u) return true;
+    uint32_t rf = 0; if (ladd_from_state == 1 && pos) { while (rf < rows && (int)rf < count && pos[rf] < ladd_from) rf++; if ((int)rf >= count) rf = rows; }
+    ladd_gated += rf; ladd_rows += rows - rf;
+    for (uint32_t r0 = rf; r0 < rows; r0 += LADD_R) {
+        const uint32_t nr = rows - r0 < LADD_R ? rows - r0 : LADD_R;
+        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(t, (uint64_t)r0 * 5120u * sizeof(float), (uint64_t)nr * 5120u * sizeof(float));
+        ds4_gpu_tensor *vv = ds4_gpu_tensor_view(ladd_rep, (uint64_t)il * LADD_R * 5120u * sizeof(float), (uint64_t)nr * 5120u * sizeof(float));
+        const int ok = xv && vv && ds4_gpu_add_tensor(xv, xv, vv, nr * 5120u);
+        if (xv) ds4_gpu_tensor_free(xv);
+        if (vv) ds4_gpu_tensor_free(vv);
+        if (!ok) { fprintf(stderr, "llms loopsteer add: the add failed at layer %u\n", il); return false; }
+    }
+    return true;
+}
+/* llms LOOPSTEER (apply_loopsteer.py): LLMS_DS4_LOOPSTEER=FILE:ATT:FFN -- x -= s (x . d_l) d_l on the attention / FFN block of every layer in the session-batch step; FILE = 40 x 5120 f32 unit directions; off unless set. Upstream's --dir-steering is refused on V4.1, so this is the V4.1 form. */
+static int lsteer_state = -1; static ds4_gpu_tensor *lsteer_dirs; static float lsteer_scale[2]; static unsigned long long lsteer_rows[2];
+static bool loopsteer_apply(uint32_t il, int which, ds4_gpu_tensor *t, uint32_t rows) {
+    if (lsteer_state < 0) { lsteer_state = 0; const char *e = getenv("LLMS_DS4_LOOPSTEER");
+        if (e && *e) { static char path[1024]; float a = 0.0f, f = 0.0f; const char *c1 = strchr(e, ':');
+            if (c1 && (size_t)(c1 - e) < sizeof path && sscanf(c1 + 1, "%f:%f", &a, &f) == 2) { memcpy(path, e, (size_t)(c1 - e)); path[c1 - e] = 0;
+                const size_t n = (size_t)40u * 5120u; float *d = malloc(n * sizeof(float)); FILE *fp = fopen(path, "rb");
+                if (d && fp && fread(d, sizeof(float), n, fp) == n) { lsteer_dirs = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+                    if (lsteer_dirs && ds4_gpu_tensor_write(lsteer_dirs, 0, d, (uint64_t)n * sizeof(float))) { lsteer_scale[0] = a; lsteer_scale[1] = f; lsteer_state = 1; } }
+                if (fp) fclose(fp); free(d);
+                if (lsteer_state == 1) { fprintf(stderr, "llms: loopsteer %s (attention block x %.3f, FFN block x %.3f, every layer, the session-batch step only)\n", path, (double)a, (double)f);
+                    atexit_b(^{ fprintf(stderr, "llms loopsteer: %llu attention rows, %llu FFN rows steered\n", lsteer_rows[0], lsteer_rows[1]); }); } }
+            if (lsteer_state != 1) fprintf(stderr, "llms: loopsteer '%s' NOT enabled (FILE:ATT:FFN with a readable 40 x 5120 f32 file)\n", e); } }
+    if (lsteer_state != 1 || il >= 40u) return true;
+    const float sc = lsteer_scale[which ? 1 : 0]; if (sc == 0.0f) return true;
+    lsteer_rows[which ? 1 : 0] += rows;
+    return ds4_gpu_directional_steering_project_tensor(t, lsteer_dirs, il, 5120u, rows, sc) != 0;
+}
 /* llms DIMS_CAP (apply_dims_cap.py): the lane capture -- see that script's docstring for the file format */
 enum { DCAP_ROWS = 64u, DCAP_REC = 4u * 5120u + 24u + 5120u + 24u + 5120u };
 static const uint32_t dcap_field_off[5] = { 0u, 20480u, 20504u, 25624u, 25648u }, dcap_field_n[5] = { 20480u, 24u, 5120u, 24u, 5120u };   /* residual, attn split, attn block, ffn split, ffn block */
@@ -47996,7 +48504,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) batch_stage("pre", il, rows);
         if (ok) dcap_take(il, 1, active.attn_split, rows);   /* llms DIMS_CAP: the attention split */
         const int dskip_layer = ok && dskip_on(il) && g_dskip_conf_open && !(dskip_think_gate() && ((short_prefill_active && !g_dskip_verify) || !g_dskip_inside));   /* llms DEC_SKIP: the attention not computed -- its output zero, straight to the post-mix; TWOSPEED: the gate */
+        const int dskip_ffn_half = ok && dskip_half_on(il, 1) && g_dskip_conf_open;   /* llms DSKIP_SPLIT: the FFN half alone -- declared before both gotos, so it is set on every path to the label */
         if (dskip_layer) { ok = elide_zero_copy(active.block, rows); g_dskip_layers++; goto llms_dskip_attn; }
+        if (ok && dskip_half_on(il, 0) && g_dskip_conf_open) { ok = elide_zero_copy(active.block, rows); g_dskip_half_n[0]++; goto llms_dskip_attn; }   /* llms DSKIP_SPLIT: the attention half alone */
         const bool wavefront_now = ({
             /* LLMS_DS4_ANE_DENSE set, VROWS_PRE set, the ANE programs loaded */
             static int on = -1, on_final = 0;   /* llms ANE_T12_BG: a 0 read while the tier loads run on their thread is not final; off, pend is 0 and the first read is final as before */
@@ -48117,6 +48627,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         const bool llms_sp_attn = ok && llms_sp_attn_eligible(g, graphs + base, positions + base, pr, attention_in_pieces ? pr : prefill_rows, il, batch_attn_out_now);
         uint32_t llms_sp_previous = 0;
         ring_attention_try = llms_sp_attn && rope_rows_done && pr <= 16u && !ds4_gpu_llms_alt_off("a2r");   /* ALT a2r (apply_att2ring.py) */   /* llms ATT2_RING */
+        if (ring_attention_try && base != 0u && a2r_base0_on()) { ring_attention_try = 0; a2r_base0_restored++; }   /* llms A2R_BASE0 (apply_a2r_base0.py): the finish reads the ring in place only at base 0 (ROWS_BASE), so piece B takes its snapshot */
         if (llms_sp_attn) ok = ({
             bool inl_ret_llms_sp_attn_snapshot;
             const ds41_gpu_graph *session = graphs[base]; uint32_t start = positions[base]; uint32_t *previous = &llms_sp_previous;
@@ -48292,6 +48803,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) { ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
             if (!ok) fprintf(stderr, "llms batch fail: sum_partial layer %u\n", il); }
         if (ok) ok = dims_zero_apply(active.block, rows, 1u);   /* llms DIMS_ZERO: before the attention's HC post */
+        if (ok) ok = loopsteer_apply(il, 0, active.block, rows);   /* llms LOOPSTEER: the attention block */
+        if (ok) ok = loopsteer_add_apply(il, 0, active.block, rows, positions, count);   /* llms LOOPSTEER_ADD: the attention block (+ LOOPSTEER_FROM) */
         if (ok) dcap_take(il, 2, active.block, rows);   /* llms DIMS_CAP: the attention block */
         ds4_gpu_tensor *const norm_before_slot = active.norm, *const batch_norm_before_slot = g->batch.norm; ds4_gpu_tensor *const lag_slot_view = ok ? ({
             ds4_gpu_tensor *inl_ret_lag_slot_for;
@@ -48308,9 +48821,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             if (!ok) fprintf(stderr, "llms batch fail: after_attention_batch layer %u\n", il); batch_stage("ffn_pre", il, rows); }
         if (ok) dcap_take(il, 3, active.ffn_split, rows);   /* llms DIMS_CAP: the FFN split */
         static int add6_l0 = -1; if (add6_l0 < 0) add6_l0 = getenv("LLMS_DS4_L0_INJECT") != NULL;   /* llms ADD6 v2: L0_INJECT adds into routed after the sum */
-        const int add6_armed = ok && !dskip_layer && !shared_owner && rows <= 4u && g->tp_world <= 1 && !g_elide_ffn_state && g_elide_sweep_layer < 0 && !add6_l0 &&
+        const int add6_armed = ok && !dskip_layer && !dskip_ffn_half && !shared_owner && rows <= 4u && g->tp_world <= 1 && !g_elide_ffn_state && g_elide_sweep_layer < 0 && !add6_l0 &&
                                ds4_gpu_llms_add6_arm(active.routed, active.shared, active.block, rows);   /* llms ADD6 v2: the verify's routed call */
-        if (ok && !dskip_layer) { streaming_rows_step = 1; arm_lag(il); ok = ds41_moe_batch(g, model, l, il, rows, shared_owner); disarm_lag(); streaming_rows_step = 0;
+        if (ok && !dskip_layer && !dskip_ffn_half) { streaming_rows_step = 1; arm_lag(il); ok = ds41_moe_batch(g, model, l, il, rows, shared_owner); disarm_lag(); streaming_rows_step = 0;
             if (!ok) fprintf(stderr, "llms batch fail: moe_batch layer %u\n", il); batch_stage("moe", il, rows); }
         const int add6_fused = add6_armed && ds4_gpu_llms_add6_take();   /* llms ADD6 v2: the G32 sum wrote block = routed + shared */
         if (ok && !lag_slot_view) ok = save_lag_input(g->batch.norm, il, rows);   /* llms LAG; llms LAGSLOT: the slot already holds the FFN norm */
@@ -48326,6 +48839,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         });   /* llms PLAG; llms LAGSLOT: active.norm is where the FFN input is */
         active.norm = norm_before_slot; g->batch.norm = batch_norm_before_slot;   /* llms LAGSLOT: unconditional -- the step frees its own views at its end, never the slot's */
         if (ok && dskip_layer) ok = elide_zero_copy(active.routed, rows) && elide_zero_copy(active.shared, rows);   /* llms DEC_SKIP: the FFN not computed -- its outputs zero */
+        if (ok && dskip_ffn_half) { ok = elide_zero_copy(active.routed, rows) && elide_zero_copy(active.shared, rows); g_dskip_half_n[1]++; }   /* llms DSKIP_SPLIT: the FFN half not computed */
         if (ok) ok =
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
@@ -48333,6 +48847,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = run_late_lag_call(model, l, il, rows, active.block);   /* llms LAG: the lag call of layer il - d, before the bf16 rounding */
         if (ok) ok = run_prefill_lag_call(model, il, rows, active.block);   /* llms PLAG: the prefill lag call of layer il - d */
         if (ok) ok = dims_zero_apply(active.block, rows, 1u);   /* llms DIMS_ZERO: before the FFN's HC post */
+        if (ok) ok = loopsteer_apply(il, 1, active.block, rows);   /* llms LOOPSTEER: the FFN block */
+        if (ok) ok = loopsteer_add_apply(il, 1, active.block, rows, positions, count);   /* llms LOOPSTEER_ADD: the FFN block (+ LOOPSTEER_FROM) */
         if (ok) dcap_take(il, 4, active.block, rows);   /* llms DIMS_CAP: the FFN block */
         if (ok && tail_publish && il + 1u == DS4_N_LAYER) ok = capture_tail_l39(&active, rows, 0);   /* llms TAILFULL (apply_tailfull5.py): the last layer's norm / selected / route_weights / UNROUNDED f per row */
         const bool defer_qa_transition = (rows == 2u || (rows == 3u && k3_hc_on()) || (rows == 4u && k4x_hc_on())) && il + 1u < DS4_N_LAYER &&
@@ -48392,6 +48908,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (!ok || prefill_only) continue;
         ok = ds4_gpu_hc_weighted_sum_tensor(s->x, s->residual, s->pre, DS4_N_EMBD, DS4_N_HC) &&
             ds41_bf16(s->x, DS4_N_EMBD) && ds41_norm(s->norm, s->x, model, weights->output_norm);
+        if (ok) ok = hf_produce(s, s->norm, positions[i]);
         if (ok) ok = batch_logits ?
             ds4_gpu_tensor_copy(g->rows_view[i].norm, 0, s->norm, 0, DS4_N_EMBD * sizeof(float)) :
             (ds41_output_projection(s, s->tp_logits_half ? s->tp_logits_half : s->logits,
@@ -48664,6 +49181,7 @@ static bool ds41_graph_short_prefill_tlimpl(ds41_gpu_graph *g, const ds4_model *
 
     const int sp_tail_x = sp_tail_rows() && append_end > 0u && (uint32_t)g->pos + count + sp_tail_rows() > append_end && !ds4_gpu_llms_alt_off("sptail");   /* llms SP_TAIL: a call reaching the tail -- the listener serves only its suffix rows (CED_SFX, layers 20-39) and <= 4-row calls (apply_exact_tail2.py) */
     if (sp_tail_x) { ds4_gpu_llms_exact_step(1); sp_tail_small_calls++; }
+    const int psr_full = last_layer_to_run == 39;   /* llms PREFILL_SCORE_ROWS: every layer runs for this call's rows */
     bool ok = ds4_gpu_begin_commands() && ds41_graph_step_batch(graphs, tokens,
         (int)count, count, m, w);
     ds4_gpu_llms_set_pad_ok(0);   /* llms SP_PAD */
@@ -48676,6 +49194,31 @@ static bool ds41_graph_short_prefill_tlimpl(ds41_gpu_graph *g, const ds4_model *
     ds4_gpu_llms_set_sp_split(0);   /* llms SP_SPLIT */
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (ok) dcap_flush((uint32_t)count); else dcap_active = 0;   /* llms DIMS_CAP */
+    {   /* llms PREFILL_SCORE_ROWS (apply_prefill_score_rows.py): the row scorer in the shipped short path; off unless set */
+        static int psr = -1; static unsigned long long psr_rows, psr_skip, psr_hc_calls; static double psr_hc_max;
+        if (psr < 0) { const char *e = getenv("LLMS_DS4_PREFILL_SCORE_ROWS"); psr = e && *e && *e != '0';
+            if (psr) { psr_head_rs = 1; fprintf(stderr, "llms: prefill score rows (the short path's rows scored into LLMS_DS4_PREFILL_SCORE; a call's last row skipped; CED encoder-only steps skipped)\n");
+                atexit_b(^{ fprintf(stderr, "llms prefill score rows: %llu rows scored, %llu skipped; head check %llu calls, max |logit diff| %.9g (HEAD_RS %s)\n", psr_rows, psr_skip, psr_hc_calls, psr_hc_max, getenv("LLMS_DS4_HEAD_RS") ? getenv("LLMS_DS4_HEAD_RS") : "unset"); }); } }
+        if (psr && ok) {
+            if (prefill_score_state < 0) { const char *p = getenv("LLMS_DS4_PREFILL_SCORE"); prefill_score_state = 0;
+                if (p && *p) { prefill_score_file = fopen(p, "w"); prefill_score_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float)); prefill_score_state = prefill_score_file && prefill_score_logits; } }
+            if (prefill_score_state == 1) {
+                if (!psr_full) psr_skip += count - 1u;
+                else { const uint32_t p0 = (uint32_t)g->pos - count;
+                    uint32_t first = 0, end = 0;
+                    ok = prefill_score_interval(p0, count - 1u, &first, &end);
+                    for (uint32_t t = first; ok && t < end; t++) { ok = score_prefill_row(g, m, w, g->rows_view[t].residual, g->rows_view[t].ffn_split, p0 + t, tokens[t + 1u], tokens[t]); psr_rows++; }
+                    fflush(prefill_score_file); }
+                fprintf(prefill_score_file, "# call %u %u\n", (unsigned)((uint32_t)g->pos - count), (unsigned)count); fflush(prefill_score_file);   /* llms PREFILL_SCORE_ROWS2: the call's span */
+                if (ok && psr_full) {   /* llms PREFILL_SCORE_ROWS2 HEAD CHECK: the call's last row through the scorer's head against ds41_graph_logits */
+                    static float *ha, *hb; if (!ha) ha = malloc((size_t)DS4_N_VOCAB * sizeof(float)); if (!hb) hb = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+                    if (ha && hb && psr_row_logits(g, m, w, g->rows_view[count - 1u].residual, g->rows_view[count - 1u].ffn_split, ha) && ds41_graph_logits(g, m, w, hb, (uint32_t)g->pos - 1u)) {
+                        double mx_ = 0.0; for (int v = 0; v < DS4_N_VOCAB; v++) { const double d_ = fabs((double)ha[v] - (double)hb[v]); if (d_ != d_) { mx_ = INFINITY; break; } if (d_ > mx_) mx_ = d_; }
+                        if (mx_ > psr_hc_max) psr_hc_max = mx_; psr_hc_calls++; }
+                    else psr_hc_max = INFINITY; }
+            }
+        }
+    }
     l0sw_in_step = 0; if (l0sw_cap_pending) { if (ok) l0sw_flush(); else l0sw_cap_pending = 0; }   /* llms L0_SWAP */
     flush_hidden_dump();   /* llms DSP_HIDDEN_DUMP: the short prefill step's end */
     if (selection_dump_file && selection_dump_count) {   /* llms SEL_DUMP: the step's records, read back after its commands */
@@ -48720,7 +49263,7 @@ static bool rollback_verify_deep(ds41_gpu_graph *g, uint32_t keep, int restore) 
     }
     if (ok && keep == 0u) {
         g->pos = snapshot_position; g->history = snapshot_history;
-        ok = ds4_gpu_tensor_copy(g->residual, 0, snapshot_residual, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
+        ok = hf_select(g, 0u) && ds4_gpu_tensor_copy(g->residual, 0, snapshot_residual, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
              ds4_gpu_tensor_copy(g->pre, 0, snapshot_pre_split, 0, DS4_N_HC * sizeof(float));
     }
     ok = ds4_gpu_end_commands() != 0 && ok;
@@ -48771,7 +49314,7 @@ static bool ds41_graph_verify_rows_q8inner_tlimpl(ds41_gpu_graph *g, const ds4_m
     struct timespec vc0 = {0, 0}; if (verify_log_file) clock_gettime(CLOCK_THREAD_CPUTIME_ID, &vc0); if (verify_log_file) ds4_gpu_llms_fc_arm();   /* llms VSPLIT3 */ const uint32_t vdb0 = verify_log_file ? ds4_gpu_llms_db_polls() : 0u;   /* llms VSPLIT6 */ double ves0 = 0.0, veg0 = 0.0; if (verify_log_file) ds4_gpu_llms_edf_sums(&ves0, &veg0);   /* llms VSPLIT7 */   /* llms VSPLIT2: the main thread's CPU time over the encode */
     verify_all_rows = 1;
     if (chain_half_rows) { last_layer_to_run = 19; suffix_rows_continuing = count - chain_half_rows; }   /* llms CHAIN_HALF: CED_SFX on a verify */
-    bool ok = ds4_gpu_begin_commands() && ({
+    bool ok = ds4_gpu_begin_commands() && hf_begin_verify(g, count) && ({
         bool inl_ret_snapshot_before_verify;
         /* inside the open batch, before the step's writes */
         snapshot_is_valid = 0; pair_capture_on = 0;   /* llms DEEPRB2 */
@@ -48798,6 +49341,7 @@ static bool ds41_graph_verify_rows_q8inner_tlimpl(ds41_gpu_graph *g, const ds4_m
         inl_end_snapshot_before_verify:;
         inl_ret_snapshot_before_verify;
     }) && ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);   /* llms DEEPRB */
+    g->hf_recording = false;   /* Head rows have been enqueued, including the async path. */
     pair_capture_on = 0;   /* llms DEEPRB2 */
     if (chain_half_rows) { last_layer_to_run = 39; suffix_rows_continuing = 0u; }   /* llms CHAIN_HALF */
     verify_all_rows = 0; short_prefill_active = 0; g_dskip_verify = 0; ds4_gpu_llms_set_sp_split(0);
@@ -48857,9 +49401,12 @@ static bool rollback_verify(ds41_gpu_graph *g, uint32_t keep) {   /* llms SPEC_C
     g->pos = verify_start_position + keep;
     g->history = verify_history_after_row[r];
     if (rb_async_now < 0) { g->pos++; return true; }   /* llms RB_SKIP: the canary -- no copies and the position one past the kept row */
-    if (rb_async_now == 2) return true;   /* llms RB_SKIP: the copies are dead */
+    if (rb_async_now == 2) {   /* The old copies remain dead; this new consumer needs its own feature. */
+        if (!hf_on()) return true;
+        return ds4_gpu_begin_commands() && hf_select(g, keep) && ds4_gpu_end_commands();
+    }
     return ds4_gpu_begin_commands() &&   /* llms ROLLBACK_FIX: the copies need an open batch */
-        ds4_gpu_tensor_copy(g->residual, 0, g->rows_view[r].residual, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
+        hf_select(g, keep) && ds4_gpu_tensor_copy(g->residual, 0, g->rows_view[r].residual, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->rows_view[r].ffn_split, 0, DS4_N_HC * sizeof(float)) && (rb_async_now ? ds4_gpu_end_commands_nowait() : ds4_gpu_end_commands());   /* llms RB_ASYNC */
 }
 
@@ -49103,11 +49650,13 @@ __attribute__((constructor)) static void report_raw_restores_at_exit(void) {
 }
 static ds4_gpu_tensor *alloc_drafter_floats(uint64_t floats) { return ds4_gpu_tensor_alloc(floats * sizeof(float)); }
 static uint64_t g_dspb_hist[];
+static uint64_t g_dspb_hist2[8][8];   /* llms BLOCK_HIST2 (apply_block_hist2.py): cycles by (drafts verified, drafts kept) */
 static void report_drafter(void) {
     if (g_dsp.on != 1) return;
     {   /* llms DSP41_BLOCK; llms BLOCK5: every depth 0..5 (5 = DRAFT_BLOCK_MAX, defined below at the drafter buffers; g_dspb_hist has DRAFT_BLOCK_MAX + 2 entries) */
         uint64_t hs = 0; for (int k = 0; k <= 5; k++) hs += g_dspb_hist[k];
         if (hs) { fprintf(stderr, "llms dsp41 block: accepted drafts per cycle 0..5:"); for (int k = 0; k <= 5; k++) fprintf(stderr, " %llu", (unsigned long long)g_dspb_hist[k]); fprintf(stderr, "\n"); }
+        if (hs) { fprintf(stderr, "llms dsp41 block: cycles by drafts verified -> kept:"); for (int a = 1; a <= 5; a++) { uint64_t t2 = 0; for (int k = 0; k <= a; k++) t2 += g_dspb_hist2[a][k]; if (!t2) continue; fprintf(stderr, " %d ->", a); for (int k = 0; k <= a; k++) fprintf(stderr, " %llu", (unsigned long long)g_dspb_hist2[a][k]); fprintf(stderr, ";"); } fprintf(stderr, "\n"); }   /* llms BLOCK_HIST2 */
     }
     const double tok = (double)(g_dsp.cycles + g_dsp.accepts);
     fprintf(stderr, "llms dsp41: %llu cycles (%llu drafted, %llu accepted = %.3f; %llu without a draft, %llu plain steps), %.3f tokens per cycle; "
@@ -49449,6 +49998,13 @@ static bool ringpre_consume_or_push(void) {   /* the drafter batch: the kept row
     ringpre_valid = 0;
     return push_verified_rows_to_ring();
 }
+static int dcrh_safe_state = -1; static uint64_t dcrh_safe_held;   /* llms DCRH_SAFE (apply_dcrh_safe.py) */
+static int dcrh_safe_on(void) {
+    if (dcrh_safe_state < 0) { const char *e = getenv("LLMS_DS4_DCRH_SAFE"); dcrh_safe_state = e && *e == '1';
+        if (dcrh_safe_state) { fprintf(stderr, "llms: dcrh safe (grammar-depth and copy verifies run without DECODE_COROUTE_HARD: a lossy row does not judge a known-true draft)\n");
+            atexit_b(^{ fprintf(stderr, "llms dcrh safe: %llu grammar / copy verifies held unconfined\n", (unsigned long long)dcrh_safe_held); }); } }
+    return dcrh_safe_state;
+}
 static int gd_drain_state = -1; static uint64_t gd_drains, gd_drain_rows, gd_drain_skipped, gd_left_cycles, gd_left_rows, gd_left_pc; static double gd_drain_ms;   /* llms GD_DRAIN (apply_gd_drain.py) */
 static int gd_drain_on(void) {   /* llms GD_DRAIN: 1 drains the drafter's pending rows before a grammar-depth verify; 0 only counts what is left out; unset: neither */
     if (gd_drain_state < 0) { const char *e = getenv("LLMS_DS4_GD_DRAIN"); gd_drain_state = e && *e == '1';
@@ -49631,7 +50187,7 @@ static bool drafter_forward_body_ss(const ds4_model *mm, const ds4_weights *mw, 
         ok = ok && ds41_matmul(g_dsp.rl, m, t->gate_inp, g_dsp.n, false) &&
              (ds4_gpu_llms_router_bias_override(drafter_bank_on ? drafter_bank_router_bias[s] : NULL), true) &&   /* llms DSP41_BANK */
              ds4_gpu_router_select_tensor(g_dsp.sel, g_dsp.rw, g_dsp.probs, m->map, m->size, t->exp_bias->abs_offset, 0, 0, (uint32_t)token,
-                                          DRAFTER_EXPERTS, drafter_topk(), DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, g_dsp.rl) &&
+                                          DRAFTER_EXPERTS, drafter_topk(), (DS4_EXPERT_WEIGHT_SCALE / g_llms_route_gain), 0, 0, true, false, g_dsp.rl) &&
              (ds4_gpu_llms_router_bias_override(NULL), true);
         ds4_gpu_llms_ss_signal(DSS_TAG(5));
         ds4_gpu_llms_ss(0); ds4_gpu_llms_ss_wait(DSS_TAG(4));      /* (E) stream 0, after n: the shared expert */
@@ -49705,7 +50261,7 @@ static bool drafter_forward_body(const ds4_model *mm, const ds4_weights *mw, int
              ds41_matmul(g_dsp.rl, m, t->gate_inp, g_dsp.n, false) &&
              (ds4_gpu_llms_router_bias_override(drafter_bank_on ? drafter_bank_router_bias[s] : NULL), true) &&   /* llms DSP41_BANK */
              ds4_gpu_router_select_tensor(g_dsp.sel, g_dsp.rw, g_dsp.probs, m->map, m->size, t->exp_bias->abs_offset, 0, 0, (uint32_t)token,
-                                          DRAFTER_EXPERTS, drafter_topk(), DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, g_dsp.rl) &&
+                                          DRAFTER_EXPERTS, drafter_topk(), (DS4_EXPERT_WEIGHT_SCALE / g_llms_route_gain), 0, 0, true, false, g_dsp.rl) &&
              (ds4_gpu_llms_router_bias_override(NULL), true) &&
              ds41_matmul(g_dsp.sg, m, t->gate_sh, g_dsp.n, true) && ds41_matmul(g_dsp.su, m, t->up_sh, g_dsp.n, true) &&
              ds4_gpu_swiglu_tensor(g_dsp.sm, g_dsp.sg, g_dsp.su, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) && ds41_bf16(g_dsp.sm, DS4_N_FF_EXP) &&
@@ -49788,6 +50344,13 @@ static uint32_t block_keys_for_row(uint32_t r, uint32_t B) {
     if (!on) return B;
     g_dspb_causal_n++; return r + 1u;
 }
+static uint64_t dspb_shorthead_calls, dspb_shorthead_fallbacks; static int dspb_shorthead_last;   /* llms DSPB_SHORTHEAD */
+static int dspb_shorthead_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("LLMS_DS4_DSPB_SHORTHEAD"); on = e && *e && *e != '0';
+        if (on) { fprintf(stderr, "llms: dspb shorthead (the block drafter's head over the DSP41_SHORT list for each block row; non-members masked -inf on the host)\n");
+                  atexit_b(^{ fprintf(stderr, "llms dspb shorthead: %llu short heads, %llu full-head fallbacks\n", (unsigned long long)dspb_shorthead_calls, (unsigned long long)dspb_shorthead_fallbacks); }); } }
+    return on;
+}
 static bool drafter_forward_block_batched(const ds4_model *mm, const ds4_weights *mw, int token, uint32_t pos, uint32_t B) {   /* llms DSPB_BATCH */
     const uint32_t n_raw = g_dsp.ring_n < DRAFTER_RING_ROWS ? g_dsp.ring_n : DRAFTER_RING_ROWS;
     const uint32_t raw_start = (g_dsp.ring_next + DRAFTER_RING_ROWS * 4u - n_raw) % DRAFTER_RING_ROWS;
@@ -49860,7 +50423,7 @@ static bool drafter_forward_block_batched(const ds4_model *mm, const ds4_weights
             ok = (ds4_gpu_llms_router_bias_override(drafter_bank_on ? drafter_bank_router_bias[s] : NULL), true) &&
                  ds4_gpu_router_select_tensor(BATCHED_BLOCK_VIEW(BB_SEL, r), BATCHED_BLOCK_VIEW(BB_RW, r), BATCHED_BLOCK_VIEW(BB_PROBS, r), m->map, m->size, t->exp_bias->abs_offset, 0, 0,
                                               r == 0 ? (uint32_t)token : (uint32_t)DRAFT_PLACEHOLDER_TOKEN,
-                                              DRAFTER_EXPERTS, DRAFTER_EXPERTS_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, BATCHED_BLOCK_VIEW(BB_RL, r)) &&
+                                              DRAFTER_EXPERTS, DRAFTER_EXPERTS_USED, (DS4_EXPERT_WEIGHT_SCALE / g_llms_route_gain), 0, 0, true, false, BATCHED_BLOCK_VIEW(BB_RL, r)) &&
                  (ds4_gpu_llms_router_bias_override(NULL), true);
         ok = ok && ds41_matmul_batch(BATCHED_BLOCK_BUFFER(BB_SG), m, t->gate_sh, BATCHED_BLOCK_BUFFER(BB_N), B, true) && ds41_matmul_batch(BATCHED_BLOCK_BUFFER(BB_SU), m, t->up_sh, BATCHED_BLOCK_BUFFER(BB_N), B, true) &&
              ds4_gpu_swiglu_tensor(BATCHED_BLOCK_BUFFER(BB_SM), BATCHED_BLOCK_BUFFER(BB_SG), BATCHED_BLOCK_BUFFER(BB_SU), DS4_N_FF_EXP * B, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
@@ -49887,9 +50450,26 @@ static bool drafter_forward_block_batched(const ds4_model *mm, const ds4_weights
              ds41_norm(g_dsp.n, g_dsp.x, m, g_dsp.norm) &&
              ds4_gpu_tensor_copy(g_dspb_n, (uint64_t)r * DS4_N_EMBD * sizeof(float), g_dsp.n, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
     if (ok) {
-        ds4_gpu_llms_q4l_bypass(0);
-        ok = ds41_matmul_batch(g_dspb_logits, mm, mw->output, g_dspb_n, B, false);
-        ds4_gpu_llms_q4l_bypass(1);
+        bool short_done = false;   /* llms DSPB_SHORTHEAD (apply_dspb_shorthead.py): each block row's head over the shortlist */
+        if (dspb_shorthead_on() && load_short_vocab() > 0) {
+            short_done = true;
+            ds4_gpu_llms_q4l_bypass(0);   /* llms DSPB_SHORTHEAD3: the main model's head is in the MAIN dense table; the bypass sends lookups to the drafter's */
+            for (uint32_t r = 0; short_done && r < B; r++) {
+                /* llms DSPB_SHORTHEAD2 (apply_dspb_shorthead2.py): block 1's own buffers -- the row into g_dsp.n, the head into g_dsp.logits, then into the block row */
+                short_done = ds4_gpu_tensor_copy(g_dsp.n, 0, g_dspb_n, (uint64_t)r * DS4_N_EMBD * sizeof(float), (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+                             ds4_gpu_llms_q4l_short(g_dsp.logits, mw->output->abs_offset, (uint32_t)mw->output->dim[0], (uint32_t)mw->output->dim[1], g_dsp.n, short_vocab_ids, short_vocab_size) != 0 &&
+                             ds4_gpu_tensor_copy(g_dspb_logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float), g_dsp.logits, 0, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+                { static int said; if (!short_done && !said) { said = 1; fprintf(stderr, "llms dspb shorthead: the short head refused at block row %u (falls back to the full head)\n", r); } }
+            }
+            ds4_gpu_llms_q4l_bypass(1);   /* llms DSPB_SHORTHEAD3: restored for the rest of the block drafter */
+            if (short_done) dspb_shorthead_calls++; else dspb_shorthead_fallbacks++;
+        }
+        dspb_shorthead_last = short_done;
+        if (!short_done) {
+            ds4_gpu_llms_q4l_bypass(0);
+            ok = ds41_matmul_batch(g_dspb_logits, mm, mw->output, g_dspb_n, B, false);
+            ds4_gpu_llms_q4l_bypass(1);
+        }
     }
     if (!ok) return false;
     ds4_gpu_tensor *l0 = ds4_gpu_tensor_view(g_dspb_logits, 0, (uint64_t)DS4_N_VOCAB * sizeof(float));
@@ -49952,7 +50532,7 @@ static bool drafter_forward_block_body(const ds4_model *mm, const ds4_weights *m
                  (ds4_gpu_llms_router_bias_override(drafter_bank_on ? drafter_bank_router_bias[s] : NULL), true) &&
                  ds4_gpu_router_select_tensor(g_dsp.sel, g_dsp.rw, g_dsp.probs, m->map, m->size, t->exp_bias->abs_offset, 0, 0,
                                               r == 0 ? (uint32_t)token : (uint32_t)DRAFT_PLACEHOLDER_TOKEN,
-                                              DRAFTER_EXPERTS, DRAFTER_EXPERTS_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, g_dsp.rl) &&
+                                              DRAFTER_EXPERTS, DRAFTER_EXPERTS_USED, (DS4_EXPERT_WEIGHT_SCALE / g_llms_route_gain), 0, 0, true, false, g_dsp.rl) &&
                  (ds4_gpu_llms_router_bias_override(NULL), true) &&
                  ds41_matmul(g_dsp.sg, m, t->gate_sh, g_dsp.n, true) && ds41_matmul(g_dsp.su, m, t->up_sh, g_dsp.n, true) &&
                  ds4_gpu_swiglu_tensor(g_dsp.sm, g_dsp.sg, g_dsp.su, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) && ds41_bf16(g_dsp.sm, DS4_N_FF_EXP) &&
@@ -50187,6 +50767,7 @@ static uint64_t ds4_engine_dynamic_expert_cache_bytes(
                                            &per_expert_bytes)) {
         return 0;
     }
+    per_expert_bytes = llms_plan_slot_bytes(per_expert_bytes);   /* llms COMPACT_PLAN */
     if (e->ssd_streaming_cache_experts > UINT64_MAX / per_expert_bytes) {
         return UINT64_MAX;
     }
@@ -52065,6 +52646,24 @@ static bool try_minp_fast_scalar(const float *logits, uint32_t n_vocab, float te
     give_sampler_candidates(cand);
     return true;
 }
+/* llms THINK_HOLD (apply_think_hold.py): while the CLI holds the thinking open, ONE token (the close) is excluded from every draw -- the sampled token and the speculative acceptance -- through a copy of the row with its logit at a -1e30 sentinel; -1 (off) unless the CLI sets it */
+static int llms_ban_tok = -1; static float *llms_ban_row; static uint32_t llms_ban_cap; static unsigned long long llms_ban_rows, llms_ban_live;
+static int llms_ban_wanted; static unsigned long long llms_ban_want_n;   /* llms THINK_CHECK: the close was the row's most likely token */
+int ds4_llms_ban_take_wanted(void) { const int w = llms_ban_wanted; llms_ban_wanted = 0; return w; }
+unsigned long long ds4_llms_ban_wants(void) { return llms_ban_want_n; }
+void ds4_llms_ban_token(int tok) { llms_ban_tok = tok; }
+unsigned long long ds4_llms_ban_rows(void) { return llms_ban_rows; }
+unsigned long long ds4_llms_ban_live(void) { return llms_ban_live; }
+static const float *llms_ban_view(const float *logits, uint32_t n_vocab, float temperature, float min_p) {
+    if (llms_ban_tok < 0 || !logits || (uint32_t)llms_ban_tok >= n_vocab || !is_finite_bits(logits[llms_ban_tok]) || !(logits[llms_ban_tok] > -1.0e29f)) return NULL;   /* the copy itself holds the -1e30 sentinel there: no recursion */
+    if (llms_ban_cap < n_vocab) { free(llms_ban_row); llms_ban_row = malloc((size_t)n_vocab * sizeof(float)); llms_ban_cap = llms_ban_row ? n_vocab : 0; }
+    if (!llms_ban_row) return NULL;
+    memcpy(llms_ban_row, logits, (size_t)n_vocab * sizeof(float));
+    float mx = -INFINITY; for (uint32_t i = 0; i < n_vocab; i++) if (is_finite_bits(logits[i]) && logits[i] > mx) mx = logits[i];
+    llms_ban_rows++; if (temperature > 0.0f && min_p > 0.0f && (logits[llms_ban_tok] - mx) / temperature >= logf(min_p)) llms_ban_live++;   /* the close was a candidate of this draw */
+    if (!(logits[llms_ban_tok] < mx)) { llms_ban_wanted = 1; llms_ban_want_n++; }   /* llms THINK_CHECK: the close was the most likely token -- the model's own stopping point */
+    llms_ban_row[llms_ban_tok] = -1.0e30f; return llms_ban_row;   /* a finite sentinel (the build runs -ffast-math): exp((-1e30 - max) / T) is 0 and min_p drops it */
+}
 static bool sample_build_probabilities(
         const float *logits,
         uint32_t     n_vocab,
@@ -52073,6 +52672,7 @@ static bool sample_build_probabilities(
         float        top_p,
         float        min_p,
         float       *probs) {
+    { const float *llms_bv = llms_ban_view(logits, n_vocab, temperature, min_p); if (llms_bv) return sample_build_probabilities(llms_bv, n_vocab, temperature, top_k, top_p, min_p, probs); }   /* llms THINK_HOLD */
     minp_support_probs = NULL;   /* llms RESID_SPARSE: only a fast build below records a support */
     if (logits && probs && n_vocab && temperature > 0.0f && top_k == 0 && min_p > 0.0f && !ds4_gpu_llms_alt_off("minpf") &&   /* llms MINP_FAST + MINP_VEC (adopted; the switches removed 10-27) */
         (try_minp_vec(logits, n_vocab, temperature, top_p, min_p, probs) || try_minp_fast_scalar(logits, n_vocab, temperature, top_p, min_p, probs))) return true;   /* the min_p superset only: its pass in NEON, the scalar pass where NEON declines */
@@ -52624,6 +53224,7 @@ static int sample_top_p_min_p(
         float        min_p,
         uint64_t    *rng,
         float       *prob_scratch) {
+    { const float *llms_bv = llms_ban_view(logits, n_vocab, temperature, min_p); if (llms_bv) return sample_top_p_min_p(llms_bv, n_vocab, temperature, top_k, top_p, min_p, rng, prob_scratch); }   /* llms THINK_HOLD */
     if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
@@ -77088,6 +77689,7 @@ static void ds4_engine_fit_glm_streaming_budget(
         ds4_streaming_routed_expert_bytes(&e->weights,
                                           &per_expert_bytes) &&
         per_expert_bytes != 0;
+    if (has_routed_experts) per_expert_bytes = llms_plan_slot_bytes(per_expert_bytes);   /* llms COMPACT_PLAN: the memory fit in real slot bytes */
 
     const uint32_t old_full_layers = e->ssd_streaming_full_layers;
     const uint32_t old_cache_experts = e->ssd_streaming_cache_experts;
@@ -79111,6 +79713,7 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
+    if (expert) expert = llms_plan_slot_bytes(expert);   /* llms COMPACT_PLAN 5th site (apply_compact_plan2.py): the V4.1 fit in real slot bytes */
     if (fixed >= budget || (expert && budget - fixed < expert)) {
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
                         "Use --ssd-streaming or a smaller context.\n",
@@ -79309,6 +79912,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (e->backend == DS4_BACKEND_METAL)
         ds4_gpu_set_model_untracked_default(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
 #endif
+    llms_route_gain_apply();   /* llms ROUTE_GAIN: after the validation, before any router call */
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         if (e->ssd_streaming && (e->ssd_streaming_full_layers || e->ssd_streaming_preload_experts)) {
             fprintf(stderr, "ds4: Qwen SSD fills its expert cache on demand; full resident layers "
@@ -82195,8 +82799,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 }
 
 static int forced_id_exists(uint32_t pos);   /* llms IDS_DUMP: defined with FORCE_IDS below */
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+static void llms_copy_release_session(const ds4_session *s);
+#endif
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    llms_copy_release_session(s);
+#endif
     {   /* llms IDS_DUMP (apply_ids_dump.py): every fed token as 'pos id g' (g = 1: forced by LLMS_DS4_FORCE_IDS) */
         const char *dp = getenv("LLMS_DS4_IDS_DUMP");
         if (dp && *dp) { FILE *f = fopen(dp, "w");
@@ -84475,7 +85085,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * still have matching logits before it can be saved or continued. */
         if (pending_logits) {
             const double head_start = phase_log_file ? now_sec() : 0.0;   /* llms PHASE_LOG */
-            const bool head_logits_ok = ds41_graph_logits(g, &e->model, &e->weights, s->logits);
+            const bool head_logits_ok = ds41_graph_logits(g, &e->model, &e->weights, s->logits, g->pos - 1u);
             if (phase_log_file) { const double t1 = now_sec(); phase_head_ms = (t1 - head_start) * 1e3;
                                fprintf(phase_log_file, "S %.6f %.6f %d %.3f %u %.3f %u %.3f\n", sync_start, t1, prompt->len - sync_rows_before, phase_batched_ms, phase_batched_calls, phase_single_ms, phase_single_steps, phase_head_ms); fflush(phase_log_file); }
             if (!head_logits_ok) {
@@ -85752,6 +86362,28 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     return 1;
 }
 
+/* LLMS_DS4_HEAD_FEATURE: 0 means unavailable, never a zero-filled feature.
+ * The caller records missing cases and binds this serial to its cycle ID.
+ * A logical LAZY0 rewind fails the position check until the held token is consumed.
+ */
+int ds4_session_copy_head_input(ds4_session *s, float *out, int cap,
+                                uint32_t *position, uint64_t *serial) {
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_NO_GPU)
+    if (!s || !out || cap < (int)DS4_N_EMBD || !hf_on() ||
+        !ds4_session_is_ds41(s) || !s->checkpoint_valid || !s->ds41_graph_ready ||
+        ds4_gpu_commands_active() || verify_async_pending) return 0;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    if (!g->pos || !g->valid || !g->hf_valid || !g->hf_current ||
+        g->pos != (uint32_t)s->checkpoint.len || g->hf_position + 1u != g->pos) return 0;
+    if (!ds4_gpu_tensor_read(g->hf_current, 0, out, (uint64_t)DS4_N_EMBD * sizeof(float))) return 0;
+    if (position) *position = g->hf_position;
+    if (serial) *serial = g->hf_serial;
+    return (int)DS4_N_EMBD;
+#else
+    (void)s; (void)out; (void)cap; (void)position; (void)serial; return 0;
+#endif
+}
+
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
@@ -86948,6 +87580,7 @@ int ds4_session_llms_scrub_restore(ds4_session *s) {
         ok = ds4_gpu_tensor_copy(g->previous_kv[o], 0, scrub_pair, ((uint64_t)o * 2u + 0u) * 512u * 4u, 512u * 4u) && ds4_gpu_tensor_copy(g->previous_score[o], 0, scrub_pair, ((uint64_t)o * 2u + 1u) * 512u * 4u, 512u * 4u);
     ok = ds4_gpu_end_commands() != 0 && ok;
     if (!ok) { s->checkpoint_valid = false; return 3; }
+    g->hf_valid = g->hf_before_valid = g->hf_recording = false; /* Scrub snapshot does not carry this feature. */
     g->pos = scrub_pos; g->history = scrub_history; ds41_dspark_reset(g->dspark);
     s->checkpoint.len = (int)scrub_pos; s->dspark_rewind_end = 0;
     return 0;
@@ -95047,6 +95680,12 @@ static float draft_threshold(void) {   /* llms DSP41_ADAPT2: the threshold in fo
     return d < 0.5f ? 0.5f : d > 0.97f ? 0.97f : d;
 }
 static int sched_on; static float *sched_verify_cost;   /* llms DSP41_SCHED */
+static float llms_seq2_tau(void) {   /* llms DSP41_SEQ2 (apply_seq2.py): a sequential later draft, gated on the previous draft's probability; 0 = off */
+    static float tau = -1.0f;
+    if (tau < 0.0f) { const char *e = getenv("LLMS_DS4_DSP41_SEQ2"); tau = e && *e ? (float)atof(e) : 0.0f; if (!(tau > 0.0f) || tau > 1.0f) tau = 0.0f;
+        if (tau > 0.0f) fprintf(stderr, "llms: dsp41 seq2 (sampled cycles: a later draft comes from a second one-row drafter pass on the previous draft, when that draft's probability is at least %.3f)\n", (double)tau); }
+    return tau;
+}
 static int draft_block_rows(void) {   /* llms DSP41_BLOCK */
     static int b = -1;
     if (b < 0) { const char *e = getenv("LLMS_DS4_DSP41_BLOCK"); b = e && *e ? atoi(e) : 1; if (b < 1) b = 1; if (b > DRAFT_BLOCK_MAX) b = DRAFT_BLOCK_MAX;
@@ -95130,6 +95769,92 @@ static int sample_block_draft(uint32_t k, const float *raw, int prev, float temp
     return pick;
 }
 static float draft_prob_of(uint32_t k, int tok) { for (uint32_t j = 0; j < g_dspb_cn[k]; j++) if ((int)g_dspb_ci[k][j] == tok) return g_dspb_cq[k][j]; return 0.0f; }
+/* PROPOSAL: LLMS_DS4_HEAD_JOINT=/new/file requires HEAD_FEATURE=1.
+ * Header = 16 little-endian u32 + 2 u64 (80 bytes on supported hosts).
+ * kind 0 begin, 1 sampled result, 2 end. No fields depend on struct padding.
+ * flags: 1 prior z present, 2 fresh drafter n present, 4 forced replay, 8 base logits present.
+ * Result payload: optional z, optional n, then finite base logits, positive q and positive p (id,f32).
+ */
+static FILE *hj_file;
+static int hj_state = -1, hj_n_valid, hj_z_valid, hj_d;
+static uint32_t hj_P, hj_t, hj_zpos;
+static uint64_t hj_cycle, hj_serial;
+static float hj_z[16384], hj_n[16384];
+static uint32_t *hj_lids, hj_nlogits; static float *hj_lvalues; static int hj_base_valid;
+static void hj_close(void) { if (hj_file) { fclose(hj_file); hj_file = NULL; } free(hj_lids); free(hj_lvalues); hj_lids=NULL; hj_lvalues=NULL; }
+static bool hj_write(const void *p, size_t size, size_t count) {
+    return !count || fwrite(p, size, count, hj_file) == count;
+}
+static bool hj_frame(uint32_t kind, int d, int accepted, int result, bool forced,
+                     const float *q, const float *p) {
+    if (hj_state == 0) return true;
+    if (hj_state != 1) return false;
+    uint32_t nq = 0, np = 0;
+    if (kind == 1) for (uint32_t v=0; v<DS4_N_VOCAB; v++) {
+        if (!isfinite(q[v]) || !isfinite(p[v]) || q[v]<0 || p[v]<0) return false;
+        nq += q[v]>0; np += p[v]>0;
+    }
+    const uint32_t flags = (hj_z_valid ? 1u : 0u) | (hj_n_valid ? 2u : 0u) | (forced ? 4u : 0u) | (hj_base_valid ? 8u : 0u);
+    const uint32_t h[16] = {0x48464a32u, kind, hj_P, hj_t, (uint32_t)d,
+        (uint32_t)accepted, flags, DS4_N_EMBD, DS4_N_VOCAB, nq, np,
+        hj_zpos, (uint32_t)result, kind==1 ? hj_nlogits : 0u, 0, 0};
+    const uint64_t ids[2] = {hj_cycle, hj_serial};
+    bool ok = hj_write(h, 4, 16) && hj_write(ids, 8, 2);
+    if (kind == 1) {
+        if (hj_z_valid) ok = ok && hj_write(hj_z, 4, DS4_N_EMBD);
+        if (hj_n_valid) ok = ok && hj_write(hj_n, 4, DS4_N_EMBD);
+        for (uint32_t j=0; ok && j<hj_nlogits; j++)
+            ok = hj_write(&hj_lids[j],4,1) && hj_write(&hj_lvalues[j],4,1);
+        for (uint32_t v=0; ok && v<DS4_N_VOCAB; v++) if (q[v]>0)
+            ok = hj_write(&v,4,1) && hj_write(&q[v],4,1);
+        for (uint32_t v=0; ok && v<DS4_N_VOCAB; v++) if (p[v]>0)
+            ok = hj_write(&v,4,1) && hj_write(&p[v],4,1);
+    }
+    return ok;
+}
+static bool hj_begin(ds4_session *s, uint32_t P, int t) {
+    if (hj_state < 0) {
+        const char *path = getenv("LLMS_DS4_HEAD_JOINT"); hj_state=0;
+        if (path && *path && strcmp(path,"0")) {
+            if (!hf_on() || DS4_N_EMBD>16384u) { hj_state=-2; return false; }
+            hj_file=fopen(path,"wbx");
+            if (!hj_file) { hj_state=-2; return false; }
+            hj_lids=malloc((size_t)DS4_N_VOCAB*sizeof(uint32_t)); hj_lvalues=malloc((size_t)DS4_N_VOCAB*sizeof(float));
+            if (!hj_lids || !hj_lvalues) { hj_close(); hj_state=-2; return false; }
+            hj_state=1; atexit(hj_close);
+        }
+    }
+    if (!hj_state) return true;
+    if (hj_state!=1) return false;
+    hj_cycle++; hj_P=P; hj_t=(uint32_t)t; hj_n_valid=0; hj_d=-1;
+    hj_serial=0; hj_zpos=UINT32_MAX; hj_nlogits=0; hj_base_valid=0;
+    hj_z_valid=ds4_session_copy_head_input(s,hj_z,16384,&hj_zpos,&hj_serial)==(int)DS4_N_EMBD;
+    if (hj_z_valid && (!P || hj_zpos+1u!=P)) return false;
+    return hj_frame(0,-1,-1,0,false,NULL,NULL) && fflush(hj_file)==0 && !ferror(hj_file);
+}
+static bool hj_snapshot(const ds4_gpu_tensor *n, const float *logits, uint32_t P, int d) {
+    if (!hj_state) return true;
+    if (hj_state!=1 || hj_P!=P) return false;
+    hj_d=d; hj_n_valid=ds4_gpu_tensor_read(n,0,hj_n,(uint64_t)DS4_N_EMBD*sizeof(float))!=0;
+    for (uint32_t v=0; v<DS4_N_VOCAB; v++) {
+        if (isnan(logits[v]) || logits[v]==INFINITY) return false;
+        if (isfinite(logits[v])) { hj_lids[hj_nlogits]=v; hj_lvalues[hj_nlogits++]=logits[v]; }
+    }
+    hj_base_valid=1;
+    return true; /* Missing feature is an observation, not a fabricated zero. */
+}
+static bool hj_result(uint32_t P, int t, int d, int accepted, bool forced,
+                      const float *q, const float *p) {
+    if (!hj_state) return true;
+    if (hj_state!=1 || hj_P!=P || hj_t!=(uint32_t)t) return false;
+    if (hj_d!=d) { hj_n_valid=0; hj_base_valid=0; hj_nlogits=0; }
+    return hj_frame(1,d,accepted,0,forced,q,p);
+}
+static bool hj_end(int result) {
+    if (!hj_state) return true;
+    return hj_frame(2,-1,-1,result,false,NULL,NULL) && fflush(hj_file)==0 && !ferror(hj_file);
+}
+
 static FILE *dcc_file; static int dcc_state = -1, dcc_valid; static uint32_t dcc_pos; static int dcc_d; static float dcc_n[16384], dcc_chk[16384];   /* llms DCOCO_CAPTURE (fixed size: DS4_N_EMBD is a runtime shape value; guarded <= 16384 at use) */
 static uint64_t dcc_records, dcc_checked, dcc_equal, dcc_missed;
 static int dcoco_capture_on(void) {
@@ -95182,6 +95907,138 @@ void ds4_session_set_draft_hint_seq(ds4_session *s, const int *tokens, int n) {
     if (grammar_depth_mode() == 2) grammar_hint_tokens[1] = 13;
     grammar_hint_count = n; grammar_hint_position = (int64_t)s->checkpoint.len; grammar_hints_received++;
 }
+/* llms COPY_PROPOSAL: complete request-local index, off unless explicitly set.
+ * This source candidate reuses the existing verifier's allocated <=9 rows.
+ * It is not a proof of native logit/state equivalence or a measured speed gain. */
+#include "ds4_copy_index.h"
+_Static_assert(DRAFTER_CAPTURE_ROWS == 9 && SNAPSHOT_ROWS == 8,
+               "copy binding must be reviewed if native row capacities change");
+static ci_index *llms_copy_index;
+static const ds4_session *llms_copy_owner;
+static int llms_copy_state=-1, llms_copy_depth=8;
+static int llms_copy_current_cycle;
+static uint64_t llms_copy_calls, llms_copy_offers, llms_copy_cycles;
+static uint64_t llms_copy_proposed, llms_copy_accepted, llms_copy_rebuilds;
+static uint64_t llms_copy_declines, llms_copy_budget_declines, llms_copy_preemptions;
+static size_t llms_copy_limit=64u*1024u*1024u;
+static size_t llms_copy_peak_allocation;
+
+static void llms_copy_report(void) {
+    if (!llms_copy_state) return;
+    fprintf(stderr,"llms copy: calls %llu offers %llu cycles %llu proposed %llu accepted %llu rebuilds %llu declines %llu budget_declines %llu adapt_preemptions %llu; peak index demand %zu bytes; no-copy width unchanged\n",
+        (unsigned long long)llms_copy_calls,(unsigned long long)llms_copy_offers,
+        (unsigned long long)llms_copy_cycles,(unsigned long long)llms_copy_proposed,
+        (unsigned long long)llms_copy_accepted,(unsigned long long)llms_copy_rebuilds,
+        (unsigned long long)llms_copy_declines,(unsigned long long)llms_copy_budget_declines,
+        (unsigned long long)llms_copy_preemptions,
+        llms_copy_peak_allocation);
+    ci_destroy(llms_copy_index);llms_copy_index=NULL;llms_copy_owner=NULL;
+}
+
+static int llms_copy_on(void) {
+    if (llms_copy_state>=0) return llms_copy_state;
+
+    const char *e=getenv("LLMS_DS4_COPY_PROPOSAL");
+    llms_copy_state=e && *e && strcmp(e,"0");
+    if (!llms_copy_state) return 0;
+    const char *d=getenv("LLMS_DS4_COPY_DEPTH");
+    if (d && *d) {
+        char *end=NULL;long v=strtol(d,&end,10);
+        if (!end || *end || v<1 || v>=DRAFTER_CAPTURE_ROWS) {
+            fprintf(stderr,"llms copy: invalid depth '%s'; allocated capture supports 1..%d drafts; copy disabled\n",d,DRAFTER_CAPTURE_ROWS-1);
+            llms_copy_state=0;return 0;
+        }
+        llms_copy_depth=(int)v;
+    }
+    if (llms_copy_depth>=DRAFTER_CAPTURE_ROWS) {llms_copy_state=0;return 0;}
+    const char *b=getenv("LLMS_DS4_COPY_BYTES");
+    if (b && *b) {
+        char *end=NULL;errno=0;unsigned long long v=strtoull(b,&end,10);
+        if (*b=='-' || errno || !end || *end || !v || v>SIZE_MAX) {
+            fprintf(stderr,"llms copy: invalid allocation budget '%s'; copy disabled\n",b);
+            llms_copy_state=0;return 0;
+        }
+        llms_copy_limit=(size_t)v;
+    }
+    atexit(llms_copy_report);
+    fprintf(stderr,"llms: copy proposal on, complete committed history, depth %d, index allocation limit %zu bytes; direct target draws, native binding under test\n",llms_copy_depth,llms_copy_limit);
+    return 1;
+}
+
+static void llms_copy_release_session(const ds4_session *s) {
+    if (llms_copy_owner!=s) return;
+    ci_destroy(llms_copy_index);llms_copy_index=NULL;llms_copy_owner=NULL;
+}
+
+/* Reconcile actual checkpoint contents, not just pointer identity or length.
+ * This handles same-length rewrite, restore, rewind and appended tool context.
+ * The full comparison is O(context); its native cost remains to be measured.
+ * The first input t is already selected by the caller, but not yet evaluated.
+ * It enters provisionally; the next reconciliation follows the actual checkpoint
+ * if this call fails or the caller keeps only a prefix. Speculative copies never
+ * enter here merely because they were offered. */
+static uint32_t llms_copy_prepare(ds4_session *s, uint32_t P, int t,
+                                 int max_tokens, int acc_cap, int eos,
+                                 int *drafts, uint32_t draft_capacity) {
+    if (!llms_copy_on()) return 0;
+    llms_copy_calls++;
+    dry_init();
+    if (!s || !s->checkpoint_valid || !drafts || !draft_capacity || t<0 ||
+        t>=(int)DS4_N_VOCAB || t==eos || s->ctx_size<=1 ||
+        max_tokens<2 || acc_cap<2 || P!=(uint32_t)s->checkpoint.len ||
+        P>=(uint32_t)s->ctx_size || ds4_gpu_commands_active() ||
+        dry_state>0 || next_bias_tok>=0) {llms_copy_declines++;return 0;}
+    const char *force=getenv("LLMS_DS4_DSP41_FORCE");
+    if (force && (!strcmp(force,"junk") || !strcmp(force,"nodraft") || !strcmp(force,"bare"))) {
+        llms_copy_declines++;return 0;
+    }
+    uint32_t limit=(uint32_t)llms_copy_depth;
+    if (limit>draft_capacity) limit=draft_capacity;
+    if (limit>(uint32_t)max_tokens-1u) limit=(uint32_t)max_tokens-1u;
+    if (limit>(uint32_t)acc_cap-1u) limit=(uint32_t)acc_cap-1u;
+    if (limit>(uint32_t)s->ctx_size-P-1u) limit=(uint32_t)s->ctx_size-P-1u;
+    if (!limit) {llms_copy_declines++;return 0;}
+    if (llms_copy_owner!=s || !llms_copy_index || llms_copy_index->capacity!=(uint32_t)s->ctx_size) {
+        ci_destroy(llms_copy_index);llms_copy_index=NULL;llms_copy_owner=NULL;
+        static const uint32_t all_lengths[]={16,32,64,128,256};
+        size_t count=0;
+        while (count<sizeof(all_lengths)/sizeof(all_lengths[0]) && all_lengths[count]<(uint32_t)s->ctx_size) count++;
+        if (!count) {llms_copy_declines++;return 0;}
+        const int rc=ci_create(&llms_copy_index,(uint32_t)s->ctx_size,all_lengths,count,
+                               (uint32_t)llms_copy_depth,llms_copy_limit,0);
+        if (rc!=CI_OK) {llms_copy_budget_declines++;return 0;}
+        llms_copy_owner=s;
+        if (llms_copy_index->allocation_bytes>llms_copy_peak_allocation)
+            llms_copy_peak_allocation=llms_copy_index->allocation_bytes;
+    }
+    ci_index *ix=llms_copy_index;
+    uint32_t common=ix->length<P ? ix->length : P;
+    uint32_t matched=0;
+    for (;matched<common;matched++)
+        if (s->checkpoint.v[matched]<0 || ix->tokens[matched]!=(uint32_t)s->checkpoint.v[matched]) break;
+    if (matched<ix->length) {
+        if (ci_truncate(ix,matched)!=CI_OK) {llms_copy_release_session(s);llms_copy_declines++;return 0;}
+        llms_copy_rebuilds++;
+    }
+    for (uint32_t i=matched;i<P;i++) {
+        const int tok=s->checkpoint.v[i];
+        if (tok<0 || tok>=(int)DS4_N_VOCAB || ci_append(ix,(uint32_t)tok)!=CI_OK) {
+            llms_copy_release_session(s);llms_copy_declines++;return 0;
+        }
+    }
+    if (ci_append(ix,(uint32_t)t)!=CI_OK) {llms_copy_release_session(s);llms_copy_declines++;return 0;}
+    ci_proposal proposal={0};
+    if (ci_propose(ix,limit,&proposal)!=CI_OK) {llms_copy_release_session(s);llms_copy_declines++;return 0;}
+    uint32_t n=0;
+    for (;n<proposal.count;n++) {
+        const uint32_t tok=proposal.tokens[n];
+        if (tok>=DS4_N_VOCAB || (int)tok==eos) break;
+        drafts[n]=(int)tok;
+    }
+    if (n) llms_copy_offers++;
+    return n;
+}
+
 static uint32_t grammar_proposal_length(const ds4_session *s, uint32_t P, int t, int max_tokens, int acc_cap, int eos, float temp) {
     /* llms GDPRE: the ONE eligibility predicate of a grammar-depth proposal at position P -- tag, greedy, EOS, DSP41_FORCE, capacity,
        context, vocabulary; returns the proposal length (>= 2) or 0. Used by the ADAPT gate and by the LOOKUP block that consumes it. */
@@ -95208,6 +96065,7 @@ static int preenc_state = -1; static uint64_t preenc_made, preenc_used, preenc_m
 
 static int preenc_on(void) {
     if (preenc_state < 0) { const char *e = getenv("LLMS_DS4_DSP_PREENC"); preenc_state = e && *e && *e != '0' && !getenv("LLMS_DS4_DSP41_DUMP");
+        if (preenc_state && strstr(e, "lpm0") && llms_low_power_mode()) { preenc_state = 0; fprintf(stderr, "llms: low power mode on -- the drafted verify is synchronous by default, so the thinking cap applies in every layer (LLMS_DS4_DSP_PREENC=%s)\n", e); }   /* llms LPM_SYNC_VERIFY (apply_lpm_preenc.py): the value '1lpm0' = the async verify on, and off while the Mac is in Low Power Mode; a plain '0' / '1' is unchanged */
         if (preenc_state) { fprintf(stderr, "llms: dsp preenc (the next drafter batch encoded for both outcomes during the verify's last wait; the matching one committed after the acceptance)\n");
             atexit_b(^{ uint64_t a = 0, b = 0, cc = 0; ds4_gpu_llms_preenc_counts(&a, &b, &cc);
                 fprintf(stderr, "llms dsp preenc: %llu pairs encoded, %llu used; not used: no pair %llu, state %llu, shortlist %llu, path %llu, encode %llu, commit inside %llu; buffers made %llu, run %llu, dropped %llu\n",
@@ -95246,9 +96104,10 @@ static int speculative_cycle(ds4_session *s, int t, int max_tokens, int eos, flo
     { static int learn_n = -1, learn_seen; if (learn_n < 0) { const char *e = getenv("LLMS_DS4_FIXSET_LEARN"); learn_n = e && atoi(e) > 0 ? atoi(e) : 0; }   /* llms FIXSET_LEARN */
       if (learn_n && learn_seen <= learn_n) { if (learn_seen++ == learn_n) { extern void ds4_gpu_llms_fixset_learn_end(int); ds4_gpu_llms_fixset_learn_end(learn_n); } } }
     { extern void ds4_gpu_llms_round_soft_cycle(void); ds4_gpu_llms_round_soft_cycle(); }   /* llms ROUND_SOFT: a no-op unless set */
-    const double tc = now_sec(); cycle_was_drafted = 0;
+    const double tc = now_sec(); cycle_was_drafted = 0; llms_copy_current_cycle = 0;
     void ds4_gpu_llms_decode_cycle(int on); ds4_gpu_llms_decode_cycle(1);   /* MAINWFE reads it: inside a decode cycle (was the bridge's flag; the bridge cut 10-26) */
     const uint32_t cycle_position = (uint32_t)s->checkpoint.len;   /* llms PHASE_LOG */
+    if (!hj_begin(s, cycle_position, t)) { snprintf(err, errlen, "head joint: begin failed"); return -1; }
     extern uint64_t ds4_gpu_llms_stream_misses(void); const uint64_t cycle_misses_start = phase_log_file && phase_log_file != (FILE *)1 ? ds4_gpu_llms_stream_misses() : 0;   /* llms PHASE_LOG: + the cycle's installs */
     const uint64_t drafts_before = g_dsp.drafts;   /* llms BGATE */
     const int n = speculative_cycle_body(s, t, max_tokens, eos, temp, top_k, top_p, min_p, rng, acc, acc_cap, err, errlen);
@@ -95259,15 +96118,16 @@ static int speculative_cycle(ds4_session *s, int t, int max_tokens, int eos, flo
         for (int i = 0; i < n && i < 8 && k < (int)sizeof ids - 16; i++) k += snprintf(ids + k, sizeof ids - (size_t)k, "%s%d", i ? "," : "", acc[i]);
         fprintf(phase_log_file, "C %.6f %u %d %.3f %d %s %llu\n", t1, cycle_position, n, (t1 - tc) * 1e3, cycle_was_drafted, ids, (unsigned long long)(ds4_gpu_llms_stream_misses() - cycle_misses_start)); fflush(phase_log_file); }
     ds4_gpu_llms_decode_cycle(0);
+    if (!hj_end(n)) { snprintf(err, errlen, "head joint: end failed"); return -1; }
     if (n > 0) next_call_position = (uint32_t)s->checkpoint.len;   /* llms DSP41_WARM: where the next call should start */
-    if (n > 0 && cycle_was_drafted && adapt_by_rate()) {
+    if (n > 0 && cycle_was_drafted && !llms_copy_current_cycle && adapt_by_rate()) {
         const double ms = (now_sec() - tc) * 1e3;
         if (rate_tokens_per_cycle_average > 0.0) { rate_cycle_ms_average = 0.9 * rate_cycle_ms_average + 0.1 * ms; rate_tokens_per_cycle_average = 0.9 * rate_tokens_per_cycle_average + 0.1 * (double)n; }
         else { rate_cycle_ms_average = ms; rate_tokens_per_cycle_average = (double)n; }
     }
     return n;
 }
-static int think_k_val = -1; static uint64_t think_k_steps, think_k_seen; static uint32_t think_scan_len; static int think_inside;   /* llms THINK_K (apply_think_k.py) */
+static int think_k_val = -1; static uint64_t think_k_steps, think_k_seen; static uint32_t think_scan_len; static int think_inside; static int think_k_until = -1; static uint32_t think_open_at; static uint64_t think_k_until_freed;   /* llms THINK_K_UNTIL (apply_think_k_until.py) */   /* llms THINK_K (apply_think_k.py) */
 
 static uint32_t think_k_cap(const ds4_session *s, int t) {   /* LLMS_DS4_THINK_K=K: inside <think> ... </think> every verify row keeps at most K routed picks; ALT thk */
     if (think_k_val < 0) { const char *e = getenv("LLMS_DS4_THINK_K"); think_k_val = e && *e ? atoi(e) : 0; if (think_k_val < 1 || think_k_val > 5) think_k_val = 0;
@@ -95276,16 +96136,45 @@ static uint32_t think_k_cap(const ds4_session *s, int t) {   /* LLMS_DS4_THINK_K
     if (!think_k_val) return 0u;
     const int *cv = s->checkpoint.v; const uint32_t cn = (uint32_t)s->checkpoint.len;
     if (cn < think_scan_len) { think_scan_len = 0; think_inside = 0; }   /* a rewind or a new session: rescan from the start */
-    for (; think_scan_len < cn; think_scan_len++) { const int v = cv[think_scan_len]; if (v == 128821) think_inside = 1; else if (v == 128822) think_inside = 0; }
-    int inside = think_inside; if (t == 128821) inside = 1; else if (t == 128822) inside = 0;   /* the step's own input token */
+    for (; think_scan_len < cn; think_scan_len++) { const int v = cv[think_scan_len]; if (v == 128821) { think_inside = 1; think_open_at = think_scan_len; } else if (v == 128822) think_inside = 0; }
+    int inside = think_inside; if (t == 128821) { inside = 1; think_open_at = cn; } else if (t == 128822) inside = 0;   /* the step's own input token; llms THINK_K_UNTIL: where the span opened */
     g_dskip_inside = inside;   /* llms TWOSPEED */
     think_k_seen++;
-    if (!inside || ds4_gpu_llms_alt_off("thk")) return 0u;
+    if (ds4_gpu_llms_alt_off("thk")) return 0u;
+    if (!inside) {   /* llms OUT_K (apply_out_k.py): a cap on verify rows OUTSIDE thinking spans only */
+        static int out_k = -1; static uint64_t out_k_steps;
+        if (out_k < 0) { const char *e = getenv("LLMS_DS4_OUT_K"); out_k = e && *e ? atoi(e) : 0; if (out_k < 1 || out_k > 5) out_k = 0;
+            if (out_k) { fprintf(stderr, "llms: out k %d (outside thinking spans every verify row keeps at most %d routed picks) -- FIDELITY DIAL\n", out_k, out_k);
+                atexit_b(^{ fprintf(stderr, "llms out k: %llu verifies capped outside thinking spans\n", (unsigned long long)out_k_steps); }); } }
+        if (!out_k) return 0u;
+        out_k_steps++; return (uint32_t)out_k;
+    }
+    if (think_k_until < 0) { const char *e = getenv("LLMS_DS4_THINK_K_UNTIL"); think_k_until = e && *e ? atoi(e) : 0; if (think_k_until < 0) think_k_until = 0;   /* llms THINK_K_UNTIL */
+        if (think_k_until) { fprintf(stderr, "llms: think k until %d (the thinking cap applies only to a span's first %d tokens; past them a verify is uncapped)\n", think_k_until, think_k_until);
+            atexit_b(^{ fprintf(stderr, "llms think k until: %llu verifies inside thinking left uncapped past the limit\n", (unsigned long long)think_k_until_freed); }); } }
+    if (think_k_until && cn - think_open_at >= (uint32_t)think_k_until) { think_k_until_freed++; return 0u; }
     think_k_steps++; return (uint32_t)think_k_val;
+}
+
+static int llms_block_out_on = -1; static uint64_t llms_block_out_in, llms_block_out_out;   /* llms BLOCK_OUT (apply_block_out.py) */
+static int llms_block_out_inside(const ds4_session *s, int t) {   /* 1 when the switch is on and this cycle starts inside a thinking span: the block path is not offered there */
+    static uint32_t scan_len; static int inside_now;
+    if (llms_block_out_on < 0) { const char *e = getenv("LLMS_DS4_DSP41_BLOCK_OUT"); llms_block_out_on = e && *e && *e != '0';
+        if (llms_block_out_on) { fprintf(stderr, "llms: block out (the block drafter is offered only outside thinking spans; inside them a cycle keeps one draft)\n");
+            atexit_b(^{ fprintf(stderr, "llms block out: %llu cycles inside thinking kept at one draft, %llu outside offered the block\n", (unsigned long long)llms_block_out_in, (unsigned long long)llms_block_out_out); }); } }
+    if (!llms_block_out_on) return 0;
+    const int *cv = s->checkpoint.v; const uint32_t cn = (uint32_t)s->checkpoint.len;
+    if (cn < scan_len) { scan_len = 0; inside_now = 0; }
+    for (; scan_len < cn; scan_len++) { const int v = cv[scan_len]; if (v == 128821) inside_now = 1; else if (v == 128822) inside_now = 0; }
+    int inside = inside_now; if (t == 128821) inside = 1; else if (t == 128822) inside = 0;
+    if (inside) llms_block_out_in++; else llms_block_out_out++;
+    return inside;
 }
 static int llms_block_cap_on = -1, llms_sched_fix_on = -1;   /* llms DEPTH_FIX (apply_depth_fix.py) */
 static int llms_block_cap(void) { if (llms_block_cap_on < 0) { const char *e_ = getenv("LLMS_DS4_BLOCK_CAP"); llms_block_cap_on = e_ && *e_ && *e_ != '0'; if (llms_block_cap_on) fprintf(stderr, "llms: block cap (a deeper-block verify inside a thinking span keeps at most THINK_K routed picks a row, as the block-1 verify does; inert unless THINK_K is set) -- FIDELITY DIAL\n"); } return llms_block_cap_on; }
 static int llms_sched_fix(void) { if (llms_sched_fix_on < 0) { const char *e_ = getenv("LLMS_DS4_SCHED_FIX"); llms_sched_fix_on = e_ && *e_ && *e_ != '0'; if (llms_sched_fix_on) fprintf(stderr, "llms: sched fix (the verify-cost update is clamped to 2 x the estimate; every 16th scheduled cycle runs the shortest verify so a shallow length refreshes)\n"); } return llms_sched_fix_on; }
+static int llms_sched_k0_on = -1; static uint64_t llms_sched_k0_cycles, llms_sched_k0_zero;   /* llms SCHED_K0 (apply_sched_k0.py): the scheduler may choose zero drafts */
+static int llms_sched_k0(void) { if (llms_sched_k0_on < 0) { const char *e_ = getenv("LLMS_DS4_SCHED_K0"); llms_sched_k0_on = e_ && *e_ && *e_ != '0'; if (llms_sched_k0_on) { fprintf(stderr, "llms: sched k0 (the verify-length scheduler may drop the draft: a one-row verify when its expected tokens a ms win)\n"); atexit_b(^{ fprintf(stderr, "llms sched k0: %llu scheduled cycles, %llu at zero drafts\n", (unsigned long long)llms_sched_k0_cycles, (unsigned long long)llms_sched_k0_zero); }); } } return llms_sched_k0_on; }
 static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos, float temp, int top_k, float top_p, float min_p,
                                  uint64_t *rng, int *acc, int acc_cap, char *err, size_t errlen) {
     if (ledger_layer_on()) ds4_gpu_llms_set_ledger_tag(2, 1, 41);   /* llms LEDGER_LAYER: the drafter cycle: the draft phase until the verify's layer loop */
@@ -95293,12 +96182,15 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
     ds41_gpu_graph *g = &s->ds41_graph;
     const uint32_t P = (uint32_t)s->checkpoint.len;
     const size_t vb = (size_t)DS4_N_VOCAB * sizeof(float);
+    int copy_dr[DRAFTER_CAPTURE_ROWS - 1];
+    const uint32_t copy_nd = llms_copy_prepare(s, P, t, max_tokens, acc_cap, eos,
+                                                copy_dr, DRAFTER_CAPTURE_ROWS - 1);
     last_step_multirow = 0;   /* llms the k-row step's rewind */
     if (adapt_by_rate()) {   /* llms DSP41_RATE */
         rate_calls_seen++;
         bool plain = rate_plain_ms_average > 0.0 ? (rate_tokens_per_cycle_average > 0.0 && rate_plain_ms_average < rate_cycle_ms_average / rate_tokens_per_cycle_average) : (rate_calls_seen == 5u || rate_calls_seen == 6u);
         if (rate_plain_ms_average > 0.0 && rate_calls_seen % 16u == 0u) plain = !plain;
-        if (plain) {
+        if (plain && !copy_nd) {
             const double tp = now_sec();
             g_dsp.last_step_rewindable = 0; plain_steps_taken++;
             inside_plain_step = 1; plain_step_feeds_drafter = 1;
@@ -95327,7 +96219,7 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
             bool near = (did >= 0 && t == did) || (t == tml && n >= 2 && v[n - 1] == tds && v[n - 2] == bar);
             for (int i = n - 1; !near && i >= 0 && i >= n - dw; i--)
                 near = (did >= 0 && v[i] == did) || (bar >= 0 && v[i] == bar && i + 2 < n + 1 && ((i + 1 < n ? v[i + 1] : t) == tds) && ((i + 2 < n ? v[i + 2] : (i + 2 == n ? t : -1)) == tml));
-            if (!near) {
+            if (!near && !copy_nd) {
                 g_dsp.last_step_rewindable = 0; plain_steps_taken++; dsml_plain++;
                 inside_plain_step = 1; plain_step_feeds_drafter = 1;
                 const int rc = ds4_session_eval(s, t, err, errlen);
@@ -95348,9 +96240,10 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
         const int warm = threshold_controller_on() && P < warm_window_end;
         const bool gd_has = grammar_proposal_length(s, P, t, max_tokens, acc_cap, eos, temp) >= 2u && !ds4_gpu_llms_alt_off("gdepth");   /* llms GDPRE  */
         const bool gd_pre = gd_has && !ds4_gpu_llms_alt_off("gdpre");   /* ALT 'gdpre': the pre-emption off per step (measurement) */
-        int gd_preempted = 0; if (gd_has) grammar_gate_eligible++;
+        int gd_preempted = 0, copy_preempted = 0; if (gd_has) grammar_gate_eligible++;
         if (th > 0.0f && (warm || (draft_acceptance_average < th && (++plain_steps_since_probe % gap) != 0u))) {
           if (gd_pre) { grammar_gate_preempted++; gd_preempted = 1; }   /* llms GDPRE: the eligible grammar proposal pre-empts the plain return */
+          else if (copy_nd) { llms_copy_preemptions++; copy_preempted = 1; }
           else {
             if (gd_has) grammar_gate_bypassed++;
             const double tp = now_sec();
@@ -95364,8 +96257,8 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
             acc[0] = t; return 1;
           }
         }
-        this_cycle_is_probe = !gd_preempted && th > 0.0f && draft_acceptance_average < th;   /* llms GDPRE: a pre-empted step is not a probe */
-        if (!gd_preempted && th > 0.0f && draft_acceptance_average < th) probe_cycles_taken++;
+        this_cycle_is_probe = !gd_preempted && !copy_preempted && th > 0.0f && draft_acceptance_average < th;   /* llms GDPRE: a pre-empted step is not a probe */
+        if (!gd_preempted && !copy_preempted && th > 0.0f && draft_acceptance_average < th) probe_cycles_taken++;
     }
     raw_restore_pending = 0;   /* llms DSP41_RESRAW */
     if (held_token >= 0) { held_token = -1; held_token_misses++; s->checkpoint_valid = false;   /* llms DSP41_LAZY0 */
@@ -95389,7 +96282,7 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
     turn_t_enc = turn_t_gpu = turn_t_read = 0.0;   /* llms TURN_LOG */
     { extern unsigned long long ds4_gpu_llms_altw_offmask(void); turn_dr_off = ds4_gpu_llms_altw_offmask(); }   /* llms SKIPG3: the drafter is encoded under this step's ALTW bits */
     {   /* llms GRAMMAR_DEPTH: the DSML grammar's fixed tokens as the drafts of one k-row verify (exact chain acceptance; rollback on rejection) */
-        int dr[8]; uint32_t nd = 0;
+        int dr[8]; uint32_t nd = 0; bool copy_now = false;
         if (grammar_hint_count >= 2) {
             if (grammar_hint_position != (int64_t)P) grammar_hints_stale++;
             else {   /* llms GDPRE: the ONE predicate (grammar_proposal_length), the same proposal the ADAPT gate saw */
@@ -95401,13 +96294,19 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
             }
             grammar_hint_count = 0;
         }
+        if (!nd && copy_nd) {
+            copy_now = true; llms_copy_current_cycle = 1; nd = copy_nd;
+            memcpy(dr, copy_dr, (size_t)nd * sizeof(*dr));
+            llms_copy_cycles++; llms_copy_proposed += nd; dsml_hint_token = -1;
+        }
         if (nd > 0) {
+            if (copy_now) preenc_release_all();
             int toks[9]; toks[0] = t; for (uint32_t k = 0; k < nd; k++) toks[k + 1] = dr[k];
             const uint32_t kr = nd + 1u;
             cycle_was_drafted = 1; g_dsp.cycles--;   /* not a DSpark cycle in its counters */
             if (drafter_test_arm == 0 && (g_dsp.pend_rows || prompt_capture_to > prompt_capture_from)) {   /* llms GD_DRAIN : the ring before the capture is reused */
                 if (gd_drain_on() && ds4_gpu_commands_active()) gd_drain_skipped++;   /* an open batch is not ours to close: counted, left alone */
-                else if (gd_drain_on()) {
+                else if (copy_now || gd_drain_on()) {
                     const double gt0 = now_sec(); const uint32_t gr0 = g_dsp.pend_rows + (prompt_capture_to - prompt_capture_from);
                     ds4_gpu_llms_q4l_bypass(1);
                     bool okd = ds4_gpu_begin_commands() != 0 && (ringpre_on() ? ringpre_consume_or_push() : push_verified_rows_to_ring());
@@ -95423,30 +96322,41 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
                 } else { gd_left_cycles++; gd_left_rows += g_dsp.pend_rows; gd_left_pc += prompt_capture_to - prompt_capture_from; }
             }
             const double lt1 = now_sec();
-            const uint32_t half_rows_now = chain_half_cycle(P, dr, nd, kr);   /* llms CHAIN_HALF */
-            const uint32_t lean_rows_now = half_rows_now ? nd : ({
+            const uint32_t half_rows_now = copy_now ? 0u : chain_half_cycle(P, dr, nd, kr);   /* llms CHAIN_HALF */
+            const uint32_t lean_rows_now = copy_now ? 0u : (half_rows_now ? nd : ({
                 /* LLMS_DS4_EROWD_GD=1: grammar-fixed drafts ride decoder-lean rows, accepted without their rows' logits */
                 static int on = -1;
                 if (on < 0) { const char *e = getenv("LLMS_DS4_EROWD_GD"); on = e && *e == '1';
                               if (on) { fprintf(stderr, "llms: EROWD_GD (grammar-fixed drafts emitted on decoder-lean rows) -- FIDELITY DIAL\n");
                                         atexit_b(^{ fprintf(stderr, "llms erowd gd: %llu grammar cycles lean, %llu lean rows\n", (unsigned long long)lean_draft_cycles, (unsigned long long)lean_draft_rows); }); } }
                 (int)(on);
-            }) && !ds4_gpu_llms_alt_off("erowdgd") ? nd : 0u;   /* llms EROWD_GD: rows 0 .. nd-1 lean */
+            }) && !ds4_gpu_llms_alt_off("erowdgd") ? nd : 0u);   /* llms EROWD_GD: rows 0 .. nd-1 lean */
             if (lean_rows_now) { lean_draft_cycles++; lean_draft_rows += lean_rows_now; }
             ds4_gpu_llms_erowd_rows(half_rows_now ? 0u : lean_rows_now); chain_half_rows = half_rows_now;   /* llms CHAIN_HALF */
             capture_drafter_streams = 1; captured_stream_rows = 0;
+            const int dcrh_held_now = dcrh_safe_on(); if (dcrh_held_now) { ds4_gpu_llms_dcrh_hold(1); dcrh_safe_held++; }   /* llms DCRH_SAFE */
             const bool vok = ds41_graph_verify_rows(g, &e->model, &e->weights, toks, kr, g_dsp.row_logits);
+            if (dcrh_held_now) ds4_gpu_llms_dcrh_hold(0);   /* llms DCRH_SAFE */
             capture_drafter_streams = 0; chain_half_rows = 0;
             ds4_gpu_llms_erowd_rows(0);
             g_dsp.verify_ms += (now_sec() - lt1) * 1e3;
             if (!vok || captured_stream_rows != kr - half_rows_now) { s->checkpoint_valid = false; snprintf(err, errlen, "grammar depth: the verify step failed at position %u", P); return -1; }
             token_vec_push(&s->checkpoint, t); g_dsp.last_step_rewindable = 0; acc[0] = t;
-            uint32_t i = 1;
+            uint32_t i = 1; int copy_correction = -1;
             for (; i <= nd; i++) {
                 const float *row = g_dsp.row_logits + (size_t)(i - 1u) * DS4_N_VOCAB;
                 if (!(i <= lean_rows_now)) dump_lp_row(P + i, row, &s->checkpoint);   /* llms FORCE_LPDUMP: lean rows skipped */
                 bool accept;
-                if (half_rows_now) accept = true;   /* llms CHAIN_HALF: these rows carry no logits */
+                if (copy_now) {
+                    const int draw = forced_id_exists(P + i) ? forced_id_at(P + i) :
+                        sample_top_p_min_p(row, DS4_N_VOCAB, temp, top_k, top_p, min_p, rng, s->sample_probs);
+                    if (draw < 0 || draw >= (int)DS4_N_VOCAB) {
+                        s->checkpoint_valid = false; snprintf(err, errlen, "copy: target draw failed at %u", P + i); return -1;
+                    }
+                    accept = draw == dr[i - 1];
+                    if (!accept) copy_correction = draw;
+                }
+                else if (half_rows_now) accept = true;   /* llms CHAIN_HALF: these rows carry no logits */
                 else if (temp <= 0.0f) accept = sample_argmax(row, DS4_N_VOCAB) == dr[i - 1];
                 else {
                     if (!sample_build_probabilities(row, DS4_N_VOCAB, temp, top_k, top_p, min_p, s->sample_probs)) { s->checkpoint_valid = false; snprintf(err, errlen, "grammar depth: target failed"); return -1; }
@@ -95454,9 +96364,10 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
                     accept = pd >= 1.0f || sample_rng_f32(rng) < pd;   /* q = delta(d): accept with probability p(d) */
                 }
                 if (i <= lean_rows_now) accept = true;   /* llms EROWD_GD: a grammar-fixed draft on a lean row */
-                if (forced_id_exists(P + i)) accept = forced_id_at(P + i) == dr[i - 1];   /* llms FORCE_IDS (17:3x): the decision overridden after the shipped code ran */
+                if (!copy_now && forced_id_exists(P + i)) accept = forced_id_at(P + i) == dr[i - 1];   /* llms FORCE_IDS (17:3x): the decision overridden after the shipped code ran */
                 if (!accept) break;
-                token_vec_push(&s->checkpoint, dr[i - 1]); acc[i] = dr[i - 1]; grammar_tokens_accepted++;
+                token_vec_push(&s->checkpoint, dr[i - 1]); acc[i] = dr[i - 1];
+                if (copy_now) llms_copy_accepted++; else grammar_tokens_accepted++;
             }
             const uint32_t keep = i;
             if (half_rows_now && keep != kr) { s->checkpoint_valid = false; snprintf(err, errlen, "chain half: a rejection on a half step at %u", P); return -1; }   /* llms CHAIN_HALF: chain_half_cycle rules it out */
@@ -95470,9 +96381,13 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
                 snapshot_is_valid = 1;   /* llms the k-row step's rewind: the snapshot stays usable for a smaller keep */
                 const float *row = g_dsp.row_logits + (size_t)(keep - 1u) * DS4_N_VOCAB;
                 if (temp <= 0.0f) memcpy(s->logits, row, vb);
-                else {   /* residual max(p - delta(d), 0): p with the rejected token removed */
-                    memcpy(g_dsp.res, s->sample_probs, vb); g_dsp.res[dr[keep - 1u]] = 0.0f;
-                    const int r = sample_probabilities(g_dsp.res, DS4_N_VOCAB, rng);
+                else {   /* Copy already drew its correction; grammar draws the exclusion residual. */
+                    int r;
+                    if (copy_now) r = copy_correction;
+                    else {
+                        memcpy(g_dsp.res, s->sample_probs, vb); g_dsp.res[dr[keep - 1u]] = 0.0f;
+                        r = sample_probabilities(g_dsp.res, DS4_N_VOCAB, rng);
+                    }
                     if (r < 0) { s->checkpoint_valid = false; snprintf(err, errlen, "grammar depth: the residual draw failed at %u", P); return -1; }
                     for (uint32_t v = 0; v < DS4_N_VOCAB; v++) s->logits[v] = -INFINITY;
                     s->logits[r] = 0.0f;
@@ -95483,7 +96398,7 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
         }
     }
     int d = -1;
-    if (draft && draft_block_rows() >= 2 && (!block_gate_streak_needed() || block_gate_streak >= (uint32_t)block_gate_streak_needed()) && max_tokens >= 3 && acc_cap >= 3 && (int)P + 4 <= s->ctx_size) {   /* llms BGATE */   /* llms DSP41_BLOCK */
+    if (draft && draft_block_rows() >= 2 && !llms_block_out_inside(s, t) && (!block_gate_streak_needed() || block_gate_streak >= (uint32_t)block_gate_streak_needed()) && max_tokens >= 3 && acc_cap >= 3 && (int)P + 4 <= s->ctx_size) {   /* llms BGATE */   /* llms DSP41_BLOCK */
         static FILE *dsp41_block_log_file = (FILE *)1; if (dsp41_block_log_file == (FILE *)1) { const char *p = getenv("LLMS_DS4_DSP41_BLOG"); dsp41_block_log_file = p && *p ? fopen(p, "w") : NULL; }
         uint32_t B = (uint32_t)draft_block_rows(); if ((int)B + 1 > max_tokens) B = (uint32_t)max_tokens - 1u; if ((int)B + 1 > acc_cap) B = (uint32_t)acc_cap - 1u;
         if (block_gate_streak_needed() && B >= 3u && block_gate_streak < 2u * (uint32_t)block_gate_streak_needed()) B = 2u;   /* llms BGATE v2: block 3 only after 2S fully accepted cycles in a row */
@@ -95494,7 +96409,8 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
         ok = ok && ds4_gpu_begin_commands() != 0 && push_verified_rows_to_ring();
         for (uint32_t q0 = prompt_capture_from; ok && q0 < prompt_capture_to; q0 += ring_load_chunk_rows()) { const uint32_t nq = prompt_capture_to - q0 < ring_load_chunk_rows() ? prompt_capture_to - q0 : ring_load_chunk_rows(); ok = load_drafter_ring(prompt_capture_ring, 1, q0, nq); }   /* llms DSP41_RING */
         if (prompt_capture_to > prompt_capture_from) prompt_capture_fills++;
-        ok = ok && drafter_forward_block(&e->model, &e->weights, t, P, B);
+        if (ok && dspb_shorthead_on() && load_short_vocab()) { scan_short_vocab_context(&s->checkpoint); add_to_short_vocab(t); }   /* llms DSPB_SHORTHEAD: the context's ids are in the list BEFORE the short head runs */
+        ok = ok && drafter_forward_block(&e->model, &e->weights, t, P, llms_seq2_tau() > 0.0f && temp > 0.0f ? 1u : B);   /* llms DSP41_SEQ2: one row; later drafts come from their own passes */
         ds4_gpu_llms_q4l_bypass(0);
         ok = ds4_gpu_end_commands() != 0 && ok;
         if (ok) ok = ds4_gpu_tensor_read(g_dspb_logits, 0, g_dspb_hl, (uint64_t)B * DS4_N_VOCAB * sizeof(float)) != 0;
@@ -95503,7 +96419,7 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
             if (dspb_short_state < 0) { const char *e = getenv("LLMS_DS4_DSPB_SHORT"); dspb_short_state = e && *e && *e != '0';
                           if (dspb_short_state) { fprintf(stderr, "llms: dspb short (the block rows' logits -inf outside DSP41_SHORT's V', as block 1's head)\n");
                                     atexit_b(^{ fprintf(stderr, "llms dspb short: %llu masked block cycles\n", (unsigned long long)dspb_short_cycles); }); } }
-            if (ok && dspb_short_state && load_short_vocab()) {
+            if (ok && (dspb_short_state || dspb_shorthead_last) && load_short_vocab()) {   /* llms DSPB_SHORTHEAD: a short head leaves stale non-members -- the mask is required */
                 scan_short_vocab_context(&s->checkpoint);
                 add_to_short_vocab(t);
                 for (uint32_t r = 0; r < B; r++) { float *row = g_dspb_hl + (size_t)r * DS4_N_VOCAB; for (uint32_t v = 0; v < DS4_N_VOCAB; v++) if (!short_vocab_member[v]) row[v] = -INFINITY; }
@@ -95523,6 +96439,37 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
             g_dspb_c1[k] = 0.0f;   /* EROWD_CAL: a path that does not compute the value leaves 0 */
             float *raw = g_dspb_hl + (size_t)k * DS4_N_VOCAB;
             if (eos >= 0 && eos < (int)DS4_N_VOCAB) raw[eos] = -INFINITY;
+            if (llms_seq2_tau() > 0.0f && temp > 0.0f) {   /* llms DSP41_SEQ2: the sequential later draft */
+                static uint64_t seq2_passes, seq2_gate_stops, seq2_fail; static int seq2_exit_line;
+                if (!seq2_exit_line) { seq2_exit_line = 1; atexit_b(^{ fprintf(stderr, "llms dsp41 seq2: %llu second passes, %llu cycles stopped by the gate, %llu failed passes\n", (unsigned long long)seq2_passes, (unsigned long long)seq2_gate_stops, (unsigned long long)seq2_fail); }); }
+                const float seq2_prev_q = k == 1u ? g_dsp.qp[dr[0]] : draft_prob_of(k - 1u, dr[k - 1]);
+                if (!(seq2_prev_q >= llms_seq2_tau())) { seq2_gate_stops++; break; }
+                ds4_gpu_llms_q4l_bypass(1);
+                bool seq2_ok = load_markov_row(dr[k - 1]) && ds4_gpu_begin_commands() != 0 && drafter_forward_block(&e->model, &e->weights, dr[k - 1], P + k, 1u);
+                ds4_gpu_llms_q4l_bypass(0);
+                seq2_ok = ds4_gpu_end_commands() != 0 && seq2_ok;
+                if (seq2_ok) seq2_ok = ds4_gpu_tensor_read(g_dspb_logits, 0, raw, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+                if (!seq2_ok) { seq2_fail++; break; }
+                if (eos >= 0 && eos < (int)DS4_N_VOCAB) raw[eos] = -INFINITY;
+                seq2_passes++;
+                uint32_t seq2_ci[64]; float seq2_cv[64]; uint32_t seq2_n = 0;
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+                    const float x = raw[v]; if (!(x > -INFINITY)) continue;
+                    if (seq2_n < 64u) { uint32_t j = seq2_n++; while (j > 0 && seq2_cv[j - 1] < x) { seq2_cv[j] = seq2_cv[j - 1]; seq2_ci[j] = seq2_ci[j - 1]; j--; } seq2_cv[j] = x; seq2_ci[j] = v; }
+                    else if (x > seq2_cv[63]) { uint32_t j = 63; while (j > 0 && seq2_cv[j - 1] < x) { seq2_cv[j] = seq2_cv[j - 1]; seq2_ci[j] = seq2_ci[j - 1]; j--; } seq2_cv[j] = x; seq2_ci[j] = v; }
+                }
+                if (seq2_n == 0u) break;
+                uint32_t seq2_mm = seq2_n; if (top_k > 0 && (uint32_t)top_k < seq2_mm) seq2_mm = (uint32_t)top_k;
+                double seq2_w[64], seq2_tot = 0.0; for (uint32_t j = 0; j < seq2_mm; j++) { seq2_w[j] = exp((double)(seq2_cv[j] - seq2_cv[0]) / temp); seq2_tot += seq2_w[j]; }
+                uint32_t seq2_keep = 0; double seq2_cum = 0.0;
+                for (uint32_t j = 0; j < seq2_mm; j++) { if (j > 0 && min_p > 0.0f && seq2_w[j] < seq2_w[0] * min_p) break; seq2_cum += seq2_w[j]; seq2_keep = j + 1; if (top_p > 0.0f && top_p < 1.0f && seq2_cum / seq2_tot >= top_p) break; }
+                double seq2_r = (double)sample_rng_f32(rng) * seq2_cum; int seq2_pick = (int)seq2_ci[seq2_keep - 1];
+                for (uint32_t j = 0; j < seq2_keep; j++) { g_dspb_ci[k][j] = seq2_ci[j]; g_dspb_cq[k][j] = (float)(seq2_w[j] / seq2_cum); }
+                g_dspb_cn[k] = seq2_keep;
+                for (uint32_t j = 0; j < seq2_keep; j++) { seq2_r -= seq2_w[j]; if (seq2_r <= 0.0) { seq2_pick = (int)seq2_ci[j]; break; } }
+                if (seq2_pick >= 0 && seq2_pick != eos) dr[nd++] = seq2_pick;
+                continue;
+            }
             {   /* llms DSPB_FULLMK2 (apply_fullmk2.py): the full-vocabulary Markov on the GPU (greedy) */
                 static int dspb_fullmk_state = -1; static float *dspb_fullmk_value; static uint64_t dspb_fullmk_calls;
                 if (dspb_fullmk_state < 0) { const char *fe = getenv("LLMS_DS4_DSPB_FULLMK"); dspb_fullmk_state = fe && !strcmp(fe, "2") ? 2 : fe && !strcmp(fe, "3") ? 3 : 0;   /* llms DSPB_FULLMK3: 3 = sampled cycles too */
@@ -95599,6 +96546,7 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
             if (sched_on && nd >= 1u) {
                 const float dms_now = (float)((now_sec() - t0) * 1e3); dcost = 0.8f * dcost + 0.2f * dms_now;
                 float surv = 1.0f, E = 1.0f, best_v = -1.0f; uint32_t best = 1;
+                if (llms_sched_k0()) { best = 0u; best_v = 1.0f / (dcost + vcost[1]); llms_sched_k0_cycles++; }   /* llms SCHED_K0: the one-row verify as a candidate */
                 for (uint32_t k = 1; k <= nd; k++) {
                     const float c = k == 1u ? (temp > 0.0f ? g_dsp.qp[dr[0]] : draft_argmax_prob(g_dsp.ql, dr[0])) : draft_prob_of(k - 1u, dr[k - 1]);   /* llms GSCHED */
                     surv *= c > 0.0f ? (c < 1.0f ? c : 1.0f) : 0.0f; E += surv;
@@ -95607,7 +96555,7 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
                 }
                 { static uint32_t gsched_cycle_counter; const uint32_t nd0 = nd; nd = best; if (sc == 2 && best < nd0 && ((++gsched_cycle_counter & 15u) == 0u)) nd = nd0;
                   { static uint32_t gfix_counter; if (llms_sched_fix() && nd > 1u && ((++gfix_counter & 15u) == 0u)) nd = 1u; } }   /* llms GSCHED: every 16th cycle the deep length, so its cost refreshes; llms SCHED_FIX: and every 16th the shortest, so a shallow length refreshes too */
-                hist[nd]++;
+                hist[nd]++; if (nd == 0u) llms_sched_k0_zero++;   /* llms SCHED_K0 */
             }
             sched_verify_cost = vcost;
         }
@@ -95696,12 +96644,34 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
             token_vec_push(&s->checkpoint, dr[i - 1]); acc[i] = dr[i - 1]; g_dsp.accepts++;
         }
         const uint32_t keep = i;   /* rows kept: t and the accepted drafts */
+        {   /* llms BLOCK_DUMP (apply_block_dump.py): every proposal of a sampled block cycle with its target rows, before the correction */
+            static int bd_state = -1; static FILE *bd_file; static uint64_t bd_written, bd_skip_short, bd_skip_sched, bd_skip_lean, bd_skip_forced, bd_skip_greedy, bd_skip_full, bd_max = 400;
+            if (bd_state < 0) { const char *e = getenv("LLMS_DS4_BLOCK_DUMP"); const char *m = getenv("LLMS_DS4_BLOCK_DUMP_MAX"); if (m && *m) bd_max = strtoull(m, NULL, 10);
+                if (e && *e) { char pth[1200]; snprintf(pth, sizeof pth, "%s.%d", e, (int)getpid()); bd_file = fopen(pth, "wb"); }
+                bd_state = bd_file != NULL;
+                if (bd_state) { fprintf(stderr, "llms: block dump (every sampled block cycle of two or more drafts: its proposals and target rows, at most %llu records)\n", (unsigned long long)bd_max);
+                    atexit_b(^{ fprintf(stderr, "llms block dump: %llu cycles written; skipped: fewer than two drafts %llu, scheduler %llu, lean drafts %llu, forced %llu, greedy %llu, past the cap %llu\n",
+                                        (unsigned long long)bd_written, (unsigned long long)bd_skip_short, (unsigned long long)bd_skip_sched, (unsigned long long)bd_skip_lean, (unsigned long long)bd_skip_forced,
+                                        (unsigned long long)bd_skip_greedy, (unsigned long long)bd_skip_full); if (bd_file) fclose(bd_file); }); } }
+            if (bd_state) {
+                int bd_forced = 0; for (uint32_t k = 1; k <= nd; k++) if (forced_id_exists(P + k)) bd_forced = 1;
+                if (nd < 2u) bd_skip_short++; else if (sched_on) bd_skip_sched++; else if (unverified_lean_drafts) bd_skip_lean++; else if (bd_forced) bd_skip_forced++; else if (temp <= 0.0f) bd_skip_greedy++;
+                else if (bd_written >= bd_max) bd_skip_full++;
+                else {
+                    struct { uint32_t magic, pos, nd, keep; float temp, top_p, min_p; int32_t top_k; int32_t dr[8]; float q[8]; } h; memset(&h, 0, sizeof h);
+                    h.magic = 0x424C4B44u; h.pos = P; h.nd = nd; h.keep = keep; h.temp = temp; h.top_p = top_p; h.min_p = min_p; h.top_k = (int32_t)top_k;
+                    for (uint32_t k = 0; k < nd && k < 8u; k++) { h.dr[k] = dr[k]; h.q[k] = k == 0u ? g_dsp.qp[dr[0]] : draft_prob_of(k, dr[k]); }
+                    fwrite(&h, sizeof h, 1, bd_file); fwrite(g_dsp.row_logits, sizeof(float), (size_t)(nd + 1u) * DS4_N_VOCAB, bd_file); bd_written++;
+                }
+            }
+        }
         if (conf_hidden_ok && confidence_log) {   /* llms DSPB_CONF: 'P nd keep conf_1 .. conf_nd' */
             fprintf(confidence_log, "%u %u %u", P, nd, keep);
             for (uint32_t k = 0; k < nd; k++) fprintf(confidence_log, " %.5f", eval_confidence(k, k == 0 ? t : dr[k - 1], conf_hidden_rows));
             fprintf(confidence_log, "\n"); fflush(confidence_log);
         }
         g_dspb_hist[keep - 1u < DRAFT_BLOCK_MAX + 1u ? keep - 1u : DRAFT_BLOCK_MAX + 1u]++;
+        g_dspb_hist2[nd < 8u ? nd : 7u][keep - 1u < 8u ? keep - 1u : 7u]++;   /* llms BLOCK_HIST2 */
         g_dsp.pend_rows = keep; g_dsp.pend_pos = P;
         {   /* llms BLK_REWIND (apply_blk_rewind.py): rewindable like a LOOKUP step -- the row logits before any overwrite, the step registered */
             if (!last_step_row_logits) last_step_row_logits = malloc((size_t)DRAFTER_CAPTURE_ROWS * DS4_N_VOCAB * sizeof(float));
@@ -95804,6 +96774,10 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
                 if (d >= 0 && dsp_corr_on()) d = dsp_corr_apply(rng, d);   /* llms DSP_CORR */
             }
             if (d == eos || (temp > 0.0f && d >= 0 && !(g_dsp.qp[d] > 0.0f))) d = -1;
+            { static int fdr = -1; static uint64_t fdr_n;   /* llms FORCE_DRAFT (apply_force_draft.py): in a forced replay the drafter's proposal is replaced by the forced id, so every arm runs the same verify rows -- an INSTRUMENT */
+              if (fdr < 0) { const char *e_ = getenv("LLMS_DS4_FORCE_DRAFT"); fdr = e_ && *e_ && *e_ != '0'; if (fdr) { fprintf(stderr, "llms: force draft (the drafter's proposal is replaced by the forced id where one exists -- an INSTRUMENT for forced replays)\n"); atexit_b(^{ fprintf(stderr, "llms force draft: %llu proposals replaced\n", (unsigned long long)fdr_n); }); } }
+              if (fdr && forced_id_exists(P + 1u)) { d = forced_ids[P + 1u]; fdr_n++; } }
+            if (d >= 0 && temp > 0.0f && !hj_snapshot(g_dsp.n, g_dsp.ql, P, d)) { snprintf(err, errlen, "head joint: snapshot failed"); return -1; }
             if (dcoco_capture_on() && d >= 0 && temp > 0.0f && DS4_N_EMBD <= 16384u) { dcc_valid = ds4_gpu_tensor_read(g_dsp.n, 0, dcc_n, (uint64_t)DS4_N_EMBD * sizeof(float)) ? 1 : 0; dcc_pos = P; dcc_d = d; }   /* llms DCOCO_CAPTURE (1) */
             if (bank_shadow_on && d >= 0 && temp > 0.0f) {   /* llms DSP41_SHADOW: the bank on the identical state */
                 ds4_gpu_llms_q4l_bypass(1);
@@ -95831,6 +96805,13 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
       if (split_q_timing_on && d >= 0) { split_q_ms_sum += (now_sec() - g_dsp_split_t3) * 1e3; split_q_cycles++; } }   /* llms DSP41_SPLIT */
     g_dsp.draft_ms += (now_sec() - t0) * 1e3;
     const double t1 = now_sec();
+    {   /* llms DRAFT_MINQ (apply_draft_minq.py): a sampled draft under the probability floor is not verified */
+        static float minq = -1.0f; static uint64_t minq_seen, minq_dropped;
+        if (minq < 0.0f) { const char *e_ = getenv("LLMS_DS4_DRAFT_MINQ"); minq = e_ && *e_ ? (float)atof(e_) : 0.0f; if (minq < 0.0f || minq > 1.0f) minq = 0.0f;
+            if (minq > 0.0f) { fprintf(stderr, "llms: draft minq (a sampled draft with q under %.3f is dropped before the verify: a one-row step)\n", (double)minq);
+                               atexit_b(^{ fprintf(stderr, "llms draft minq: %llu sampled drafts seen, %llu dropped\n", (unsigned long long)minq_seen, (unsigned long long)minq_dropped); }); } }
+        if (minq > 0.0f && d >= 0 && temp > 0.0f) { minq_seen++; if (g_dsp.qp[d] < minq) { d = -1; minq_dropped++; } }
+    }
     const int toks[2] = { t, d };
     const uint32_t k = d >= 0 ? 2u : 1u;
     if (d >= 0) g_dsp.drafts++; else g_dsp.no_draft++;
@@ -95846,9 +96827,12 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
                                 atexit_b(^{ fprintf(stderr, "llms gtopk: %llu of %llu drafted verifies capped\n", (unsigned long long)gtopk_on, (unsigned long long)gtopk_n); }); } }
         uint32_t gcap = 0;
         if (gtopk_state && d >= 0) { gtopk_n++; const float pc = temp > 0.0f ? g_dsp.qp[d] : draft_argmax_prob(g_dsp.ql, d); if (pc >= gtopk_t) { gcap = gtopk_k; gtopk_on++; } }
+        static int gtopk_row0 = -1; uint32_t gcap_row0 = 0;   /* llms GTOPK_ROW0 (apply_gtopk_row0.py): the gate's cap goes to the verify's first row only */
+        if (gtopk_row0 < 0) { const char *e_ = getenv("LLMS_DS4_GTOPK_ROW0"); gtopk_row0 = e_ && *e_ && *e_ != '0'; if (gtopk_row0) fprintf(stderr, "llms: gtopk row0 (the confidence gate's cap applies to the verify's first row only; the second row keeps the step's cap) -- FIDELITY DIAL\n"); }
+        if (gtopk_row0) { gcap_row0 = gcap; gcap = 0; }
         { const uint32_t tk = think_k_cap(s, t); if (tk && (!gcap || tk < gcap)) gcap = tk; }   /* llms THINK_K: a thinking span's verify keeps at most K picks */
-        ds4_gpu_llms_gtopk_step(gcap);
-        if (g_escalate) { ds4_gpu_llms_gtopk_step(0); ds4_gpu_llms_exact_step(1); g_esc_steps++; }   /* llms ESCALATE: this verify on the router's six, no cap */
+        ds4_gpu_llms_gtopk_step(gcap); if (gcap_row0) ds4_gpu_llms_gtopk_row0(gcap_row0);
+        if (g_escalate) { ds4_gpu_llms_gtopk_step(0); ds4_gpu_llms_exact_step(1); g_esc_steps++; }   /* llms ESCALATE: this verify on the router's six, no cap (the step call also ends GTOPK_ROW0's cap) */
 
         {   /* llms UCAP_GATE (apply_ucap_gate.py): the verify's union cap from the drafter's entropy (sampled drafts only) */
             static int ucap_gate_state = -1; static float ucap_gate_entropy_low, ucap_gate_entropy_high; static uint32_t ucap_gate_cap_low, ucap_gate_cap_high; static uint64_t ucap_gate_verifies, ucap_gate_capped_low, ucap_gate_capped_high, ucap_gate_entropy_histogram[12];
@@ -96182,6 +97166,7 @@ static int speculative_cycle_body(ds4_session *s, int t, int max_tokens, int eos
             if (dcoco_probe_file) fprintf(dcoco_probe_file, "%u %u %d %.6f %.6f %.6f\n", P, supp, qT > 0.0 ? 1 : 0, A, As, pC);
         }
     }
+    if (temp > 0.0f && d >= 0 && !hj_result(P,t,d,(int)accept,forced_id_exists(P+1u),g_dsp.qp,s->sample_probs)) { snprintf(err,errlen,"head joint: result failed"); return -1; }
     if (dcoco_capture_on() && temp > 0.0f && d >= 0) {   /* llms DCOCO_CAPTURE (2): the record, at the acceptance */
         if (!(dcc_valid && dcc_pos == P && dcc_d == d)) dcc_missed++;
         else {

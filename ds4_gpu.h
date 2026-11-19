@@ -442,7 +442,9 @@ int ds4_gpu_llms_hc_pre_fused_rows(ds4_gpu_tensor *split, ds4_gpu_tensor *xo, ds
     uint32_t pre_stride, ds4_gpu_tensor *mixo, const void *model_map, uint64_t model_size, uint64_t fn_off, uint64_t scale_off, uint64_t base_off, uint64_t nw_off,
     uint32_t n_embd, uint32_t n_hc, uint32_t iters, float rms_eps, float hc_eps, int flags, uint32_t rows);   /* llms HCF_ROWS */
 void ds4_gpu_llms_q4l_bypass(int on);   /* llms DSP41 */
+void ds4_gpu_llms_dcrh_hold(int on);   /* llms DCRH_SAFE: 1 holds DECODE_COROUTE_HARD off until 0 */
 void ds4_gpu_llms_erowd_rows(uint32_t n);   /* llms EROWD: rows < n of the next verify are decoder-lean (layers >= 20) */
+void ds4_gpu_llms_gtopk_row0(uint32_t k);   /* llms GTOPK_ROW0: the next verify's FIRST row keeps at most k routed picks (0 = off); cleared by every gtopk_step call */
 void ds4_gpu_llms_gtopk_step(uint32_t k);   /* llms GTOPK: the next verify's rows keep at most k routed picks (0 = off) */
 void ds4_gpu_llms_ucap_step(uint32_t k);
 void ds4_gpu_llms_route_class(int noncall);   /* llms UCAP_CLASS */

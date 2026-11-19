@@ -1,19 +1,55 @@
 # ds4-m1
 
-**DeepSeek V4.1 Flash 1017 on one 64 GB M1 Max: 48 tok/s decode · 343 tok/s prefill in coding-agent work (one-shot prose: 27-32 tok/s).**
+**DeepSeek V4.1 Flash 1017 on one 64 GB M1 Max: 41 tok/s decode · 313 tok/s prefill at a 1,045 MHz GPU clock (39 / 299 per GHz) · 595 tokens and 17.9 s per solved coding task.**
 
 [antirez/ds4](https://github.com/antirez/ds4) with Metal kernels, Neural Engine programs, SSD expert streaming and a trained speculative drafter
 for a 64-GB Apple Silicon Mac. The whole model runs: all 384 routed experts, the Engram tables, thinking and tool calls. The experts stream from
 the SSD into a 38 GiB cache; everything else stays in memory. **Model files: [ivp5/DeepSeek-V4.1-Flash-1017-ds4m1](https://huggingface.co/ivp5/DeepSeek-V4.1-Flash-1017-ds4m1)** on Hugging Face.
 
-## 1. Download the model (287 GB)
+## Update 2026-11-19: fewer tokens per solved task, and the loop fixes
+
+This update replaces the 2026-11-08 build. It is slower per token and faster per solved task, because it writes fewer tokens:
+
+| | 2026-11-08 | **2026-11-19** |
+|---|---:|---:|
+| Coding-agent tasks solved (15 tasks, one process) | 15 / 15 | **15 / 15** |
+| Tokens per solved task | 822 | **595** (x0.72) |
+| Seconds per solved task | 20.1 | **17.9** (x0.89) |
+| Decode | 48.4 tok/s at 1,061 MHz (45.6 per GHz) | 41.1 tok/s at 1,045 MHz (39.3 per GHz) |
+| Prefill | 342.6 tok/s at 1,061 MHz (322.9 per GHz) | 312.5 tok/s at 1,045 MHz (299.0 per GHz) |
+
+The absolute rates move with the GPU clock, which the machine's heat and power target set; the per-GHz figures are the ones to compare between runs.
+On 10 freshly generated bug-fix tasks (three from harder modules) the agent solved 10 of 10 at 108.6 s and 2,369 tokens per solution, with no loop stop.
+
+**What changed, and what it fixes.** The 11-08 build could fall into repeating a line or a tool-call parameter. Three changes address that at its sources:
+
+- **A stale attention window, repaired.** On prefill steps of 130-144 rows (a tool result of that length), the rows past 128 attended over a window shifted back by 128 positions. The first token of the next turn was computed from those rows. This was an engine defect, present since the 256-row prefill steps were introduced.
+- **Full-rank dense matrices.** Two families of attention matrices (the query projection's second stage and the attention-output pair) were stored at reduced rank. Measured against the official model, the rank cut — not the 4-bit precision — was what moved the decisions at the rows where a repeat either stops or continues. They are now stored at full rank and 4 bits (5.14 GB against 3.03). On the row of a recorded looping session where the model must choose between stopping and one more duplicate, the margin for stopping went from -3.56 to +3.69 nats (the official model: +4.09).
+- **A tool call is held to its schema.** A parameter name already written in a call cannot be written again, and a call whose schema parameters are all written closes. A duplicated parameter is never a valid call, so this removes nothing a correct session writes; it costs no speed (36.7 against 36.2 tok/s in a paired run).
+
+Also since 11-08: the routed experts of 20 layers were retrained against the official model's outputs (the two `*_trained.bin` files), the agent's
+thinking is no longer capped by a routing shortcut, and its attention index width is the model's own 512. Together these account for the
+lower token count and the lower rate per GHz.
+
+**Same behaviour as the official model on an open-ended repeat.** One case is unchanged by this update, and it is the official model's own
+behaviour: when a reply already holds the same line twice and nothing in the request says how many are wanted, the model tends to write it
+again. The official weights rank the repeated line first after the second copy in 19 of 20 test documents; this build continued such a seeded
+repeat in 5 of 8 sampled draws. A requested count is kept exactly by both (20 of 20 lines, 12 of 12). In agent use the loop detector ends
+such a turn. A change to the weights that removes the tendency is being worked on and is not part of this release.
+
+`ds4-server` keeps the 11-08 configuration and files; the two programs read different expert files from the same pack.
+
+The tables below this section that are dated 2026-11-08 describe the 11-08 files, which are still in the pack.
+
+## 1. Download the model (292 GB for the agent and the CLI; 445 GB with the server's files)
 
 ```sh
-hf download ivp5/DeepSeek-V4.1-Flash-1017-ds4m1 --local-dir ds4m1
-cd ds4m1 && shasum -a 256 -c MANIFEST.sha256 && cd ..
+hf download ivp5/DeepSeek-V4.1-Flash-1017-ds4m1 --local-dir ds4m1 --include "DeepSeek-V4.1-Flash-1017-ds4m1.gguf" "experts_*_trained.bin" "engram_iq4nl.bin" "MANIFEST.sha256"
+cd ds4m1 && shasum -a 256 -c MANIFEST.sha256; cd ..     # the two files of `ds4-server` are reported missing unless you download everything
 ```
 
-Four files; [the model card](https://huggingface.co/ivp5/DeepSeek-V4.1-Flash-1017-ds4m1) lists what each holds.
+Six files in all; `ds4-agent` and `ds4` read four of them, `ds4-server` reads the two 2026-11-08 expert files instead of the two trained ones.
+[The model card](https://huggingface.co/ivp5/DeepSeek-V4.1-Flash-1017-ds4m1) lists what each holds.
 
 ## 2. Raise the memory limits (once per boot)
 
@@ -38,24 +74,24 @@ make -j8 ds4 ds4-agent ds4-server
 ./ds4-agent -m ds4m1/DeepSeek-V4.1-Flash-1017-ds4m1.gguf
 ```
 
-`./ds4` (one prompt) and `./ds4-server` (an HTTP API) take the same `-m`. The first start unpacks 13 GB of small parts into
+`./ds4` (one prompt) and `./ds4-server` (an HTTP API) take the same `-m`. The first start unpacks 18 GB of small parts into
 `~/Library/Caches/ds4m1/` (`DS4M1_CACHE` moves it). Sampling defaults: temperature 1.0, top-p 1.0, min-p 0.2.
 
-## How it compares
+## How it compares (measured 2026-11-08 unless marked)
 
 | | **ds4m1 (this engine + the HF files)** | vcruz305 SAGE 1.55 bpw (EXL3 / REXL3) | Unsloth UD-IQ2_XXS (GGUF) |
 |---|---|---|---|
 | Runs on | **M1 Max, 64 GB** | 128 GB-class GPU (108.5 GiB resident) | llama.cpp, 300.5 GB of weights |
-| Download | **287 GB** | 320 GB | 300.5 GB |
-| Decode | **48.4 tok/s** | — | — |
-| Prefill | **342.6 tok/s** | — | — |
+| Download | **292 GB** for the agent and CLI (445 GB with the server's files) | 320 GB | 300.5 GB |
+| Decode (2026-11-19) | **41.1 tok/s at 1,045 MHz** | — | — |
+| Prefill (2026-11-19) | **312.5 tok/s at 1,045 MHz** | — | — |
 | Routed experts vs official, same test (8 agent sessions) | **KL 0.047 · top-1 92.8%** | REXL3: KL 0.091 · top-1 89.9% | — |
 | wiki1100 vs official, routed experts only (the same 1,099 positions) | **KL 0.324 · top-1 85.1%** | REXL3: KL 0.380 · top-1 83.9% | — |
 | wiki1100 vs official, the whole model | KL 0.833 · top-1 73.6% | **EXL3: KL 0.088 · top-1 88.2% (its own slice)** | KL 0.203 · top-1 90.5% (its own slice) |
 | KL vs official on its card's own text | — | EXL3: 0.088 wiki1100, 0.098 e2e_eval; REXL3: 0.051 e2e_eval | 0.203 wiki1100, 0.142 long17k |
 | Top-1 on its card's own text | — | EXL3: 88.2% wiki1100, 94.5% e2e_eval | 90.5% wiki1100, 91.2% long17k |
 | Whole model vs Q8_0 reference (4 agent sessions) | KL 0.118 · top-1 90.5% | — | — |
-| Coding-agent tasks | **15/15 solved, 822 tokens and 20 s per solution** | — | — |
+| Coding-agent tasks (2026-11-19) | **15/15 solved, 595 tokens and 17.9 s per solution** | — | — |
 
 — = not stated on that card. The same-test row swaps only the routed experts (attention, dense layers, router and head are
 the official weights in both), so it compares the two expert codecs directly.
@@ -64,9 +100,10 @@ the official weights in both), so it compares the two expert codecs directly.
 
 | Workload | Decode | Prefill | GPU clock |
 |---|---:|---:|---:|
-| 16 coding-agent tasks back to back (one process, ~7 min) | 48.4 tok/s | 342.6 tok/s | 1,061 MHz |
-| same, steady tasks 5-15, a second run | 48.6 tok/s | 342.2 tok/s | 1,073 MHz |
-| same, the published engine (ds4-m1 main) on these four files | 49.5 tok/s | 350.0 tok/s | 1,073 MHz |
+| **2026-11-19 build:** 16 coding-agent tasks back to back (one process) | 41.1 tok/s | 312.5 tok/s | 1,045 MHz |
+| same, steady tasks 5-15 | 40.7 tok/s | 306.0 tok/s | 1,026 MHz |
+| same build with the schema rule on, last eight tasks of a second run | 41.3 tok/s | 312.7 tok/s | 1,043 MHz |
+| 2026-11-08 build: 16 coding-agent tasks back to back | 48.4 tok/s | 342.6 tok/s | 1,061 MHz |
 | `ds4` one-shot, WikiText prompt of 2,062 tokens + 256 generated (a fresh process) | 26.9 tok/s | 198.0 tok/s | |
 | `ds4` one-shot, WikiText prompt of 8,172 tokens + 256 generated (a fresh process) | 31.8 tok/s | 324.9 tok/s | |
 | `ds4` one-shot, WikiText prompt of 32,803 tokens + 256 generated (a fresh process) | 27.1 tok/s | 383.2 tok/s | |
@@ -114,16 +151,18 @@ Every generated token of every attempt, over the correct solutions:
 
 | Task set | Solved | Tokens per solution | Seconds per solution |
 |---|---:|---:|---:|
-| 15 coding-agent tasks (Python modules with pytest suites) | 15 / 15 | 822 | 20.1 |
+| 2026-11-19: 15 coding-agent tasks (Python modules with pytest suites) | 15 / 15 | 595 | 17.9 |
+| 2026-11-19: 10 freshly generated bug-fix tasks | 10 / 10 | 2,369 | 108.6 |
+| 2026-11-08: the same 15 coding-agent tasks | 15 / 15 | 822 | 20.1 |
 
-DeepSeek's own benchmark suites (HLE, Terminal-Bench, SWE, ...) were not re-run here: each takes days at 48 tok/s.
+DeepSeek's own benchmark suites (HLE, Terminal-Bench, SWE, ...) were not re-run here: each takes days at this rate.
 
 ## What is upstream's and what is ours
 
 This tree is antirez/ds4 at [b3f5018](https://github.com/antirez/ds4/commit/b3f5018) (2026-11-03) merged with this fork. 3,491 of upstream's
 3,513 files are upstream's byte for byte. The 22 that differ are the engine core (`ds4.c`, `ds4_metal.m` and four headers), the five frontends,
 the Engram reader, the help and defaults file, five Metal kernel files (four gained this fork's kernels; `dsv4_kv.metal` rounds FP8 / FP4
-values with bit arithmetic), the `Makefile` and this README. The fork adds 18 files: the shipped Metal kernel variants in `live/`, three
+values with bit arithmetic), the `Makefile` and this README. The fork adds 19 files: the shipped Metal kernel variants in `live/`, four
 headers, two Metal files and `metal/README.md`.
 
 The two core files are merged function by function: upstream's version of every function that only upstream changed, both sides' changes
@@ -135,9 +174,10 @@ identical to the measured engine's, all 818 positions.
 
 ## Known issues
 
-- The per-verify routing switches (the thinking-span expert cap and related step dials) are cleared when the asynchronous verify commits, so
-  they reach only the first layers of a drafted verify. The configuration without this race measured 16% less useful generation, so the
-  default keeps it.
+- With memory limits lower than step 2's the engine cannot lock all of its tables (it prints `NOT locked (mlock failed)`) and can run at
+  about half speed.
+- A reply that already repeats one line with no count requested tends to continue it, as with the official weights; the agent's loop
+  detector ends such a turn (see the update section).
 - Outputs are not bit-repeatable run to run: the router prefers experts already in the cache.
 - Only DeepSeek V4.1 Flash 1017 is supported by this fork's Metal path; upstream's other models are not tested here.
 
