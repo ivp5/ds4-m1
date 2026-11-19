@@ -458,8 +458,10 @@ int llms_diag_fprintf(FILE *f, const char *fmt, ...) {
         if (!show) {
             const size_t n = strlen(fmt); const int ends = n > 0 && fmt[n - 1] == '\n';
             if (open_drop) { if (ends) open_drop = 0; return 0; }
-            if (!strncmp(fmt, "llms", 4) && !strstr(fmt, "FATAL") && !strstr(fmt, "efus") && !strstr(fmt, "REFUS") && !strstr(fmt, "failed") && !strstr(fmt, "FAILED") && !strstr(fmt, "cannot") &&
-                !strstr(fmt, "ignored") && !strstr(fmt, "STOP") && !strstr(fmt, "exit")) { if (!ends) open_drop = 1; return 0; }
+            /* kept on a terminal: only a line that announces the process is stopping -- FATAL, REFUSING / REFUSED / refusing, or an exit code written as "(exit N". The first
+             * list (11-19 06:5x) also kept "failed", "cannot", "ignored", "STOP" and any "exit": a status line that MENTIONS an exit ("at exit the missing ones are loaded")
+             * reached the user's prompt. A word list scores a mention like an announcement; the markers are the ones the stopping lines carry by convention. */
+            if (!strncmp(fmt, "llms", 4) && !strstr(fmt, "FATAL") && !strstr(fmt, "REFUS") && !strstr(fmt, "refusing") && !strstr(fmt, "(exit ")) { if (!ends) open_drop = 1; return 0; }
         }
     }
     va_list ap; va_start(ap, fmt); const int r = vfprintf(f, fmt, ap); va_end(ap); return r;
