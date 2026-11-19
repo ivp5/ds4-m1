@@ -1,3 +1,4 @@
+#include "llms_diag.h"   /* llms DIAG: FIRST -- our code begins above ds4.h's include in this file */
 unsigned ds4_gpu_llms_rows_max_public(void);   /* llms F32ROWS_CAP (unsigned: before stdint.h) */
 void ds4_gpu_llms_t32_round(int on); int ds4_gpu_llms_t32_rounded(void);   /* llms T32_BF16 */
 /* =========================================================================
